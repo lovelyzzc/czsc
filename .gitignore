@@ -133,3 +133,6 @@ scripts/auto-czsc-quant/results/
 .multica/
 .agent_context/
 .claude/skills/
+
+# scripts 运行产物
+scripts/_output/

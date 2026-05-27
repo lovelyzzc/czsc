@@ -1,0 +1,13 @@
+---
+description: 生成的 HTML 文件统一通过 Cursor 内置浏览器打开
+alwaysApply: true
+---
+
+# HTML 文件查看方式
+
+生成 HTML 可视化文件后，始终通过 Cursor 内置浏览器（browser MCP）打开，不要让用户手动去找文件。
+
+具体步骤：
+1. 启动本地 HTTP 服务器（`python -m http.server <port> --directory <dir>`）
+2. 使用 `browser_navigate` 打开 `http://localhost:<port>/filename.html`，设置 `position: "beside"` 在侧边栏展示
+3. 用完后清理 HTTP 服务器进程
