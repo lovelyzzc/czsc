@@ -2,7 +2,7 @@
 author: zengbin93
 email: zeng_bin8888@163.com
 create_dt: 2023/6/24 18:49
-describe: Tushare数据源
+describe: Tushare/Tinyshare数据源
 """
 
 import os
@@ -11,14 +11,16 @@ import pandas as pd
 from loguru import logger
 from tqdm import tqdm
 
+import tinyshare as ts
+
 import czsc
 from czsc import Freq, RawBar
 
-# 首次使用需要打开一个python终端按如下方式设置 token
-# czsc.set_url_token(token='your token', url='http://api.tushare.pro')
+_tinyshare_token = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+ts.set_token(_tinyshare_token)
 
 cache_path = os.getenv("TS_CACHE_PATH", os.path.expanduser("~/.ts_data_cache"))
-dc = czsc.DataClient(url="http://api.tushare.pro", cache_path=cache_path)
+dc = czsc.DataClient(token=_tinyshare_token, url="http://api.tushare.pro", cache_path=cache_path)
 
 
 def format_kline(kline: pd.DataFrame, freq: Freq) -> list[RawBar]:
@@ -145,8 +147,6 @@ def pro_bar_minutes(ts_code, sdt, edt, freq="60min", asset="E", adj=None):
     :return:
     """
     from datetime import timedelta
-
-    import tushare as ts
 
     pro = ts.pro_api()
 
@@ -318,8 +318,6 @@ def get_raw_bars(symbol, freq, sdt, edt, fq="后复权", raw_bar=True):
             bars = format_kline(bars, Freq(freq))
 
     else:
-        import tushare as ts
-
         _map = {"日线": "D", "周线": "W", "月线": "M"}
         freq = _map[freq]
         bars = ts.pro_bar(ts_code, start_date=sdt, end_date=edt, freq=freq, asset=asset, adj=adj)
