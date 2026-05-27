@@ -406,6 +406,7 @@ _PAGE_TPL = Template(
       pane.className = "freq-pane chart-stack";
       pane.setAttribute("data-idx", String(fi));
 
+      var hasZs = (freq.main.zs_boxes && freq.main.zs_boxes.length > 0);
       var legendMain = (
         '<span class="pane-meta__legend" data-series="sma5">'
           + '<span class="pane-meta__swatch pane-meta__swatch--sma5"></span>SMA5</span>'
@@ -415,6 +416,10 @@ _PAGE_TPL = Template(
           + '<span class="pane-meta__swatch pane-meta__swatch--fx"></span>FX (DASHED)</span>'
         + '<span class="pane-meta__legend" data-series="bi">'
           + '<span class="pane-meta__swatch pane-meta__swatch--bi"></span>BI (SOLID)</span>'
+        + (hasZs
+          ? '<span class="pane-meta__legend" data-series="zs">'
+            + '<span class="pane-meta__swatch" style="background:rgba(70,130,180,0.35);height:8px;border:1px dashed rgba(70,130,180,0.6)"></span>ZS (中枢)</span>'
+          : '')
       );
       pane.innerHTML =
         '<div class="pane-meta">'
@@ -424,7 +429,7 @@ _PAGE_TPL = Template(
         + '<span class="pane-meta__hint">CLICK LEGEND TO TOGGLE</span>'
         + '</div>'
         + '<div class="chart-stack">'
-        +   '<div class="row row-main" id="main-' + fi + '"><div class="row__label">PRICE · K + SMA + FX + BI</div></div>'
+        +   '<div class="row row-main" id="main-' + fi + '"><div class="row__label">PRICE · K + SMA + FX + BI' + (hasZs ? ' + ZS' : '') + '</div></div>'
         +   '<div class="row row-vol"  id="vol-'  + fi + '"><div class="row__label">VOLUME</div></div>'
         +   '<div class="row row-sig"  id="sig-'  + fi + '"><div class="row__label">SIGNAL TIMELINE</div><div class="row__rowlabels" id="siglabels-' + fi + '"></div></div>'
         +   '<div class="row row-macd" id="macd-' + fi + '"><div class="row__label">MACD · 12/26/9</div></div>'
@@ -541,6 +546,63 @@ _PAGE_TPL = Template(
         ks.setMarkers(visible);
       }
       applySignalMarkers();
+
+      // —— 中枢矩形 (ZS boxes) via canvas overlay ——
+      var zsBoxes = freq.main.zs_boxes || [];
+      if (zsBoxes.length > 0) {
+        var zsCanvas = document.createElement('canvas');
+        zsCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1';
+        mainEl.style.position = 'relative';
+        mainEl.appendChild(zsCanvas);
+
+        function drawZsBoxes() {
+          var rect = mainEl.getBoundingClientRect();
+          var dpr = window.devicePixelRatio || 1;
+          zsCanvas.width = rect.width * dpr;
+          zsCanvas.height = rect.height * dpr;
+          zsCanvas.style.width = rect.width + 'px';
+          zsCanvas.style.height = rect.height + 'px';
+          var ctx = zsCanvas.getContext('2d');
+          ctx.scale(dpr, dpr);
+          ctx.clearRect(0, 0, rect.width, rect.height);
+
+          var ts = cMain.timeScale();
+          zsBoxes.forEach(function (zs) {
+            var x0 = ts.timeToCoordinate(zs.t0);
+            var x1 = ts.timeToCoordinate(zs.t1);
+            if (x0 === null || x1 === null) return;
+            var ps = cMain.priceScale('right');
+            // ks (candlestick series) exposes coordinateToPrice / priceToCoordinate
+            var y_zg = ks.priceToCoordinate(zs.zg);
+            var y_zd = ks.priceToCoordinate(zs.zd);
+            if (y_zg === null || y_zd === null) return;
+
+            var left = Math.min(x0, x1);
+            var width = Math.abs(x1 - x0);
+            var top = Math.min(y_zg, y_zd);
+            var height = Math.abs(y_zd - y_zg);
+
+            // 半透明填充
+            ctx.fillStyle = currentThemeName === 'dark'
+              ? 'rgba(100, 149, 237, 0.12)'   // cornflower blue tint
+              : 'rgba(70, 130, 180, 0.10)';   // steel blue tint
+            ctx.fillRect(left, top, width, height);
+
+            // 上下边框
+            ctx.strokeStyle = currentThemeName === 'dark'
+              ? 'rgba(100, 149, 237, 0.45)'
+              : 'rgba(70, 130, 180, 0.40)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 3]);
+            ctx.strokeRect(left, top, width, height);
+            ctx.setLineDash([]);
+          });
+        }
+        // 视窗变化时重绘
+        cMain.timeScale().subscribeVisibleLogicalRangeChange(function () { requestAnimationFrame(drawZsBoxes); });
+        cMain.subscribeCrosshairMove(function () { requestAnimationFrame(drawZsBoxes); });
+        setTimeout(drawZsBoxes, 50);
+      }
 
       // VOL
       var cVol = LightweightCharts.createChart(volEl, commonOpts({
@@ -750,10 +812,16 @@ _PAGE_TPL = Template(
         });
       });
 
+      // 中枢 toggle 与重绘：保存 drawZsBoxes + zsVisible 到 seriesRefs
+      var zsVisible = true;
+      var _drawZsBoxes = (typeof drawZsBoxes === 'function') ? drawZsBoxes : null;
+
       var seriesRefs = {
         candles: ks, sma5: sma5, sma20: sma20, fx: fx, bi: bi,
         volume: volSeries, macdDiff: diffSeries, macdDea: deaSeries, macdHist: macdHist,
         zeroLine: zeroLineRef, diffForZero: diffSeries,
+        _drawZsBoxes: _drawZsBoxes,
+        _zsCanvas: (typeof zsCanvas !== 'undefined') ? zsCanvas : null,
       };
       var rawRefs = {
         candles: freq.main.candles, volume: freq.volume.bars, macdHist: freq.macd.macd,
@@ -807,6 +875,14 @@ _PAGE_TPL = Template(
       pane.querySelectorAll('.pane-meta__legend').forEach(function (item) {
         item.addEventListener('click', function () {
           var key = item.getAttribute('data-series');
+          if (key === 'zs') {
+            zsVisible = !zsVisible;
+            item.classList.toggle('legend--off', !zsVisible);
+            if (seriesRefs._zsCanvas) {
+              seriesRefs._zsCanvas.style.display = zsVisible ? '' : 'none';
+            }
+            return;
+          }
           var s = seriesRefs[key];
           if (!s) return;
           var off = item.classList.toggle('legend--off');
@@ -872,6 +948,10 @@ _PAGE_TPL = Template(
         g.series.zeroLine = g.series.diffForZero.createPriceLine({
           price: 0, color: currentTheme.text, lineWidth: 1, lineStyle: dashedLineStyle, axisLabelVisible: true, title: '0',
         });
+      });
+      // 中枢重绘（主题切换后颜色需要更新）
+      groups.forEach(function (g) {
+        if (g.series._drawZsBoxes) requestAnimationFrame(g.series._drawZsBoxes);
       });
       setTimeout(alignAxes, 0);
     }

@@ -13,7 +13,7 @@ from typing import Any, TypedDict, cast
 
 import numpy as np
 
-from czsc._native import CZSC
+from czsc._native import CZSC, ZS
 from czsc._native.ta import sma as _sma_rust
 
 from . import _theme
@@ -27,6 +27,7 @@ __all__ = [
     "MacdPane",
     "MainPane",
     "VolumePane",
+    "ZsBox",
     "build_from_czsc",
     "build_from_trader",
 ]
@@ -54,6 +55,16 @@ class Histogram(TypedDict):
     color: str
 
 
+class ZsBox(TypedDict):
+    """中枢矩形：用于在主图上绘制半透明区域。"""
+    t0: int       # 起始时间（unix 秒）
+    t1: int       # 结束时间（unix 秒）
+    zg: float     # 中枢上沿
+    zd: float     # 中枢下沿
+    gg: float     # 最高点
+    dd: float     # 最低点
+
+
 # -- Dataclasses（业务侧使用）---------------------------------------------------
 
 
@@ -64,6 +75,7 @@ class MainPane:
     sma20: list[LinePoint] = field(default_factory=list)
     fx_line: list[LinePoint] = field(default_factory=list)  # 虚线，连接所有分型
     bi_line: list[LinePoint] = field(default_factory=list)  # 实线，仅笔的端点
+    zs_boxes: list[ZsBox] = field(default_factory=list)     # 中枢矩形
 
 
 @dataclass
@@ -132,6 +144,60 @@ def _sma(close: np.ndarray, n: int) -> np.ndarray:
     return res
 
 
+def _extract_zs_boxes(c: CZSC) -> list[ZsBox]:
+    """从 CZSC 的 bi_list 中提取非重叠中枢序列。
+
+    贪心策略：滑窗 3 笔构建 ZS，有效则记录并跳过已被包含的笔，
+    避免产生大量重叠矩形。
+    """
+    bi_list = list(c.bi_list)
+    if len(bi_list) < 3:
+        return []
+
+    boxes: list[ZsBox] = []
+    i = 0
+    while i <= len(bi_list) - 3:
+        try:
+            zs = ZS(bi_list[i : i + 3])
+        except Exception:
+            i += 1
+            continue
+        if not zs.is_valid():
+            i += 1
+            continue
+
+        # 尝试向后扩展：把后续笔纳入，只要仍与 [zg, zd] 有交集
+        j = i + 3
+        zg, zd = zs.zg, zs.zd
+        while j < len(bi_list):
+            bi = bi_list[j]
+            bi_high = max(float(bi.fx_a.fx), float(bi.fx_b.fx))
+            bi_low = min(float(bi.fx_a.fx), float(bi.fx_b.fx))
+            if bi_low < zg and bi_high > zd:
+                j += 1
+            else:
+                break
+
+        extended_bis = bi_list[i:j]
+        edt = extended_bis[-1].fx_b.dt
+
+        boxes.append(
+            cast(
+                ZsBox,
+                {
+                    "t0": _ts(zs.sdt),
+                    "t1": _ts(edt),
+                    "zg": float(zg),
+                    "zd": float(zd),
+                    "gg": float(max(max(float(b.fx_a.fx), float(b.fx_b.fx)) for b in extended_bis)),
+                    "dd": float(min(min(float(b.fx_a.fx), float(b.fx_b.fx)) for b in extended_bis)),
+                },
+            )
+        )
+        i = j  # 跳过已包含的笔
+    return boxes
+
+
 def _build_main_pane(c: CZSC, theme: _theme.ThemeColors, *, show_sma: Sequence[int]) -> MainPane:
     bars = list(c.bars_raw)
     candles: list[Candle] = []
@@ -192,7 +258,9 @@ def _build_main_pane(c: CZSC, theme: _theme.ThemeColors, *, show_sma: Sequence[i
             dedup[p["time"]] = p
         bi_line = sorted(dedup.values(), key=lambda p: p["time"])
 
-    return MainPane(candles=candles, sma5=sma5, sma20=sma20, fx_line=fx_line, bi_line=bi_line)
+    zs_boxes = _extract_zs_boxes(c)
+
+    return MainPane(candles=candles, sma5=sma5, sma20=sma20, fx_line=fx_line, bi_line=bi_line, zs_boxes=zs_boxes)
 
 
 def _build_volume_pane(c: CZSC, theme: _theme.ThemeColors) -> VolumePane:
@@ -251,6 +319,7 @@ def _tail_freq_payload(fp: FreqPayload, n: int) -> FreqPayload:
     fp.main.sma20 = _filter(fp.main.sma20)
     fp.main.fx_line = _filter(fp.main.fx_line)
     fp.main.bi_line = _filter(fp.main.bi_line)
+    fp.main.zs_boxes = [z for z in fp.main.zs_boxes if z["t1"] >= cutoff]
     fp.volume.bars = _filter(fp.volume.bars)
     fp.macd.diff = _filter(fp.macd.diff)
     fp.macd.dea = _filter(fp.macd.dea)
