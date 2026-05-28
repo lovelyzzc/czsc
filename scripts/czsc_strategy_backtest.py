@@ -1,14 +1,17 @@
-"""缠论 5 大策略统一回测（真实 A 股日线数据）
+"""新策略研究回测（全 A 股日线数据）
+
+抛弃传统缠论一买/二买/三买/背驰，利用 CZSC 框架中 bar/tas/vol/jcc/pressure 等
+信号模块构建 6 种新策略，覆盖突破、趋势、反转、均值回归等不同交易流派。
 
 策略列表：
-    1. 一买策略 — 趋势反转（逆势抄底）
-    2. 二买策略 — 趋势确认（回踩买入）
-    3. 三买策略 — 中枢突破（顺势追涨）
-    4. 笔趋势跟踪 — 最简单的趋势策略
-    5. 背驰策略 — 多笔形态 + MACD 辅助
+    1. 波动率压缩突破 — 窄幅整理 + 放量突破新高
+    2. MACD零轴共振 — DIF零轴附近二次金叉 + 均线多头排列
+    3. TD序列反转 — 神奇九转买点 + RSI超卖确认
+    4. 量价背离反转 — 量价极值买点 + 看涨吞没形态
+    5. 布林KDJ超卖反弹 — 布林下轨极值 + KDJ超卖转多
+    6. 双均线趋势回踩 — 双均线强势多头 + 支撑位 + 相对低位
 
 数据源：~/.ts_data_cache/a_stock_daily_qfq/ 下的 Tushare 日线前复权 parquet
-无分钟级数据，多级别联立策略跳过。
 """
 
 from __future__ import annotations
@@ -39,9 +42,7 @@ FEE_RATE = 0.0002
 FREQ = "日线"
 
 _ZDT = f"{FREQ}_D1_涨跌停V230331_涨停_任意_任意_0"
-_DIETING = f"{FREQ}_D1_涨跌停V230331_跌停_任意_任意_0"
 _BI_DOWN = f"{FREQ}_D1_表里关系V230101_向下_任意_任意_0"
-_BI_UP = f"{FREQ}_D1_表里关系V230101_向上_任意_任意_0"
 
 INTERVAL = 3600 * 24 * 5
 TIMEOUT = 120
@@ -49,134 +50,250 @@ STOP_LOSS = 500
 
 
 def _exit_bi_down() -> Event:
-    return Event.load({
-        "name": "笔向下_平多",
-        "operate": "平多",
-        "signals_all": [_BI_DOWN],
-    })
+    return Event.load({"name": "笔向下_平多", "operate": "平多", "signals_all": [_BI_DOWN]})
 
 
-# ==================== 策略定义 ====================
+# ==================== 策略 1: 波动率压缩突破 ====================
 
-def build_first_buy_position(symbol: str) -> Position:
-    return Position(
-        name="一买策略_多头", symbol=symbol,
-        opens=[Event.load({
-            "name": "一买_开多", "operate": "开多",
-            "signals_all": [f"{FREQ}_D1B_BUY1_一买_任意_任意_0"],
-            "signals_not": [_ZDT],
-        })],
-        exits=[_exit_bi_down()],
-        interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-    )
+_VOL_SQUEEZE_OPEN = [
+    f"{FREQ}_窄幅震荡N5_形态V241013_满足_任意_任意_0",
+    f"{FREQ}_D1W20_事件V240428_收盘新高_任意_任意_0",
+    f"{FREQ}_D1K_量柱V221216_梯量_价升_任意_0",
+]
 
 
-class FirstBuyStrategy(CzscStrategyBase):
+class VolSqueezeStrategy(CzscStrategyBase):
     @property
     def positions(self) -> list[Position]:
-        return [build_first_buy_position(self.symbol)]
+        return [Position(
+            name="波动率压缩突破_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "窄幅放量突破_开多", "operate": "开多",
+                "signals_all": _VOL_SQUEEZE_OPEN, "signals_not": [_ZDT],
+            })],
+            exits=[_exit_bi_down()],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
 
     @property
     def signals_config(self):
         base = list(super().signals_config)
         names = {c["name"] for c in base}
-        if "cxt_first_buy_V221126" not in names:
-            base.append({"name": "cxt_first_buy_V221126", "freq": FREQ, "di": 1})
+        extras = [
+            {"name": "bar_zfzd_V241013", "freq": FREQ, "n": 5},
+            {"name": "bar_break_V240428", "freq": FREQ, "di": 1, "w": 20},
+            {"name": "vol_ti_suo_V221216", "freq": FREQ, "di": 1},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
         return base
 
 
-def build_second_buy_position(symbol: str) -> Position:
-    return Position(
-        name="二买策略_多头", symbol=symbol,
-        opens=[Event.load({
-            "name": "二买_开多", "operate": "开多",
-            "signals_all": [f"{FREQ}_D1#SMA#21_BS2辅助V230320_二买_任意_任意_0"],
-            "signals_not": [_ZDT],
-        })],
-        exits=[_exit_bi_down()],
-        interval=INTERVAL, timeout=TIMEOUT, stop_loss=400, t0=False,
-    )
+# ==================== 策略 2: MACD 零轴共振 ====================
+
+_MACD_ZERO_OPEN = [
+    f"{FREQ}_D1N100MD1J2S0_MACD交叉数量V230625_0轴下第2次金叉以后_任意_任意_0",
+    f"{FREQ}_DIF分层W60T20_完全分类V241010_零轴附近_任意_任意_0",
+    f"{FREQ}_D1SMA5#10#20_均线系统V230513_多头排列_任意_任意_0",
+]
+_MACD_EXIT = f"{FREQ}_D1MACD12#26#9#MACD_BS辅助V221028_空头_向下_任意_0"
 
 
-class SecondBuyStrategy(CzscStrategyBase):
+class MACDZeroStrategy(CzscStrategyBase):
     @property
     def positions(self) -> list[Position]:
-        return [build_second_buy_position(self.symbol)]
+        return [Position(
+            name="MACD零轴共振_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "零轴二次金叉_开多", "operate": "开多",
+                "signals_all": _MACD_ZERO_OPEN, "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "MACD死叉_平多", "operate": "平多", "signals_all": [_MACD_EXIT]}),
+            ],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "tas_cross_status_V230625", "freq": FREQ, "di": 1,
+             "n": 100, "md": 1, "j": 2, "s": 0},
+            {"name": "tas_dif_layer_V241010", "freq": FREQ, "w": 60, "t": 20},
+            {"name": "tas_ma_system_V230513", "freq": FREQ, "di": 1, "ma_seq": "5#10#20"},
+            {"name": "tas_macd_base_V221028", "freq": FREQ, "di": 1,
+             "fastperiod": 12, "slowperiod": 26, "signalperiod": 9, "key": "MACD"},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
 
 
-def build_third_buy_position(symbol: str) -> Position:
-    return Position(
-        name="三买策略_多头", symbol=symbol,
-        opens=[
-            Event.load({
-                "name": "纯笔三买_开多", "operate": "开多",
-                "signals_all": [f"{FREQ}_D1_三买辅助V230228_三买_任意_任意_0"],
-                "signals_not": [_ZDT],
-            }),
-            Event.load({
-                "name": "均线三买_开多", "operate": "开多",
-                "signals_all": [f"{FREQ}_D1#SMA#34_BS3辅助V230318_三买_任意_任意_0"],
-                "signals_not": [_ZDT],
-            }),
-        ],
-        exits=[_exit_bi_down()],
-        interval=INTERVAL, timeout=TIMEOUT, stop_loss=300, t0=False,
-    )
+# ==================== 策略 3: TD 序列反转 ====================
+
+_TD9_BUY = f"{FREQ}_神奇九转N9_BS辅助V240616_买点_任意_任意_0"
+_RSI_OVERSOLD = f"{FREQ}_D1T30RSI14_RSI辅助V230227_超卖_任意_任意_0"
+_TD9_SELL = f"{FREQ}_神奇九转N9_BS辅助V240616_卖点_任意_任意_0"
 
 
-class ThirdBuyStrategy(CzscStrategyBase):
+class TD9Strategy(CzscStrategyBase):
     @property
     def positions(self) -> list[Position]:
-        return [build_third_buy_position(self.symbol)]
+        return [Position(
+            name="TD序列反转_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "TD9超卖_开多", "operate": "开多",
+                "signals_all": [_TD9_BUY, _RSI_OVERSOLD], "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "TD卖点_平多", "operate": "平多", "signals_all": [_TD9_SELL]}),
+            ],
+            interval=INTERVAL, timeout=60, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "bar_td9_V240616", "freq": FREQ, "n": 9},
+            {"name": "tas_rsi_base_V230227", "freq": FREQ, "di": 1, "th": 30, "timeperiod": 14},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
 
 
-def build_bi_trend_position(symbol: str) -> Position:
-    return Position(
-        name="笔趋势_非多即空", symbol=symbol,
-        opens=[
-            Event.load({"name": "笔向上_开多", "operate": "开多",
-                         "signals_all": [_BI_UP], "signals_not": [_ZDT]}),
-            Event.load({"name": "笔向下_开空", "operate": "开空",
-                         "signals_all": [_BI_DOWN], "signals_not": [_DIETING]}),
-        ],
-        exits=[], interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS,
-    )
+# ==================== 策略 4: 量价背离极值反转 ====================
+
+_VOLPRICE_BS1 = f"{FREQ}_D1N20量价_BS1辅助_看多_任意_任意_0"
+_ENGULF_BULL = f"{FREQ}_D1_吞没形态_满足_看涨吞没_任意_0"
 
 
-class BiTrendStrategy(CzscStrategyBase):
+class VolPriceRevStrategy(CzscStrategyBase):
     @property
     def positions(self) -> list[Position]:
-        return [build_bi_trend_position(self.symbol)]
+        return [Position(
+            name="量价背离反转_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "量价极值吞没_开多", "operate": "开多",
+                "signals_all": [_VOLPRICE_BS1, _ENGULF_BULL], "signals_not": [_ZDT],
+            })],
+            exits=[_exit_bi_down()],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "bar_vol_bs1_V230224", "freq": FREQ, "di": 1, "n": 20},
+            {"name": "jcc_ten_mo_V221028", "freq": FREQ, "di": 1},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
 
 
-def build_divergence_position(symbol: str) -> Position:
-    return Position(
-        name="背驰策略_多头", symbol=symbol,
-        opens=[
-            Event.load({
-                "name": "aAb底背驰_开多", "operate": "开多",
-                "signals_all": [f"{FREQ}_D1五笔_形态V230619_aAb式底背驰_任意_任意_0"],
-                "signals_not": [_ZDT],
-            }),
-            Event.load({
-                "name": "类三买_开多", "operate": "开多",
-                "signals_all": [f"{FREQ}_D1五笔_形态V230619_类三买_任意_任意_0"],
-                "signals_not": [_ZDT],
-            }),
-        ],
-        exits=[_exit_bi_down()],
-        interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-    )
+# ==================== 策略 5: 布林 + KDJ 超卖反弹 ====================
+
+_BOLL_BEAR_EXTREME = f"{FREQ}_D1BOLL20_强弱V221112_空头_超强_任意_0"
+_KDJ_BULL = f"{FREQ}_D1T20KDJ9#3#3#K值突破1#3_BS辅助V230401_多头_任意_任意_0"
+_BOLL_BULL = f"{FREQ}_D1BOLL20_强弱V221112_多头_任意_任意_0"
 
 
-class DivergenceStrategy(CzscStrategyBase):
+class BollKDJStrategy(CzscStrategyBase):
     @property
     def positions(self) -> list[Position]:
-        return [build_divergence_position(self.symbol)]
+        return [Position(
+            name="布林KDJ超卖反弹_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "布林超卖KDJ转多_开多", "operate": "开多",
+                "signals_all": [_BOLL_BEAR_EXTREME, _KDJ_BULL], "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "布林转多_平多", "operate": "平多", "signals_all": [_BOLL_BULL]}),
+            ],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "tas_boll_power_V221112", "freq": FREQ, "di": 1, "timeperiod": 20},
+            {"name": "tas_kdj_evc_V230401", "freq": FREQ, "di": 1, "th": 20, "key": "K",
+             "fastk_period": 9, "slowk_period": 3, "slowd_period": 3,
+             "min_count": 1, "max_count": 3},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
 
 
-STRATEGY_TAGS = ["1_一买策略", "2_二买策略", "3_三买策略", "4_笔趋势跟踪", "5_背驰策略"]
-STRATEGY_CLASSES = [FirstBuyStrategy, SecondBuyStrategy, ThirdBuyStrategy, BiTrendStrategy, DivergenceStrategy]
+# ==================== 策略 6: 双均线趋势回踩 + 支撑位 ====================
+
+_DUAL_MA_BULL = f"{FREQ}_D1T100#SMA#5#20_JX辅助V221203_多头_强势_任意_0"
+_SUPPORT = f"{FREQ}_D1W20_支撑压力V240402_支撑位_任意_任意_0"
+_REL_LOW = f"{FREQ}_N20_BS辅助V240328_相对低点_任意_任意_0"
+_DUAL_MA_BEAR = f"{FREQ}_D1T100#SMA#5#20_JX辅助V221203_空头_任意_任意_0"
+
+
+class DualMAPullbackStrategy(CzscStrategyBase):
+    @property
+    def positions(self) -> list[Position]:
+        return [Position(
+            name="双均线趋势回踩_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "均线强势回踩支撑_开多", "operate": "开多",
+                "signals_all": [_DUAL_MA_BULL, _SUPPORT, _REL_LOW],
+                "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "均线转空_平多", "operate": "平多", "signals_all": [_DUAL_MA_BEAR]}),
+            ],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=400, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "tas_double_ma_V221203", "freq": FREQ, "di": 1,
+             "th": 100, "ma_type": "SMA", "timeperiod1": 5, "timeperiod2": 20},
+            {"name": "pressure_support_V240402", "freq": FREQ, "di": 1, "w": 20},
+            {"name": "xl_bar_position_V240328", "freq": FREQ, "n": 20},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
+
+
+# ==================== 策略注册 ====================
+
+STRATEGY_TAGS = [
+    "1_波动率压缩突破", "2_MACD零轴共振", "3_TD序列反转",
+    "4_量价背离反转", "5_布林KDJ超卖反弹", "6_双均线趋势回踩",
+]
+STRATEGY_CLASSES = [
+    VolSqueezeStrategy, MACDZeroStrategy, TD9Strategy,
+    VolPriceRevStrategy, BollKDJStrategy, DualMAPullbackStrategy,
+]
 
 
 # ==================== 子进程入口 ====================
@@ -246,7 +363,7 @@ def _process_stock(parquet_path: str) -> dict | None:
 
 def main():
     print("=" * 70)
-    print("  缠论 5 大策略统一回测（真实 A 股日线数据）")
+    print("  新策略研究回测 — 6 大策略（全 A 股日线数据）")
     print("=" * 70)
 
     shutil.rmtree(HOLDS_DIR, ignore_errors=True)
@@ -360,7 +477,7 @@ def main():
             out_html = OUTPUT_DIR / f"{tag}.html"
             generate_backtest_report(
                 df=dfw, output_path=str(out_html),
-                title=f"缠论策略 - {tag}（全A股日线）",
+                title=f"新策略研究 - {tag}（全A股日线）",
                 fee_rate=FEE_RATE, weight_type="ts", yearly_days=252,
             )
             print(f"  HTML: {out_html.name} ({out_html.stat().st_size/1024:.1f} KB)")
