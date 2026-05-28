@@ -1,15 +1,13 @@
-"""新策略研究回测（全 A 股日线数据）
+"""趋势起爆到加速阶段策略研究（全 A 股日线数据）
 
-抛弃传统缠论一买/二买/三买/背驰，利用 CZSC 框架中 bar/tas/vol/jcc/pressure 等
-信号模块构建 6 种新策略，覆盖突破、趋势、反转、均值回归等不同交易流派。
+核心理念：趋势生命周期为 底部整理 → 起爆 → 加速 → 巅峰 → 衰竭。
+本研究聚焦"起爆到加速"窗口，用 4 种不同维度捕捉同一现象：
 
 策略列表：
-    1. 波动率压缩突破 — 窄幅整理 + 放量突破新高
-    2. MACD零轴共振 — DIF零轴附近二次金叉 + 均线多头排列
-    3. TD序列反转 — 神奇九转买点 + RSI超卖确认
-    4. 量价背离反转 — 量价极值买点 + 看涨吞没形态
-    5. 布林KDJ超卖反弹 — 布林下轨极值 + KDJ超卖转多
-    6. 双均线趋势回踩 — 双均线强势多头 + 支撑位 + 相对低位
+    1. MACD转势起爆 — DIF穿零轴 + MACD方向向上 + 价格加速上涨
+    2. 三连阳放量起爆 — 三K新高涨依次放量 + 均线多头排列
+    3. 笔趋势动量加速 — 笔上升趋势 + MACD强势 + 区间价格加速
+    4. 8K结构量能爆发 — 8K上涨结构 + 区间动量强势 + 成交量放大
 
 数据源：~/.ts_data_cache/a_stock_daily_qfq/ 下的 Tushare 日线前复权 parquet
 """
@@ -53,219 +51,33 @@ def _exit_bi_down() -> Event:
     return Event.load({"name": "笔向下_平多", "operate": "平多", "signals_all": [_BI_DOWN]})
 
 
-# ==================== 策略 1: 波动率压缩突破 ====================
+# ==================== 策略 1: MACD 转势起爆 ====================
+# DIF 穿越零轴（趋势刚转多）+ MACD 柱子方向向上（动量增强）+ 价格拟合加速上涨
 
-_VOL_SQUEEZE_OPEN = [
-    f"{FREQ}_窄幅震荡N5_形态V241013_满足_任意_任意_0",
-    f"{FREQ}_D1W20_事件V240428_收盘新高_任意_任意_0",
-    f"{FREQ}_D1K_量柱V221216_梯量_价升_任意_0",
-]
+_DIF_NEAR_ZERO = f"{FREQ}_DIF分层W60T20_完全分类V241010_零轴附近_任意_任意_0"
+_MACD_DIR_UP = f"{FREQ}_D1K#MACD12#26#9方向_BS辅助V221106_向上_任意_任意_0"
+_POLYFIT_ACC_UP = f"{FREQ}_D1W20_分类V240428_加速上涨_任意_任意_0"
+_MACD_DIR_DOWN = f"{FREQ}_D1K#MACD12#26#9方向_BS辅助V221106_向下_任意_任意_0"
 
 
-class VolSqueezeStrategy(CzscStrategyBase):
+class MACDIgnitionStrategy(CzscStrategyBase):
+    """DIF 零轴转势 + MACD 向上 + 价格加速"""
+
     @property
     def positions(self) -> list[Position]:
         return [Position(
-            name="波动率压缩突破_多头", symbol=self.symbol,
+            name="MACD转势起爆_多头", symbol=self.symbol,
             opens=[Event.load({
-                "name": "窄幅放量突破_开多", "operate": "开多",
-                "signals_all": _VOL_SQUEEZE_OPEN, "signals_not": [_ZDT],
-            })],
-            exits=[_exit_bi_down()],
-            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-        )]
-
-    @property
-    def signals_config(self):
-        base = list(super().signals_config)
-        names = {c["name"] for c in base}
-        extras = [
-            {"name": "bar_zfzd_V241013", "freq": FREQ, "n": 5},
-            {"name": "bar_break_V240428", "freq": FREQ, "di": 1, "w": 20},
-            {"name": "vol_ti_suo_V221216", "freq": FREQ, "di": 1},
-        ]
-        for cfg in extras:
-            if cfg["name"] not in names:
-                base.append(cfg)
-        return base
-
-
-# ==================== 策略 2: MACD 零轴共振 ====================
-
-_MACD_ZERO_OPEN = [
-    f"{FREQ}_D1N100MD1J2S0_MACD交叉数量V230625_0轴下第2次金叉以后_任意_任意_0",
-    f"{FREQ}_DIF分层W60T20_完全分类V241010_零轴附近_任意_任意_0",
-    f"{FREQ}_D1SMA5#10#20_均线系统V230513_多头排列_任意_任意_0",
-]
-_MACD_EXIT = f"{FREQ}_D1MACD12#26#9#MACD_BS辅助V221028_空头_向下_任意_0"
-
-
-class MACDZeroStrategy(CzscStrategyBase):
-    @property
-    def positions(self) -> list[Position]:
-        return [Position(
-            name="MACD零轴共振_多头", symbol=self.symbol,
-            opens=[Event.load({
-                "name": "零轴二次金叉_开多", "operate": "开多",
-                "signals_all": _MACD_ZERO_OPEN, "signals_not": [_ZDT],
-            })],
-            exits=[
-                _exit_bi_down(),
-                Event.load({"name": "MACD死叉_平多", "operate": "平多", "signals_all": [_MACD_EXIT]}),
-            ],
-            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-        )]
-
-    @property
-    def signals_config(self):
-        base = list(super().signals_config)
-        names = {c["name"] for c in base}
-        extras = [
-            {"name": "tas_cross_status_V230625", "freq": FREQ, "di": 1,
-             "n": 100, "md": 1, "j": 2, "s": 0},
-            {"name": "tas_dif_layer_V241010", "freq": FREQ, "w": 60, "t": 20},
-            {"name": "tas_ma_system_V230513", "freq": FREQ, "di": 1, "ma_seq": "5#10#20"},
-            {"name": "tas_macd_base_V221028", "freq": FREQ, "di": 1,
-             "fastperiod": 12, "slowperiod": 26, "signalperiod": 9, "key": "MACD"},
-        ]
-        for cfg in extras:
-            if cfg["name"] not in names:
-                base.append(cfg)
-        return base
-
-
-# ==================== 策略 3: TD 序列反转 ====================
-
-_TD9_BUY = f"{FREQ}_神奇九转N9_BS辅助V240616_买点_任意_任意_0"
-_RSI_OVERSOLD = f"{FREQ}_D1T30RSI14_RSI辅助V230227_超卖_任意_任意_0"
-_TD9_SELL = f"{FREQ}_神奇九转N9_BS辅助V240616_卖点_任意_任意_0"
-
-
-class TD9Strategy(CzscStrategyBase):
-    @property
-    def positions(self) -> list[Position]:
-        return [Position(
-            name="TD序列反转_多头", symbol=self.symbol,
-            opens=[Event.load({
-                "name": "TD9超卖_开多", "operate": "开多",
-                "signals_all": [_TD9_BUY, _RSI_OVERSOLD], "signals_not": [_ZDT],
-            })],
-            exits=[
-                _exit_bi_down(),
-                Event.load({"name": "TD卖点_平多", "operate": "平多", "signals_all": [_TD9_SELL]}),
-            ],
-            interval=INTERVAL, timeout=60, stop_loss=STOP_LOSS, t0=False,
-        )]
-
-    @property
-    def signals_config(self):
-        base = list(super().signals_config)
-        names = {c["name"] for c in base}
-        extras = [
-            {"name": "bar_td9_V240616", "freq": FREQ, "n": 9},
-            {"name": "tas_rsi_base_V230227", "freq": FREQ, "di": 1, "th": 30, "timeperiod": 14},
-        ]
-        for cfg in extras:
-            if cfg["name"] not in names:
-                base.append(cfg)
-        return base
-
-
-# ==================== 策略 4: 量价背离极值反转 ====================
-
-_VOLPRICE_BS1 = f"{FREQ}_D1N20量价_BS1辅助_看多_任意_任意_0"
-_ENGULF_BULL = f"{FREQ}_D1_吞没形态_满足_看涨吞没_任意_0"
-
-
-class VolPriceRevStrategy(CzscStrategyBase):
-    @property
-    def positions(self) -> list[Position]:
-        return [Position(
-            name="量价背离反转_多头", symbol=self.symbol,
-            opens=[Event.load({
-                "name": "量价极值吞没_开多", "operate": "开多",
-                "signals_all": [_VOLPRICE_BS1, _ENGULF_BULL], "signals_not": [_ZDT],
-            })],
-            exits=[_exit_bi_down()],
-            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-        )]
-
-    @property
-    def signals_config(self):
-        base = list(super().signals_config)
-        names = {c["name"] for c in base}
-        extras = [
-            {"name": "bar_vol_bs1_V230224", "freq": FREQ, "di": 1, "n": 20},
-            {"name": "jcc_ten_mo_V221028", "freq": FREQ, "di": 1},
-        ]
-        for cfg in extras:
-            if cfg["name"] not in names:
-                base.append(cfg)
-        return base
-
-
-# ==================== 策略 5: 布林 + KDJ 超卖反弹 ====================
-
-_BOLL_BEAR_EXTREME = f"{FREQ}_D1BOLL20_强弱V221112_空头_超强_任意_0"
-_KDJ_BULL = f"{FREQ}_D1T20KDJ9#3#3#K值突破1#3_BS辅助V230401_多头_任意_任意_0"
-_BOLL_BULL = f"{FREQ}_D1BOLL20_强弱V221112_多头_任意_任意_0"
-
-
-class BollKDJStrategy(CzscStrategyBase):
-    @property
-    def positions(self) -> list[Position]:
-        return [Position(
-            name="布林KDJ超卖反弹_多头", symbol=self.symbol,
-            opens=[Event.load({
-                "name": "布林超卖KDJ转多_开多", "operate": "开多",
-                "signals_all": [_BOLL_BEAR_EXTREME, _KDJ_BULL], "signals_not": [_ZDT],
-            })],
-            exits=[
-                _exit_bi_down(),
-                Event.load({"name": "布林转多_平多", "operate": "平多", "signals_all": [_BOLL_BULL]}),
-            ],
-            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
-        )]
-
-    @property
-    def signals_config(self):
-        base = list(super().signals_config)
-        names = {c["name"] for c in base}
-        extras = [
-            {"name": "tas_boll_power_V221112", "freq": FREQ, "di": 1, "timeperiod": 20},
-            {"name": "tas_kdj_evc_V230401", "freq": FREQ, "di": 1, "th": 20, "key": "K",
-             "fastk_period": 9, "slowk_period": 3, "slowd_period": 3,
-             "min_count": 1, "max_count": 3},
-        ]
-        for cfg in extras:
-            if cfg["name"] not in names:
-                base.append(cfg)
-        return base
-
-
-# ==================== 策略 6: 双均线趋势回踩 + 支撑位 ====================
-
-_DUAL_MA_BULL = f"{FREQ}_D1T100#SMA#5#20_JX辅助V221203_多头_强势_任意_0"
-_SUPPORT = f"{FREQ}_D1W20_支撑压力V240402_支撑位_任意_任意_0"
-_REL_LOW = f"{FREQ}_N20_BS辅助V240328_相对低点_任意_任意_0"
-_DUAL_MA_BEAR = f"{FREQ}_D1T100#SMA#5#20_JX辅助V221203_空头_任意_任意_0"
-
-
-class DualMAPullbackStrategy(CzscStrategyBase):
-    @property
-    def positions(self) -> list[Position]:
-        return [Position(
-            name="双均线趋势回踩_多头", symbol=self.symbol,
-            opens=[Event.load({
-                "name": "均线强势回踩支撑_开多", "operate": "开多",
-                "signals_all": [_DUAL_MA_BULL, _SUPPORT, _REL_LOW],
+                "name": "DIF零轴+MACD向上+加速_开多", "operate": "开多",
+                "signals_all": [_DIF_NEAR_ZERO, _MACD_DIR_UP, _POLYFIT_ACC_UP],
                 "signals_not": [_ZDT],
             })],
             exits=[
                 _exit_bi_down(),
-                Event.load({"name": "均线转空_平多", "operate": "平多", "signals_all": [_DUAL_MA_BEAR]}),
+                Event.load({"name": "MACD转向_平多", "operate": "平多",
+                            "signals_all": [_MACD_DIR_DOWN]}),
             ],
-            interval=INTERVAL, timeout=TIMEOUT, stop_loss=400, t0=False,
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
         )]
 
     @property
@@ -273,10 +85,135 @@ class DualMAPullbackStrategy(CzscStrategyBase):
         base = list(super().signals_config)
         names = {c["name"] for c in base}
         extras = [
-            {"name": "tas_double_ma_V221203", "freq": FREQ, "di": 1,
-             "th": 100, "ma_type": "SMA", "timeperiod1": 5, "timeperiod2": 20},
-            {"name": "pressure_support_V240402", "freq": FREQ, "di": 1, "w": 20},
-            {"name": "xl_bar_position_V240328", "freq": FREQ, "n": 20},
+            {"name": "tas_dif_layer_V241010", "freq": FREQ, "w": 60, "t": 20},
+            {"name": "tas_macd_direct_V221106", "freq": FREQ, "di": 1,
+             "fastperiod": 12, "slowperiod": 26, "signalperiod": 9},
+            {"name": "bar_polyfit_V240428", "freq": FREQ, "di": 1, "w": 20},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
+
+
+# ==================== 策略 2: 三连阳放量起爆 ====================
+# 三根K线创新高 + 依次放量（最直观的起爆形态）+ 均线多头排列确认方向
+
+_TRIPLE_BULL_VOL = f"{FREQ}_D1三K加速_裸K形态V230506_新高涨_依次放量_任意_0"
+_MA_BULL_ALIGN = f"{FREQ}_D1SMA5#10#20_均线系统V230513_多头排列_任意_任意_0"
+
+
+class TripleBullStrategy(CzscStrategyBase):
+    """三K新高涨放量 + 均线多头排列"""
+
+    @property
+    def positions(self) -> list[Position]:
+        return [Position(
+            name="三连阳放量起爆_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "三连阳放量+均线多头_开多", "operate": "开多",
+                "signals_all": [_TRIPLE_BULL_VOL, _MA_BULL_ALIGN],
+                "signals_not": [_ZDT],
+            })],
+            exits=[_exit_bi_down()],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "bar_triple_V230506", "freq": FREQ, "di": 1},
+            {"name": "tas_ma_system_V230513", "freq": FREQ, "di": 1, "ma_seq": "5#10#20"},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
+
+
+# ==================== 策略 3: 笔趋势 + 动量加速 ====================
+# 笔高低点形成上升趋势 + MACD 强势（不是超强，避免追高）+ 价格加速
+
+_BI_UPTREND = f"{FREQ}_D4N1笔趋势_高低点辅助判断V230913_上升趋势_任意_任意_0"
+_MACD_STRONG = f"{FREQ}_D1K#MACD12#26#9强弱_BS辅助V221108_强势_任意_任意_0"
+_PRICE_ACC = f"{FREQ}_D1W10_加速V221110_上涨_任意_任意_0"
+_MACD_WEAK = f"{FREQ}_D1K#MACD12#26#9强弱_BS辅助V221108_弱势_任意_任意_0"
+
+
+class BiTrendAccelStrategy(CzscStrategyBase):
+    """笔上升趋势 + MACD 强势 + 价格加速"""
+
+    @property
+    def positions(self) -> list[Position]:
+        return [Position(
+            name="笔趋势动量加速_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "笔上升+MACD强势+加速_开多", "operate": "开多",
+                "signals_all": [_BI_UPTREND, _MACD_STRONG, _PRICE_ACC],
+                "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "MACD转弱_平多", "operate": "平多",
+                            "signals_all": [_MACD_WEAK]}),
+            ],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "cxt_bi_trend_V230913", "freq": FREQ, "di": 4, "n": 1},
+            {"name": "tas_macd_power_V221108", "freq": FREQ, "di": 1,
+             "fastperiod": 12, "slowperiod": 26, "signalperiod": 9},
+            {"name": "bar_accelerate_V221110", "freq": FREQ, "di": 1, "window": 10},
+        ]
+        for cfg in extras:
+            if cfg["name"] not in names:
+                base.append(cfg)
+        return base
+
+
+# ==================== 策略 4: 趋势跟踪 + 绝对动量加速 ====================
+# 60 日趋势跟踪确认多头 + 绝对动量达到强势 + 价格拟合加速上涨
+
+_TREND_BULL = f"{FREQ}_D1N60趋势跟踪_BS辅助V240209_多头_任意_任意_0"
+_ABS_MOMENTUM = f"{FREQ}_D1N20T1000_绝对动量V230227_强势_任意_任意_0"
+_TREND_BEAR = f"{FREQ}_D1N60趋势跟踪_BS辅助V240209_空头_任意_任意_0"
+
+
+class TrendMomentumAccelStrategy(CzscStrategyBase):
+    """60 日趋势多头 + 绝对动量强势 + 价格加速上涨"""
+
+    @property
+    def positions(self) -> list[Position]:
+        return [Position(
+            name="趋势动量加速_多头", symbol=self.symbol,
+            opens=[Event.load({
+                "name": "趋势多头+动量强+加速_开多", "operate": "开多",
+                "signals_all": [_TREND_BULL, _ABS_MOMENTUM, _POLYFIT_ACC_UP],
+                "signals_not": [_ZDT],
+            })],
+            exits=[
+                _exit_bi_down(),
+                Event.load({"name": "趋势转空_平多", "operate": "平多",
+                            "signals_all": [_TREND_BEAR]}),
+            ],
+            interval=INTERVAL, timeout=TIMEOUT, stop_loss=STOP_LOSS, t0=False,
+        )]
+
+    @property
+    def signals_config(self):
+        base = list(super().signals_config)
+        names = {c["name"] for c in base}
+        extras = [
+            {"name": "bar_trend_V240209", "freq": FREQ, "di": 1, "N": 60},
+            {"name": "bar_bpm_V230227", "freq": FREQ, "di": 1, "n": 20, "th": 1000},
+            {"name": "bar_polyfit_V240428", "freq": FREQ, "di": 1, "w": 20},
         ]
         for cfg in extras:
             if cfg["name"] not in names:
@@ -287,12 +224,10 @@ class DualMAPullbackStrategy(CzscStrategyBase):
 # ==================== 策略注册 ====================
 
 STRATEGY_TAGS = [
-    "1_波动率压缩突破", "2_MACD零轴共振", "3_TD序列反转",
-    "4_量价背离反转", "5_布林KDJ超卖反弹", "6_双均线趋势回踩",
+    "1_MACD转势起爆", "2_三连阳放量起爆", "3_笔趋势动量加速", "4_趋势动量加速",
 ]
 STRATEGY_CLASSES = [
-    VolSqueezeStrategy, MACDZeroStrategy, TD9Strategy,
-    VolPriceRevStrategy, BollKDJStrategy, DualMAPullbackStrategy,
+    MACDIgnitionStrategy, TripleBullStrategy, BiTrendAccelStrategy, TrendMomentumAccelStrategy,
 ]
 
 
@@ -363,7 +298,7 @@ def _process_stock(parquet_path: str) -> dict | None:
 
 def main():
     print("=" * 70)
-    print("  新策略研究回测 — 6 大策略（全 A 股日线数据）")
+    print("  趋势起爆到加速 — 4 大策略回测（全 A 股日线数据）")
     print("=" * 70)
 
     shutil.rmtree(HOLDS_DIR, ignore_errors=True)
@@ -398,7 +333,6 @@ def main():
     total_elapsed = time.time() - t_start
     print(f"\n[回测完成] 总耗时 {total_elapsed:.0f}s | 有效 {len(all_results)}/{len(file_list)} 只")
 
-    # Phase 1: 汇总交易对统计
     pair_stats: dict[str, dict] = {}
     for tag in STRATEGY_TAGS:
         ps = {"win": 0, "loss": 0, "pairs": 0, "stocks": 0}
@@ -412,7 +346,6 @@ def main():
                     ps["stocks"] += 1
         pair_stats[tag] = ps
 
-    # Phase 2: 读取 holds parquet 文件，按策略跑 WeightBacktest
     print("\n[Phase 2] 读取 holds 文件，运行 WeightBacktest ...")
     holds_files = sorted(HOLDS_DIR.glob("*.parquet"))
     print(f"  holds 文件: {len(holds_files)} 个")
@@ -477,7 +410,7 @@ def main():
             out_html = OUTPUT_DIR / f"{tag}.html"
             generate_backtest_report(
                 df=dfw, output_path=str(out_html),
-                title=f"新策略研究 - {tag}（全A股日线）",
+                title=f"趋势起爆加速 - {tag}（全A股日线）",
                 fee_rate=FEE_RATE, weight_type="ts", yearly_days=252,
             )
             print(f"  HTML: {out_html.name} ({out_html.stat().st_size/1024:.1f} KB)")
@@ -494,7 +427,7 @@ def main():
 
     cmp = pd.DataFrame(all_stats).set_index("tag")
     print("\n\n" + "=" * 80)
-    print("  策略对比汇总（全 A 股日线）")
+    print("  策略对比汇总（趋势起爆到加速 · 全 A 股日线）")
     print("=" * 80)
     display_cols = [c for c in [
         "stocks_count", "pairs_count", "pair_win_rate",
