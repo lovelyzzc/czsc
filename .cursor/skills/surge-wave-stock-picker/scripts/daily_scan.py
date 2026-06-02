@@ -313,7 +313,8 @@ def main():
             else:
                 priority += 0  # 止损太窄（< 3%），可能噪音
         else:
-            priority += 0
+            # 止损幅度为负 = 当前价已跌破止损位，不应入场
+            priority -= 30
 
         # 维度 3: MA10 贴合度（25 分）— 越接近 MA10 入场价越好
         ma10_dev = r.get("MA10偏离%", 0)
@@ -339,8 +340,13 @@ def main():
         shrink_score = 10 if vol_shrink < 0.8 else (7 if vol_shrink < 1.0 else 3)
         priority += fresh_score + shrink_score
 
-        r["优先级"] = round(priority, 1)
-        r["等级"] = "A" if priority >= 80 else ("B" if priority >= 65 else "C")
+        r["优先级"] = round(max(priority, 0), 1)
+        # 止损已穿透（幅度为负）强制降级
+        sl_broken = sl_pct is not None and sl_pct <= 0
+        if sl_broken:
+            r["等级"] = "C"
+        else:
+            r["等级"] = "A" if priority >= 80 else ("B" if priority >= 65 else "C")
 
     # ── 硬性过滤 ──
     actionable = [r for r in results
