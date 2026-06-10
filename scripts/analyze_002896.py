@@ -21,10 +21,7 @@ PARQUET = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq" / "002896.SZ.parq
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TOKEN = os.getenv(
-    "TINYSHARE_TOKEN",
-    "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b",
-)
+TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
 
 
 def update_data() -> pd.DataFrame:
@@ -99,7 +96,7 @@ def analyze(c: CZSC, df: pd.DataFrame):
     print("=" * 70)
 
     # 基础信息
-    print(f"\n【基础统计】")
+    print("\n【基础统计】")
     print(f"  数据范围: {df['trade_date'].iloc[0]} ~ {df['trade_date'].iloc[-1]}")
     print(f"  分型数量: {len(fx_list)}")
     print(f"  完成笔数: {len(bi_list)}")
@@ -108,7 +105,7 @@ def analyze(c: CZSC, df: pd.DataFrame):
     print(f"  最新收盘: {last_price:.2f}")
 
     # 最近几笔分析
-    print(f"\n【最近 5 笔走势】")
+    print("\n【最近 5 笔走势】")
     for bi in bi_list[-5:]:
         direction = "↑" if str(bi.direction) == "Direction.Up" else "↓"
         power = f"{bi.power:.2f}" if hasattr(bi, "power") else "N/A"
@@ -123,7 +120,7 @@ def analyze(c: CZSC, df: pd.DataFrame):
     # 当前笔状态
     last_bi = bi_list[-1]
     is_up = str(last_bi.direction) == "Direction.Up"
-    print(f"\n【当前笔状态】")
+    print("\n【当前笔状态】")
     print(f"  最后一笔方向: {'向上 ↑' if is_up else '向下 ↓'}")
     print(f"  起点: {last_bi.fx_a.dt.strftime('%Y-%m-%d')} @ {float(last_bi.fx_a.fx):.2f}")
     print(f"  终点: {last_bi.fx_b.dt.strftime('%Y-%m-%d')} @ {float(last_bi.fx_b.fx):.2f}")
@@ -132,14 +129,14 @@ def analyze(c: CZSC, df: pd.DataFrame):
     # 未完成笔（ubi）
     if c.ubi_fxs:
         ubi_fxs = list(c.ubi_fxs)
-        print(f"\n【未完成笔 (UBI)】")
+        print("\n【未完成笔 (UBI)】")
         for fx in ubi_fxs:
             mark = "顶" if str(fx.mark) == "Mark.G" else "底"
             print(f"  {mark}分型 @ {fx.dt.strftime('%Y-%m-%d')}  价格 {float(fx.fx):.2f}")
 
     # 最近中枢
     if zs_list:
-        print(f"\n【最近中枢】")
+        print("\n【最近中枢】")
         for zs in zs_list[-3:]:
             bis_in_zs = list(zs.bis)
             print(
@@ -165,8 +162,8 @@ def analyze(c: CZSC, df: pd.DataFrame):
     latest_vol = float(df.iloc[-1]["vol"])
     vol_ratio = latest_vol / avg_vol_20 if avg_vol_20 > 0 else 0
 
-    print(f"\n【近期量价特征】")
-    print(f"  最近10日涨跌:")
+    print("\n【近期量价特征】")
+    print("  最近10日涨跌:")
     for _, row in recent.iterrows():
         pct = row["pct_chg"]
         bar = "▓" * min(int(abs(pct) * 2), 20) if not pd.isna(pct) else ""
@@ -183,15 +180,15 @@ def analyze(c: CZSC, df: pd.DataFrame):
     ma20 = closes[-20:].mean()
     ma60 = closes[-60:].mean() if len(closes) >= 60 else None
 
-    print(f"\n【均线系统】")
+    print("\n【均线系统】")
     print(f"  MA5  = {ma5:.2f}  {'✓ 价格在上' if last_price > ma5 else '✗ 价格在下'}")
     print(f"  MA20 = {ma20:.2f}  {'✓ 价格在上' if last_price > ma20 else '✗ 价格在下'}")
     if ma60:
         print(f"  MA60 = {ma60:.2f}  {'✓ 价格在上' if last_price > ma60 else '✗ 价格在下'}")
     if ma5 > ma20:
-        print(f"  MA5 > MA20 → 短期均线多头排列")
+        print("  MA5 > MA20 → 短期均线多头排列")
     else:
-        print(f"  MA5 < MA20 → 短期均线空头排列")
+        print("  MA5 < MA20 → 短期均线空头排列")
 
     # 综合判断
     print(f"\n{'=' * 70}")
@@ -231,7 +228,7 @@ def analyze(c: CZSC, df: pd.DataFrame):
 
     # 关键价位
     if zs_list:
-        print(f"\n  关键价位:")
+        print("\n  关键价位:")
         print(f"    最近中枢上沿 (ZG): {last_zs.zg:.2f} — 突破确认则看多")
         print(f"    最近中枢下沿 (ZD): {last_zs.zd:.2f} — 跌破则看空")
         print(f"    最近中枢最高 (GG): {last_zs.gg:.2f}")

@@ -1,5 +1,9 @@
 # 缠论走势类型划分（11 态）+ 买卖点回测 + 主升浪特征研究
 
+> **2026-06-10 审计完结**：完整结论、证据与下一轮迭代交接见
+> [`SURGE_REGIME_AUDIT_2026-06-10.md`](SURGE_REGIME_AUDIT_2026-06-10.md)。
+> 一句话判定：实盘镜像 + 随机对照下当前形态**无选股 alpha**。
+
 把个股日线走势划分为 0..10 共 11 个走势类型，标注各状态的买卖点，做样本外（OOS）
 回测对比，并研究主升浪个股的特征与阶段、给出止损止盈策略。**全程不使用未来函数，
 不按指标网格搜最优（防过拟合）。**
@@ -11,17 +15,28 @@
 | `trend_regime.py` | 因果安全的 11 态缠论状态机（核心模块） | `uv run --no-sync python scripts/trend_regime.py --self-check 000636.SZ` |
 | `trend_regime_backtest.py` | 右侧买点 + 止损止盈矩阵 + OOS 回测 | `uv run --no-sync python scripts/trend_regime_backtest.py` |
 | `surge_characteristics.py` | 主升浪特征/阶段研究报告 | `uv run --no-sync python scripts/surge_characteristics.py` |
-| `surge_regime_backtest.py` | 主升浪启动 OOS 回测（确认追入 vs 启动埋伏） | `uv run --no-sync python scripts/surge_regime_backtest.py` |
+| `surge_regime_backtest.py` | 主升浪启动 OOS 回测（全信号等权，**结论已被下行替代**） | `uv run --no-sync python scripts/surge_regime_backtest.py` |
+| `surge_candidates_dump.py` | 门控前候选 × 多延迟模拟一次性抽取（下游共享数据） | `uv run --no-sync python scripts/surge_candidates_dump.py` |
+| `surge_portfolio_backtest.py` | **实盘镜像组合回测**（top-N+硬过滤+成本）+ 随机对照 beta 剥离 | `uv run --no-sync python scripts/surge_portfolio_backtest.py` |
+| `surge_signal_analyses.py` | 新鲜度衰减 + 门控敏感性分析 | `uv run --no-sync python scripts/surge_signal_analyses.py` |
+| `check_tail_consistency.py` | daily_scan TAIL 快路径 vs 全量重放一致性 | `uv run --no-sync python scripts/check_tail_consistency.py 160 300` |
+| `_repair_qfq_seams.py` | qfq 缓存接缝检测/重下/链式修平 | `python scripts/_repair_qfq_seams.py --fix` |
 
-输出落 `scripts/_output/trend_regime/`（11 态回测）与 `scripts/_output/surge_regime/`（主升浪回测）。
+输出落 `scripts/_output/{trend_regime, surge_regime, surge_candidates, surge_portfolio}/`。
 
 ## 主升浪启动信号 + 每日选股
 
 `trend_regime.surge_onset(prev, regime, feats, prior, mode)` 是共享的因果「主升浪启动」信号
 （`confirm` 确认进 7/8 / `anticipate` 刚离开中枢 5，均带放量+均线发散门控），被回测与选股 skill 共用。
-每日选股见 `.cursor/skills/surge-regime-stock-picker/`（`iter_states(tail=150)` 快路径，全市场扫描 ~2 分钟）。
-主升浪回测结论：**FULL 退出（SL2+18%跟踪+背驰/破坏）在 IS/OOS 两段均优于仅 SL2**；两种买点相当
-（启动埋伏胜率/回撤略优，确认追入单笔幅度略大）。OOS>IS 仍含 2024Q4 市场 beta。
+每日选股见 `.cursor/skills/surge-regime-stock-picker/`（`iter_states(tail=160)` 快路径，全市场扫描 ~2 分钟；
+快路径与全量重放一致率 100%）。优先级排序走 `trend_regime.priority_score`（选股与回测单一真源）。
+
+**2026-06-10 实盘镜像重测结论（替代旧 surge_regime_backtest 结论）**：top-N 优先级选股 +
+硬过滤 + 成本 + 退市股回补后，两种买点 OOS 超额（vs 同日同成交额十分位随机对照）均不显著
+→ **收益主体为规模/市场 beta，未证明选股 alpha**；组合净年化为负。仅 2025 年有显著正超额，
+2024/2026 为负（市场状态依赖）。`priority_score` 选出的交易差于全候选平均，仅作展示排序。
+详见 `.cursor/skills/surge-regime-stock-picker/SKILL.md` 的回测表现一节与
+`scripts/_output/surge_portfolio/summary.json`。
 
 ## 11 个走势类型
 
@@ -40,7 +55,18 @@
    `--self-check` 中**断言**「流式 `bi_list` == 全量 `CZSC(bars[:t+1])` 逐字节一致」，
    消除「最后一笔用未来 bar 确认」这一常见泄漏（旧脚本用 `bi.edt<=dt` 过滤即有此泄漏）。
 2. **次日开盘成交**：信号收盘确认，次日开盘价成交；止损按当日触及价、跳空按开盘。
-3. **涨停跳过**：`|pct_chg|≥9.8%` 当日置为不可交易，无法成交即不入场。
+3. **涨停跳过**：按板阈值（主板 9.8% / 创业板 19.8%，`limit_pct_for`）当日置为
+   不可交易，无法成交即不入场。
+
+## 数据层（2026-06-10 修复）
+
+- **qfq 接缝清零**：增量同步曾把未复权行追加到前复权历史（693 只），且数据源对
+  配股/缩股类除权的复权因子有缺陷（182 只）——`_repair_qfq_seams.py --fix` 重下 +
+  pre_close 链式修平，全库 `close[i]/close[i-1]-1 == pct_chg[i]` 校验通过；
+  `_sync_daily_data.py` 同步后自动修平新接缝。
+- **退市股回补**：`sync_a_stock_daily.py --list-status D` 回补 198 只退市股
+  （130 只早年退市无复权因子失败，记录于 manifest），缓解生存者偏差；
+  全库 5719 只。
 
 ## 关键结论
 
@@ -64,6 +90,11 @@
 > **诚实的注意事项**：OOS(2024+) 明显强于 IS，部分原因是测试窗口正好覆盖 2024Q4 的
 > A 股大涨——这里有**市场 beta**，不能全记为策略 alpha。可信的是「跨期一致的排序」，
 > 不是某个绝对年化数。
+>
+> **2026-06-10 更新**：上表数字产生于数据修复前（qfq 接缝、无退市股、创业板 10cm 错杀）
+> 且为全信号等权 + 零成本口径，**绝对数值不可用于交易决策**；退出方式的相对排序结论
+> （结构/波动止损 > 快速状态止损）仍被实盘镜像重测支持。主升浪买点的最终判定见上节：
+> 无显著选股 alpha。
 
 ### 主升浪特征（909 次主升浪 vs 130 万对照样本）
 

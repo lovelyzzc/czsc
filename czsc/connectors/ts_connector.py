@@ -8,10 +8,9 @@ describe: Tushare/Tinyshare数据源
 import os
 
 import pandas as pd
+import tinyshare as ts
 from loguru import logger
 from tqdm import tqdm
-
-import tinyshare as ts
 
 import czsc
 from czsc import Freq, RawBar

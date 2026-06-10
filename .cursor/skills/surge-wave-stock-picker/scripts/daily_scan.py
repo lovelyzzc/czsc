@@ -163,16 +163,15 @@ def _scan_one_stock(parquet_path: str) -> dict | None:
             dif[idx], dif_5ago, ma5[idx], ma10[idx], ma20[idx], ret20,
         )
 
-        if total >= SCORE_THRESHOLD:
-            if best_signal is None or total > best_signal["total"]:
-                dn_bis = [b for b in bis_up_to if b.direction.value == "向下"]
-                best_signal = {
-                    "sig_idx": idx,
-                    "sig_date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
-                    "total": total,
-                    "detail": detail,
-                    "sl_bi": dn_bis[-1].low if dn_bis else None,
-                }
+        if total >= SCORE_THRESHOLD and (best_signal is None or total > best_signal["total"]):
+            dn_bis = [b for b in bis_up_to if b.direction.value == "向下"]
+            best_signal = {
+                "sig_idx": idx,
+                "sig_date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                "total": total,
+                "detail": detail,
+                "sl_bi": dn_bis[-1].low if dn_bis else None,
+            }
 
     if best_signal is None:
         return None
@@ -249,8 +248,8 @@ def _load_stock_basic() -> tuple[dict, dict]:
     ts.set_token(TOKEN)
     pro = ts.pro_api()
     basic = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
-    name_map = dict(zip(basic["ts_code"], basic["name"]))
-    industry_map = dict(zip(basic["ts_code"], basic["industry"]))
+    name_map = dict(zip(basic["ts_code"], basic["name"], strict=False))
+    industry_map = dict(zip(basic["ts_code"], basic["industry"], strict=False))
     return name_map, industry_map
 
 
@@ -370,8 +369,8 @@ def main():
     print(f"  {scan_date} 主升浪精选  |  "
           f"精选可入场 {min(n_act, TOP_N)}/{n_act} 只 | "
           f"观察池 {n_watch} 只 | 初筛总计 {n_all} 只")
-    print(f"  策略：B+D 组合（回调入场 + SL2兜底 + 分级跟踪止损）| 回测卡玛 3.81")
-    print(f"  排序：优先级综合评分 = 特征得分(30) + 止损可控(25) + MA10贴合(25) + 新鲜度缩量(20)")
+    print("  策略：B+D 组合（回调入场 + SL2兜底 + 分级跟踪止损）| 回测卡玛 3.81")
+    print("  排序：优先级综合评分 = 特征得分(30) + 止损可控(25) + MA10贴合(25) + 新鲜度缩量(20)")
     print(f"{'='*170}")
 
     header = (f"{'序':>3} {'等级':>3} {'代码':>12} {'名称':<8} {'行业':<8} {'收盘价':>7} {'得分':>3} "
