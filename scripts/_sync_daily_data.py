@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -13,7 +14,12 @@ import pandas as pd
 import tinyshare as ts
 
 DATA_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
-TOKEN = "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b"
+TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+
+
+def _setup_tinyshare():
+    ts.set_token(TOKEN)
+    return ts.pro_api()
 
 
 def get_trade_dates_to_sync() -> list[str]:
@@ -31,10 +37,8 @@ def get_trade_dates_to_sync() -> list[str]:
 
     print(f"本地数据截止日: {local_max}")
 
-    ts.set_token(TOKEN)
-    pro = ts.pro_api()
-    cal = pro.query("trade_cal", exchange="SSE", start_date=local_max, end_date="20260630",
-                    fields="cal_date,is_open")
+    pro = _setup_tinyshare()
+    cal = pro.query("trade_cal", exchange="SSE", start_date=local_max, end_date="20260630", fields="cal_date,is_open")
     trade_days = cal[(cal["is_open"] == 1) & (cal["cal_date"] > local_max)]["cal_date"].sort_values().tolist()
     return trade_days
 
@@ -47,7 +51,7 @@ def sync_one_day(trade_date: str, pro) -> int:
         print(f"  {trade_date}: 无数据（非交易日或尚未发布）")
         return 0
 
-    print(f"  {trade_date}: 拉取 {len(df)} 只, API耗时 {time.time()-t0:.1f}s", end="")
+    print(f"  {trade_date}: 拉取 {len(df)} 只, API耗时 {time.time() - t0:.1f}s", end="")
 
     updated = 0
     t1 = time.time()
@@ -74,8 +78,20 @@ def sync_one_day(trade_date: str, pro) -> int:
         combined.to_parquet(pq, index=False)
         updated += 1
 
-    print(f" → 更新 {updated} 个文件, 写入耗时 {time.time()-t1:.1f}s")
+    print(f" → 更新 {updated} 个文件, 写入耗时 {time.time() - t1:.1f}s")
     return updated
+
+
+def repair_new_seams() -> None:
+    """追加的是未复权行：若同步窗口内有除权除息，会产生 qfq 接缝，用链式修平消除。"""
+    from _repair_qfq_seams import find_seams, flatten_seams
+
+    n_fixed = 0
+    for pq in sorted(DATA_DIR.glob("*.parquet")):
+        if find_seams(pq):
+            n_fixed += flatten_seams(pq)
+    if n_fixed:
+        print(f"[复权] 链式修平 {n_fixed} 处除权接缝")
 
 
 def main():
@@ -90,8 +106,7 @@ def main():
 
     print(f"需要同步 {len(trade_dates)} 个交易日: {trade_dates}")
 
-    ts.set_token(TOKEN)
-    pro = ts.pro_api()
+    pro = _setup_tinyshare()
 
     t0 = time.time()
     total_updated = 0
@@ -99,7 +114,8 @@ def main():
         n = sync_one_day(td, pro)
         total_updated += n
 
-    print(f"\n[完成] 总耗时 {time.time()-t0:.1f}s | 同步 {len(trade_dates)} 天 | 更新 {total_updated} 次")
+    repair_new_seams()
+    print(f"\n[完成] 总耗时 {time.time() - t0:.1f}s | 同步 {len(trade_dates)} 天 | 更新 {total_updated} 次")
 
 
 if __name__ == "__main__":

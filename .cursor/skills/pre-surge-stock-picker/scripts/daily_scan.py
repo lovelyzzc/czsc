@@ -14,10 +14,9 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import time
 from pathlib import Path
-
-import os
 
 import numpy as np
 import pandas as pd
@@ -110,7 +109,7 @@ def _score_stock(bis, zs_list, dif_val, vol_ratio_prev, vol_ratio_now):
     else:
         raw["C7_不回中枢"] = 0
 
-    weighted_total = sum(w * v for w, v in zip(FEATURE_WEIGHTS, raw.values()))
+    weighted_total = sum(w * v for w, v in zip(FEATURE_WEIGHTS, raw.values(), strict=False))
     return weighted_total, raw
 
 
@@ -241,8 +240,8 @@ def _load_stock_basic() -> tuple[dict, dict]:
     ts.set_token(TOKEN)
     pro = ts.pro_api()
     basic = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
-    name_map = dict(zip(basic["ts_code"], basic["name"]))
-    industry_map = dict(zip(basic["ts_code"], basic["industry"]))
+    name_map = dict(zip(basic["ts_code"], basic["name"], strict=False))
+    industry_map = dict(zip(basic["ts_code"], basic["industry"], strict=False))
     return name_map, industry_map
 
 

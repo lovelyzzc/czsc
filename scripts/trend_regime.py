@@ -55,7 +55,9 @@ DATA_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
 MIN_BARS = 500  # 个股最少 bar 数（数据足够长才纳入）
 WARMUP_BARS = 120  # 暖机 bar 数：之前一律 NotTradable
 MIN_BIS = 6  # 分类所需最少笔数
-LIMIT_PCT = 9.8  # 涨跌停阈值（当日 |pct_chg|≥此值视为无法成交）
+LIMIT_PCT_MAIN = 9.8  # 主板涨跌停阈值（当日 |pct_chg|≥此值视为无法成交）
+LIMIT_PCT_CHINEXT = 19.8  # 创业板 20cm 阈值（2020-08 注册制改革后，数据起点 2021-05 全程适用）
+CHINEXT_PREFIX = ("300", "301", "302")  # 创业板代码段
 ZS_MIN_BIS = 3  # 构成中枢的最少笔数
 EXCLUDE_PREFIX = ("688", "920", "83", "43")  # 科创板/北交所（涨跌停规则不同）
 
@@ -128,6 +130,11 @@ class StateSnapshot:
 # --------------------------------------------------------------------------- #
 # 数据加载 / 指标
 # --------------------------------------------------------------------------- #
+def limit_pct_for(code: str) -> float:
+    """按板返回涨跌停判定阈值（创业板 20cm，其余 10cm；688/83/43 已被排除）。"""
+    return LIMIT_PCT_CHINEXT if str(code).startswith(CHINEXT_PREFIX) else LIMIT_PCT_MAIN
+
+
 def load_stock(parquet_path: str | Path) -> pd.DataFrame | None:
     """读取单只个股日线 qfq parquet，做基础过滤并标准化列名。
 
@@ -422,6 +429,32 @@ def surge_score(feats: dict | None) -> float:
     return round(s, 1)
 
 
+# 当前状态质量分（priority_score 的组成部分；加速>三买>主升>离开）
+REGIME_QUALITY = {Regime.Acceleration: 20, Regime.ThirdBuy: 18, Regime.MainUptrend: 16, Regime.UpwardDeparture: 12}
+# 止损幅度奖励带：满分区间与选股硬过滤一致（8-20%），过近/过远递减
+STOP_FULL_BAND = (8.0, 20.0)
+STOP_PARTIAL_BAND = (5.0, 30.0)
+
+
+def priority_score(score: float, sl_pct: float | None, freshness: int, regime: int, scan_window: int = 10) -> float:
+    """选股/回测共用的综合优先级 = 主升强度(35) + 止损可控(25) + 新鲜度(20) + 状态质量(20)。
+
+    单一真源：daily_scan 排序与组合回测的候选排序都走这里，保证「回测的就是实盘排的」。
+    """
+    p = min(score, 100.0) * 0.35
+    if sl_pct is None or (isinstance(sl_pct, float) and np.isnan(sl_pct)) or sl_pct <= 0:
+        p -= 30  # 止损穿透/无效
+    elif STOP_FULL_BAND[0] <= sl_pct <= STOP_FULL_BAND[1]:
+        p += 25
+    elif STOP_PARTIAL_BAND[0] <= sl_pct < STOP_FULL_BAND[0] or STOP_FULL_BAND[1] < sl_pct <= STOP_PARTIAL_BAND[1]:
+        p += 15
+    else:
+        p += 5
+    p += max(0.0, (scan_window - freshness) / scan_window) * 20
+    p += REGIME_QUALITY.get(Regime(regime), 10)
+    return round(max(p, 0.0), 1)
+
+
 def _seed_regime(bis: list, zs_list: list, ind: dict, idx: int) -> Regime:
     """暖机结束时的初始状态：用一次无状态启发式播种，避免 FSM 起步偏差。"""
     zs = zs_list[-1] if zs_list else None
@@ -451,6 +484,7 @@ def iter_states(
     bars = format_standard_kline(df, freq=freq)
     if n <= WARMUP_BARS:
         return []
+    limit_pct = limit_pct_for(df["symbol"].iloc[0])
 
     start = WARMUP_BARS if tail is None else max(WARMUP_BARS, n - tail)
     czsc = CZSC(bars[:start])  # 暖机（= 全量构造 bars[:start]，已验证因果一致）
@@ -462,7 +496,7 @@ def iter_states(
         czsc.update(bars[idx])  # 处理后 bi_list 反映 bars[:idx+1]（已验证因果）
         bis = czsc.bi_list
 
-        not_tradable = len(bis) < MIN_BIS or abs(ind["pct_chg"][idx]) >= LIMIT_PCT or ind["vol"][idx] <= 0
+        not_tradable = len(bis) < MIN_BIS or abs(ind["pct_chg"][idx]) >= limit_pct or ind["vol"][idx] <= 0
         if not_tradable:
             regime = Regime.NotTradable
             zs_list, dn = [], []
