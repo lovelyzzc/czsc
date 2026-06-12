@@ -96,6 +96,8 @@ def find_surges(states, ind):
                     break
             surges.append(
                 {
+                    "start_k": int(start_k),  # states 序列内的启动/结束位置（供因子研究做前向标签）
+                    "end_k": int(end_k),
                     "gain": round(float(gain), 3),
                     "dur": int(dur),
                     "max_dd": round(float(max_dd), 3),

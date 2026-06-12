@@ -25,6 +25,7 @@ import tinyshare as ts
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO / "scripts"))
 
+import surge_live as sl  # noqa: E402
 import trend_regime as tr  # noqa: E402
 from trend_regime import REGIME_CN, Regime, priority_score, surge_onset, surge_score  # noqa: E402
 
@@ -54,6 +55,16 @@ def _scan_one(parquet_path: str) -> dict | None:
     if last.regime not in UPTREND_FAMILY:  # 结构已破坏/已转卖点 → 非追入窗口
         return None
 
+    code = df["symbol"].iloc[0]
+    amount = float(df["amount"].iloc[-1]) if "amount" in df.columns else 0.0
+    amount_e = round(amount / 100000, 2) if amount > 0 else 0.0
+
+    # 实验 · delay5 回踩买点（独立于主表逻辑，不影响默认输出）
+    exp = sl.detect_delay5(states)
+    if exp:
+        exp["代码"] = code
+        exp["成交额亿"] = amount_e
+
     # 最近 SCAN_WINDOW 根内最新的一次主升浪启动
     found = None
     for p in range(len(states) - 1, max(0, len(states) - 1 - SCAN_WINDOW), -1):
@@ -65,20 +76,17 @@ def _scan_one(parquet_path: str) -> dict | None:
         if found:
             break
     if found is None:
-        return None
+        return {"main": None, "exp": exp} if exp else None
 
     p_onset, variant = found
     freshness = (len(states) - 1) - p_onset
     feats = last.feats or {}
     close = last.close
-    sl = last.sl_ref if last.sl_ref == last.sl_ref else last.zd  # NaN 检查；退化用中枢下沿
-    sl = sl if (sl == sl and sl > 0) else None
-    sl_pct = round((close - sl) / close * 100, 1) if sl else None
-    code = df["symbol"].iloc[0]
-    amount = float(df["amount"].iloc[-1]) if "amount" in df.columns else 0.0
-    amount_e = round(amount / 100000, 2) if amount > 0 else 0.0
+    sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd  # NaN 检查；退化用中枢下沿
+    sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
+    sl_pct = round((close - sl_ref) / close * 100, 1) if sl_ref else None
 
-    return {
+    main_rec = {
         "代码": code,
         "名称": "",
         "行业": "",
@@ -93,12 +101,13 @@ def _scan_one(parquet_path: str) -> dict | None:
         "MA散度%": feats.get("ma_spread_pct"),
         "ret20%": feats.get("ret20"),
         "成交额亿": amount_e,
-        "推荐止损": round(sl, 2) if sl else None,
+        "推荐止损": round(sl_ref, 2) if sl_ref else None,
         "止损幅度%": sl_pct,
         "过滤原因": "",
         "可操作": False,
         "止盈规则": TP_RULE,
     }
+    return {"main": main_rec, "exp": exp}
 
 
 def _priority(r: dict) -> float:
@@ -163,19 +172,26 @@ def main():
     )
 
     t0 = time.time()
-    results = []
+    results, exp_raw = [], []
     ctx = mp.get_context("spawn")
     with ctx.Pool(n_workers) as pool:
         for i, res in enumerate(pool.imap_unordered(_scan_one, files, chunksize=20), 1):
             if res:
-                results.append(res)
+                if res.get("main"):
+                    results.append(res["main"])
+                if res.get("exp"):
+                    exp_raw.append(res["exp"])
             if i % 1000 == 0 or i == len(files):
                 print(f"  [{i}/{len(files)}] 命中 {len(results)} | {time.time() - t0:.0f}s")
 
-    if not results:
+    if results:
+        _report_default(results, name_map, industry_map, metadata_available)
+    else:
         print("\n今日无处于主升浪启动/追入窗口的标的")
-        return
+    _report_experimental(exp_raw, name_map, industry_map, metadata_available)
 
+
+def _report_default(results, name_map, industry_map, metadata_available):
     for r in results:
         r["名称"] = name_map.get(r["代码"], "")
         r["行业"] = industry_map.get(r["代码"], "")
@@ -254,6 +270,80 @@ def main():
     ]
     pd.DataFrame(results)[cols].to_parquet(out, index=False)
     print(f"\n[文件] {out}")
+
+
+def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
+    """实验 · 回踩买点 delay5。镜像口径固定（不吃环境变量阈值），仅记录与研究，非默认买入建议。
+
+    口径 = scripts/surge_pullback_entry_research.py 的 state_delay5 变体：
+    anticipate 信号（信号日门控）后第 5 个交易日收盘决策、次日开盘入场；
+    市场状态门 high20_ratio>0.12 & 等权指数>MA20；硬过滤 成交额≥1亿 + 止损带 8-20% + 剔除 ST。
+    """
+    print(f"\n{'=' * 150}")
+    print("  实验 · 回踩买点 delay5（研究中，非买入建议）— anticipate 信号后第 5 个交易日决策、次日开盘入场")
+    print(
+        "  机制注记：稳健性审计显示超额来自「5 日存活确认」而非回踩定价；超额中位数为负、肥尾驱动（详见 SURGE_REGIME_DELAY5_MIRROR_2026-06-11.md）"
+    )
+    print(f"{'=' * 150}")
+
+    t0 = time.time()
+    print("[市场状态] 构建全市场尾部面板 ...")
+    panel = sl.build_live_panel()
+    state = sl.live_market_state(panel)
+    row = state.iloc[-1]
+    gate = sl.market_gate_open(row)
+    sl.append_market_state_log(state.tail(10))
+    above = "高于" if row["ew_index_above_ma20"] > 0 else "低于"
+    print(
+        f"  {pd.Timestamp(row['dt']).date()} high20_ratio={row['high20_ratio']:.3f}（门槛>0.12）| "
+        f"等权指数{above} MA20 → 市场状态门【{'开' if gate else '关'}】 | {time.time() - t0:.0f}s"
+    )
+
+    if not exp_raw:
+        print("  今日无 delay5 结构候选（anticipate 信号后第 5 日仍在上行家族：0 只）")
+        return
+
+    for r in exp_raw:
+        r["名称"] = name_map.get(r["代码"], "")
+        r["行业"] = industry_map.get(r["代码"], "")
+        reasons = sl.hard_filter_reasons(r["sl_pct"], r["成交额亿"])
+        if metadata_available and _is_st_or_delist(r["名称"]):
+            reasons.append("ST/退市风险")
+        r["过滤原因"] = "|".join(reasons)
+        r["市场门"] = gate
+        r["可操作"] = gate and not reasons
+
+    exp_raw.sort(key=lambda x: -x["priority"])
+    actionable = [r for r in exp_raw if r["可操作"]]
+    print(
+        f"  结构候选 {len(exp_raw)} 只 | 通过硬过滤+市场门 {len(actionable)} 只 | "
+        f"入场=次日开盘（开盘逼近涨停 ≥板限-0.3% 则放弃）| 退出=SL2+18%跟踪+背驰/破坏"
+    )
+    header = (
+        f"{'序':>3} {'代码':>11} {'名称':<8} {'收盘':>7} {'状态':<7} {'优先级':>5} {'score':>5} "
+        f"{'止损':>7} {'幅度%':>6} {'额亿':>6} {'启动日':<11} {'过滤原因':<18}"
+    )
+    print(header)
+    print("-" * 150)
+    for i, r in enumerate(exp_raw[:10], 1):
+        print(
+            f"{i:>3} {r['代码']:>11} {r['名称'][:6]:<8} {r['close']:>7.2f} "
+            f"{REGIME_CN[Regime(r['dec_regime'])]:<7} {r['priority']:>5} {r['score']:>5} "
+            f"{(r['sl_ref'] or 0):>7.2f} {(r['sl_pct'] if r['sl_pct'] is not None else 0):>6.1f} "
+            f"{r['成交额亿']:>6.2f} {pd.Timestamp(r['sig_dt']).strftime('%Y-%m-%d'):<11} {r['过滤原因']:<18}"
+        )
+    if len(exp_raw) > 10:
+        print(f"  ... 另有 {len(exp_raw) - 10} 只结构候选未显示")
+    if not gate:
+        print("  ⚠ 市场状态门关闭：以上仅作记录，按策略口径今日不开新仓（2026 环境常态，属系统按设计工作）")
+
+    dec_date = pd.Timestamp(exp_raw[0]["dec_dt"]).strftime("%Y-%m-%d")
+    out = OUTPUT_DIR / f"picks_exp_delay5_{dec_date}.parquet"
+    df = pd.DataFrame(exp_raw)
+    df["sig_dt"] = pd.to_datetime(df["sig_dt"])
+    df["dec_dt"] = pd.to_datetime(df["dec_dt"])
+    df.to_parquet(out, index=False)
+    print(f"  [文件] {out}")
 
 
 if __name__ == "__main__":
