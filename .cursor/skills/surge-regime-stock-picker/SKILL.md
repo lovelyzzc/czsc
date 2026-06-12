@@ -102,7 +102,27 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 不构成可直接交易的盈利预期**。若要实盘化，下一步方向是叠加市场状态过滤器
 （仅 2025 这类环境有超额）并重新验证。
 
+## 实验模式：delay5 存活确认买点（2026-06-11 起，非买入建议）
+
+扫描输出末尾附带「实验 · 回踩买点 delay5」段（默认表不受影响）：anticipate 信号后
+第 5 个交易日收盘仍在上行家族（5/6/7/8）的候选，叠加市场状态门
+`high20_ratio>0.12 & 等权指数>MA20` 与固定硬过滤（成交额≥1亿、止损带 8-20%、剔除 ST；
+不吃 `SURGE_PICKER_*` 环境变量），入场=次日开盘（逼近涨停放弃）。
+
+研究依据与限制（详见 `scripts/SURGE_REGIME_DELAY5_MIRROR_2026-06-11.md`）：
+
+- 2024+ OOS 毛超额 +7.58%（t=2.96），对 delay 取值（2-5 天皆优）/槽位/排序均稳健；
+- **但分布为肥尾彩票型**：超额中位数 -0.19%，top-10 笔占正收益 56%，仅 2025 年
+  典型交易为正——机制是「5 日存活确认」而非回踩定价，实现值方差极大；
+- **转正需满足预声明前向标准**（≥60 笔前向样本、超额 t≥2 且中位数>0），当前仅记录；
+- 2026 环境市场门长期关闭，实验段日常显示「门关 + 仅记录」属正常；
+- 组合口径为**广度优先 30 槽**（2026-06-12 第五轮容量研究按预声明规则由 20 槽更新，
+  详见 `scripts/SURGE_REGIME_CAPACITY_RESEARCH_2026-06-12.md`）；全日历诚实年化
+  全史仅 +2.8%/最大回撤 43.9%，正期望集中在 2024+ 市场门开启环境，不可外推。
+
 ## 输出文件
 
 扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`。
+实验模式：同目录 `picks_exp_delay5_YYYY-MM-DD.parquet`（全部结构候选 + 市场门/过滤布尔列）
+与 `market_state_live.parquet`（市场状态前向审计日志）。
 回测 HTML/JSON 在 `scripts/_output/surge_regime/`。
