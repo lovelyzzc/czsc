@@ -129,6 +129,15 @@ def detect_delay5(states: list[tr.StateSnapshot]) -> dict | None:
     }
 
 
+def amount_to_e(amount: float) -> float:
+    """成交额（千元）→ 亿元，统一 round 3（与 surge_candidates_dump 的 amount_e 同口径）。
+
+    daily_scan / 镜像核对 / dump 三处必须用同一舍入，否则 1 亿阈值附近
+    pass_hard 判定会在镜像验证与真实扫描之间漂移。
+    """
+    return round(amount / 1e5, 3) if amount == amount and amount > 0 else 0.0
+
+
 def hard_filter_reasons(sl_pct: float | None, amount_e: float, *, min_amount_e: float = 1.0) -> list[str]:
     """硬过滤（与 daily_scan / 回测镜像一致）：止损带 8-20%、成交额 ≥1 亿。ST 由调用方判。"""
     reasons = []

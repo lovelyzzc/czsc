@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO / "scripts"))
 
 import surge_live as sl  # noqa: E402
+import surge_portfolio_backtest as spb  # noqa: E402  # load_st_intervals / is_st_on（本地 namechange 历史 ST 判定）
 import trend_regime as tr  # noqa: E402
 from trend_regime import REGIME_CN, Regime, priority_score, surge_onset, surge_score  # noqa: E402
 
@@ -57,7 +58,7 @@ def _scan_one(parquet_path: str) -> dict | None:
 
     code = df["symbol"].iloc[0]
     amount = float(df["amount"].iloc[-1]) if "amount" in df.columns else 0.0
-    amount_e = round(amount / 100000, 2) if amount > 0 else 0.0
+    amount_e = sl.amount_to_e(amount)  # round 3，与 dump/镜像核对同口径
 
     # 实验 · delay5 回踩买点（独立于主表逻辑，不影响默认输出）
     exp = sl.detect_delay5(states)
@@ -303,12 +304,23 @@ def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
         print("  今日无 delay5 结构候选（anticipate 信号后第 5 日仍在上行家族：0 只）")
         return
 
+    # ST 过滤优先用本地 namechange 区间（离线可用），名称元数据仅作补充；
+    # 两者都不可用时不允许静默放行——候选一律标记不可操作（与 skill 宣称的固定硬过滤一致）
+    st_intervals = spb.load_st_intervals()
+    st_filter_ok = bool(st_intervals) or metadata_available
+    if not st_filter_ok:
+        print("  ⚠ ST 过滤数据不可用（namechange.parquet 与名称元数据均缺失）→ 今日候选一律记为不可操作")
     for r in exp_raw:
         r["名称"] = name_map.get(r["代码"], "")
         r["行业"] = industry_map.get(r["代码"], "")
         reasons = sl.hard_filter_reasons(r["sl_pct"], r["成交额亿"])
-        if metadata_available and _is_st_or_delist(r["名称"]):
+        is_st = bool(st_intervals) and spb.is_st_on(st_intervals, r["代码"], pd.Timestamp(r["dec_dt"]))
+        if not is_st and metadata_available:
+            is_st = _is_st_or_delist(r["名称"])
+        if is_st:
             reasons.append("ST/退市风险")
+        elif not st_filter_ok:
+            reasons.append("ST状态未知")
         r["过滤原因"] = "|".join(reasons)
         r["市场门"] = gate
         r["可操作"] = gate and not reasons

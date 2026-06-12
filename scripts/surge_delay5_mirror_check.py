@@ -57,7 +57,7 @@ def _check_one(parquet_path: str, t_list: list[pd.Timestamp]) -> list[dict]:
             continue
         amount = float(df_t["amount"].iloc[-1]) if "amount" in df_t.columns else 0.0
         hit["symbol"] = df["symbol"].iloc[0]
-        hit["amount_e"] = round(amount / 1e5, 3) if amount > 0 else 0.0
+        hit["amount_e"] = sl.amount_to_e(amount)  # 与 daily_scan / dump 同一 helper，杜绝舍入口径漂移
         hit["n_bars_total"] = int(len(df))
         rows.append(hit)
     return rows
@@ -265,11 +265,17 @@ def main() -> None:
     total_dump = sum(d["dump_n"] for d in days)
     total_matched = sum(d["matched"] for d in days)
     total_mismatch = sum(len(d["live_only"]) + len(d["dump_only"]) for d in days)
-    gates_ok = all(r.get("gate_match", False) for r in market_rows if "gate_match" in r)
+    # 市场状态必须每个 T 都有有效对比行：缺失日不允许靠 all(空集)=True 误判 PASS
+    valid_market = [r for r in market_rows if "gate_match" in r]
+    missing_market = len(t_list) - len(valid_market)
+    gates_ok = missing_market == 0 and all(r["gate_match"] for r in valid_market)
+    gate_note = (
+        "all ok" if gates_ok else (f"{missing_market} day(s) MISSING" if missing_market else "DIVERGED")
+    )
     verdict = (
         "PASS — selection sets identical and market-state gates agree"
         if total_mismatch == 0 and total_matched == total_live == total_dump and gates_ok
-        else f"ATTENTION — {total_mismatch} set mismatches (see attributions), gate_match={'all ok' if gates_ok else 'DIVERGED'}"
+        else f"ATTENTION — {total_mismatch} set mismatches (see attributions), market-state={gate_note}"
     )
     summary = {
         "dates": [str(t.date()) for t in t_list],
