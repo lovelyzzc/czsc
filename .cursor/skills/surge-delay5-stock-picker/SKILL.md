@@ -38,8 +38,9 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/sc
 PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-delay5-stock-picker/scripts/delay5_scan.py
 ```
 
-全 A 股因果扫描约 1-2 分钟。输出三段：市场状态门（开/关）、delay5 候选表
-（按优先级排序，含止损/幅度/过滤原因/可操作标记）、前向转正进度。
+全 A 股因果扫描约 1-2 分钟。输出三段：市场状态门（开/关）、最多 5 只人工复盘短名单
+（优先覆盖不同行业/状态）、前向转正进度。完整 delay5 候选仍全部写入前向日志，
+复盘上限不改变研究样本与 30 槽组合口径。
 
 ### Step 3: 汇报结果
 
@@ -64,6 +65,8 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 
 - `scripts/_output/surge_regime_picks/picks_exp_delay5_YYYY-MM-DD.parquet`：当日全部
   结构候选 + 市场门/过滤布尔列（前向日志，按决策日命名，重复运行幂等）；
+- `scripts/_output/surge_regime_picks/review_exp_delay5_YYYY-MM-DD.parquet`：最多 5 只
+  人工复盘样本；门开时从可操作候选抽取，门关时仅从通过硬过滤的结构候选抽样；
 - `scripts/_output/surge_regime_picks/market_state_live.parquet`：市场状态前向审计日志。
 
 ## 研究文档索引

@@ -40,13 +40,15 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 ```
 
 全 A 股流式因果扫描约 1-2 分钟，输出最近 10 个交易日内出现主升浪启动信号、且当前仍处于
-主升浪家族（5/6/7/8、未破坏）的标的。精选列表还会执行实盘硬过滤：剔除 ST/退市风险、
+主升浪家族（5/6/7/8、未破坏）的完整结构池。人工复盘表只取**今日新增（新鲜度=0）**
+且通过硬过滤的候选，默认最多 5 只，并优先覆盖不同行业/启动方式/当前状态；完整结构池仍全部留档。
+复盘上限可用 `SURGE_REVIEW_LIMIT` 调整。硬过滤会剔除 ST/退市风险、
 最近一日成交额 < 1 亿、止损幅度不在 8%-20% 的标的；阈值可用
 `SURGE_PICKER_MIN_AMOUNT_E` / `SURGE_PICKER_STOP_MIN_PCT` / `SURGE_PICKER_STOP_MAX_PCT` 调整。
 
 ### Step 3: 汇报结果
 
-将精选 Top 20 呈现给用户：
+先汇报今日新增、存量跟踪、完整结构池的数量，再呈现最多 5 只人工复盘短名单：
 
 | 列 | 说明 |
 |---|---|
@@ -122,7 +124,10 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 
 ## 输出文件
 
-扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`。
-实验模式：同目录 `picks_exp_delay5_YYYY-MM-DD.parquet`（全部结构候选 + 市场门/过滤布尔列）
-与 `market_state_live.parquet`（市场状态前向审计日志）。
+完整扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`；
+人工复盘短名单保存在同目录 `review_YYYY-MM-DD.parquet`。缩短人工列表不截断完整候选，
+避免肥尾策略因漏记少数赢家而污染前向验证。
+实验模式：同目录 `picks_exp_delay5_YYYY-MM-DD.parquet`（全部结构候选 + 市场门/过滤布尔列）、
+`review_exp_delay5_YYYY-MM-DD.parquet`（最多 5 只人工复盘样本）与
+`market_state_live.parquet`（市场状态前向审计日志）。
 回测 HTML/JSON 在 `scripts/_output/surge_regime/`。
