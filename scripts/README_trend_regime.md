@@ -29,7 +29,10 @@
 `trend_regime.surge_onset(prev, regime, feats, prior, mode)` 是共享的因果「主升浪启动」信号
 （`confirm` 确认进 7/8 / `anticipate` 刚离开中枢 5，均带放量+均线发散门控），被回测与选股 skill 共用。
 每日选股见 `.cursor/skills/surge-regime-stock-picker/`（`iter_states(tail=160)` 快路径，全市场扫描 ~2 分钟；
-快路径与全量重放一致率 100%）。优先级排序走 `trend_regime.priority_score`（选股与回测单一真源）。
+快路径与全量重放一致率 100%）。扫描输出拆为两层：`picks_*.parquet` 保留完整结构池与前向样本，
+`review_*.parquet` 只保留今日新增且通过硬过滤的最多 5 只人工复盘样本；后者优先覆盖不同行业、
+启动方式和当前状态，不改变回测或组合口径。优先级排序走 `trend_regime.priority_score`
+（选股与回测单一真源，但只作展示排序，不视为收益预测器）。
 
 **2026-06-10 实盘镜像重测结论（替代旧 surge_regime_backtest 结论）**：top-N 优先级选股 +
 硬过滤 + 成本 + 退市股回补后，两种买点 OOS 超额（vs 同日同成交额十分位随机对照）均不显著
