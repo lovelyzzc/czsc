@@ -1,0 +1,60 @@
+{
+  "allowed_chan_regimes": [5, 6, 7, 8],
+  "cash_buffer": 0.005,
+  "common_cutoff": "2026-06-09",
+  "cost_model": {
+    "base_slippage_bps": 10.0,
+    "commission_bps": 2.5,
+    "impact_bps_at_1pct": 15.0,
+    "max_adv_participation": 0.05,
+    "min_commission_cny": 5.0,
+    "stamp_duty_bps_before_2023_08_28": 10.0,
+    "stamp_duty_bps_from_2023_08_28": 5.0,
+    "transfer_bps": 0.1
+  },
+  "execution": "decision_close_t_to_open_t_plus_1",
+  "execution_rules": {
+    "buy_limit_or_suspension": "cancel_and_keep_cash",
+    "order_sequence": "pending_sells_then_new_buys",
+    "participation_excess_buy": "partial_fill_then_cancel",
+    "participation_excess_sell": "partial_fill_and_retry_daily",
+    "sell_limit_or_suspension": "retain_position_and_retry_daily",
+    "slot_cap_includes_blocked_exits": true
+  },
+  "factor_definitions": {
+    "lowvol_60": "negative_sample_std_ddof1_of_60_daily_log_returns",
+    "mom_120_20": "log_close_shift20_minus_log_close_shift120",
+    "ranking": "within_decision_date_and_adv20_bucket_average_percentile_rank_ties_average_symbol_tiebreak"
+  },
+  "factor_weights": {
+    "lowvol_60": 0.5,
+    "mom_120_20": 0.5
+  },
+  "frequency": "weekly_last_trading_day",
+  "holdings": 20,
+  "initial_capital_cny": 10000000.0,
+  "liquidity_buckets": 5,
+  "min_adv20_thousand_cny": 50000.0,
+  "min_history_bars": 250,
+  "min_valid_bars_60": 57,
+  "protocol_id": "xs_chan_pilot_v1_contaminated_stress_only",
+  "random_seed": 20260715,
+  "random_seed_count": 20,
+  "controls": ["liquidity_and_retention_matched_random", "factor_target_count_matched_random_gate_with_path_caveat"],
+  "research_label": "CONTAMINATED_STRESS_ONLY",
+  "cost_stress_multipliers": [1.0, 2.0],
+  "state_columns_whitelist": ["symbol", "dt", "regime"],
+  "state_missing_policy": "deny_new_entry",
+  "start_date": "2022-01-01",
+  "timing_policy": "entry_veto_after_factor_topn_no_refill",
+  "universe_source": "scripts/_output/surge_candidates/panel.parquet distinct symbols; contaminated fixed panel only",
+  "upgrade_required_limitations": {
+    "confirmatory_oos": false,
+    "full_0_to_10_chan_state_cache": false,
+    "pit_float_mcap": false,
+    "pit_industry": false,
+    "raw_unadjusted_execution_price": false,
+    "survivorship_clean_universe": false
+  },
+  "winsor_limits": [0.01, 0.99]
+}
