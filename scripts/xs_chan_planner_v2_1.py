@@ -44,10 +44,14 @@ PROTOCOL_PATH = SCRIPT_DIR / "xs_chan_protocol_v2_1.json"
 ARTIFACT_SCHEMA = "xs_chan_planning_artifact_v2_1"
 PLANNER_INPUT_SCHEMA = "xs_chan_planner_input_v2_1"
 VERIFICATION_SCHEMA = "xs_chan_planning_verification_v2_1"
+PLANNER_BATCH_ARTIFACT_SCHEMA = "xs_chan_planning_batch_artifact_v2_1"
+PLANNER_BATCH_INPUT_SCHEMA = "xs_chan_planning_batch_input_v2_1"
+PLANNER_BATCH_VERIFICATION_SCHEMA = "xs_chan_planning_batch_verification_v2_1"
+EXPECTED_CONFIRMATION_CYCLES = 52
 FRAME_AUTHORITY = "explicit_frame_mapping_non_authoritative"
 SNAPSHOT_AUTHORITY = "verified_data_snapshot"
 STATE_COLUMNS = ("symbol", "dt", "regime")
-SCENARIOS = ("gross", "1x", "2x", "capacity")
+SCENARIOS = ("gross", "1x", "2x", "capacity_1x")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 REQUIRED_FRAMES = (
@@ -83,16 +87,22 @@ class ReferenceBook:
 
     actual_holdings: tuple[str, ...]
     blocked_exit_symbols: tuple[str, ...]
+    contingent_slot_symbols: tuple[str, ...]
     sizing_nav_cny_by_scenario: Mapping[str, float]
     sizing_nav_record_sha256_by_scenario: Mapping[str, str]
 
     def __post_init__(self) -> None:
         holdings = tuple(map(str, self.actual_holdings))
         blocked = tuple(map(str, self.blocked_exit_symbols))
-        if any(not symbol for symbol in holdings + blocked):
+        contingent = tuple(map(str, self.contingent_slot_symbols))
+        if any(not symbol for symbol in holdings + blocked + contingent):
             raise PlanningError("reference-book symbols must be non-empty strings")
-        if len(holdings) != len(set(holdings)) or len(blocked) != len(set(blocked)):
-            raise PlanningError("reference-book holdings and blocked exits must be unique")
+        if (
+            len(holdings) != len(set(holdings))
+            or len(blocked) != len(set(blocked))
+            or len(contingent) != len(set(contingent))
+        ):
+            raise PlanningError("reference-book holdings, blocked exits and contingent slots must be unique")
         if not set(blocked).issubset(set(holdings)):
             raise PlanningError("blocked exits must be a subset of actual holdings")
         nav = {str(key): value for key, value in self.sizing_nav_cny_by_scenario.items()}
@@ -112,6 +122,7 @@ class ReferenceBook:
             normalized_nav[scenario] = number
         object.__setattr__(self, "actual_holdings", holdings)
         object.__setattr__(self, "blocked_exit_symbols", blocked)
+        object.__setattr__(self, "contingent_slot_symbols", contingent)
         object.__setattr__(self, "sizing_nav_cny_by_scenario", MappingProxyType(normalized_nav))
         object.__setattr__(
             self,
@@ -123,6 +134,7 @@ class ReferenceBook:
         return {
             "actual_holdings": list(self.actual_holdings),
             "blocked_exit_symbols": list(self.blocked_exit_symbols),
+            "contingent_slot_symbols": list(self.contingent_slot_symbols),
             "sizing_nav_cny_by_scenario": dict(self.sizing_nav_cny_by_scenario),
             "sizing_nav_record_sha256_by_scenario": dict(self.sizing_nav_record_sha256_by_scenario),
         }
@@ -136,6 +148,7 @@ class ReferenceBook:
         expected = {
             "actual_holdings",
             "blocked_exit_symbols",
+            "contingent_slot_symbols",
             "sizing_nav_cny_by_scenario",
             "sizing_nav_record_sha256_by_scenario",
         }
@@ -144,6 +157,7 @@ class ReferenceBook:
         return cls(
             actual_holdings=tuple(value["actual_holdings"]),
             blocked_exit_symbols=tuple(value["blocked_exit_symbols"]),
+            contingent_slot_symbols=tuple(value["contingent_slot_symbols"]),
             sizing_nav_cny_by_scenario=dict(value["sizing_nav_cny_by_scenario"]),
             sizing_nav_record_sha256_by_scenario=dict(value["sizing_nav_record_sha256_by_scenario"]),
         )
@@ -247,7 +261,10 @@ def load_protocol(path: str | Path = PROTOCOL_PATH) -> tuple[dict[str, Any], str
         raise PlanningError("authoritative protocol no longer freezes seeds 20260720..20260739")
     if controls["rng_algorithm_version"] != "xs_chan_rng_v2_1_sha256_seedsequence_v1":
         raise PlanningError("unsupported V2.1 RNG algorithm")
-    return protocol, _sha256_bytes(supplied)
+    # The trial identity is the digest of canonical JSON, not the digest of
+    # incidental whitespace in the checked-in source file.  Byte equality
+    # above still prevents callers from supplying a different protocol.
+    return protocol, object_sha256(protocol)
 
 
 def frozen_seeds(protocol: Mapping[str, Any]) -> tuple[int, ...]:
@@ -291,11 +308,12 @@ def empty_reference_books(
             "gross": float(reference_nav_cny),
             "1x": float(reference_nav_cny),
             "2x": float(reference_nav_cny),
-            "capacity": float(capacity_nav_cny),
+            "capacity_1x": float(capacity_nav_cny),
         }
         result[key] = ReferenceBook(
             actual_holdings=(),
             blocked_exit_symbols=(),
+            contingent_slot_symbols=(),
             sizing_nav_cny_by_scenario=nav,
             sizing_nav_record_sha256_by_scenario={
                 scenario: object_sha256({"genesis": True, "book": key, "scenario": scenario, "nav_cny": nav[scenario]})
@@ -319,8 +337,9 @@ def _normalise_reference_books(
     result = {key: ReferenceBook.from_value(values[key]) for key in sorted(expected)}
     maximum = int(protocol["execution_rules"]["maximum_actual_positions"])
     for key, book in result.items():
-        if len(book.actual_holdings) > maximum:
-            raise PlanningError(f"{key} reference book exceeds {maximum} actual positions")
+        occupied = set(book.actual_holdings) | set(book.contingent_slot_symbols)
+        if len(occupied) > maximum:
+            raise PlanningError(f"{key} reference book exceeds {maximum} actual/contingent positions")
     return result
 
 
@@ -512,8 +531,17 @@ def compute_decision_surface(
     decision_dt: Any,
     *,
     protocol_path: str | Path = PROTOCOL_PATH,
+    require_target_size: bool = True,
 ) -> pd.DataFrame:
-    """Recompute the causal PIT feature/ranking surface at one decision close."""
+    """Recompute the causal PIT feature/ranking surface at one decision close.
+
+    ``require_target_size=False`` is reserved for formal-start verification of
+    preregistered earlier weeks whose eligible universe is expected to be below
+    the 50-name execution threshold.
+    """
+
+    if type(require_target_size) is not bool:
+        raise PlanningError("require_target_size must be boolean")
 
     protocol, _ = load_protocol(protocol_path)
     source = _prepare_source_frames(frames)
@@ -667,7 +695,7 @@ def compute_decision_surface(
     if not rows:
         raise PlanningError("decision surface is empty")
     surface = pd.DataFrame(rows).sort_values("symbol", kind="mergesort").reset_index(drop=True)
-    ranked = _rank_cross_section(surface, protocol)
+    ranked = _rank_cross_section(surface, protocol, require_target_size=require_target_size)
 
     state_at_decision = states.loc[states["dt"].eq(decision), list(STATE_COLUMNS)].copy()
     ranked = ranked.merge(state_at_decision, on=["symbol", "dt"], how="left", validate="one_to_one")
@@ -713,11 +741,24 @@ def _neutralized_rank(group: pd.DataFrame, factor: str, low: float, high: float)
     return pd.Series(residual, index=group.index).rank(method="average", pct=True)
 
 
-def _rank_cross_section(surface: pd.DataFrame, protocol: Mapping[str, Any]) -> pd.DataFrame:
+def _rank_cross_section(
+    surface: pd.DataFrame,
+    protocol: Mapping[str, Any],
+    *,
+    require_target_size: bool = True,
+) -> pd.DataFrame:
     eligible = surface.loc[surface["eligible"].eq(True)].copy()
     target = int(protocol["selection"]["target_size"])
-    if len(eligible) < target:
+    if require_target_size and len(eligible) < target:
         raise PlanningError(f"eligible universe {len(eligible)} is smaller than frozen target {target}")
+    if eligible.empty:
+        eligible["mom_120_20_rank"] = pd.Series(dtype=float)
+        eligible["lowvol_60_rank"] = pd.Series(dtype=float)
+        eligible["factor_score"] = pd.Series(dtype=float)
+        eligible["mcap_bucket"] = pd.Series(dtype="int64")
+        eligible["adv_bucket"] = pd.Series(dtype="int64")
+        eligible["factor_rank"] = pd.Series(dtype="int64")
+        return eligible
     formal = ["mom_120_20", "lowvol_60", "adv20", "free_float_mcap", "adjusted_close", "sma20"]
     numeric = eligible[formal].apply(pd.to_numeric, errors="raise").to_numpy(dtype=float)
     if not np.isfinite(numeric).all() or eligible["industry_code"].isna().any():
@@ -795,8 +836,9 @@ def _resolve_reference_slots(targets: Sequence[str], book: ReferenceBook, protoc
         raise PlanningError("target identities must be unique")
     held = set(book.actual_holdings)
     blocked = set(book.blocked_exit_symbols)
+    contingent = set(book.contingent_slot_symbols) - held
     target_set = set(ordered)
-    blocked_outside = tuple(sorted(blocked - target_set))
+    blocked_outside = tuple(sorted((blocked | contingent) - target_set))
     held_targets = tuple(symbol for symbol in ordered if symbol in held)
     available_new = maximum - len(blocked_outside) - len(held_targets)
     if available_new < 0:
@@ -892,6 +934,7 @@ class _GateResult:
     targets: tuple[str, ...]
     new_entries: tuple[str, ...]
     retained: tuple[str, ...]
+    candidates: tuple[str, ...]
     candidate_new_count: int
     allowed_new_count: int
     missing_state_count: int
@@ -919,6 +962,7 @@ def _real_gate(
         targets=targets,
         new_entries=accepted_new,
         retained=retained,
+        candidates=candidates,
         candidate_new_count=len(candidates),
         allowed_new_count=len(accepted_new),
         missing_state_count=int(missing),
@@ -960,6 +1004,7 @@ def _random_quota_gate(
         targets=targets,
         new_entries=new_entries,
         retained=retained,
+        candidates=candidates,
         candidate_new_count=len(candidates),
         allowed_new_count=need_new,
         missing_state_count=0,
@@ -986,6 +1031,7 @@ def _arm_payload(
     blocked: Sequence[str],
     exits: Sequence[str],
     gate_opportunities: int,
+    gate_candidates: Sequence[str],
     gate_candidate_count: int,
     missing_state_count: int,
     quota: Mapping[str, int] | None,
@@ -997,8 +1043,13 @@ def _arm_payload(
 ) -> dict[str, Any]:
     ordered = tuple(map(str, symbols))
     new = tuple(map(str, new_entries))
+    candidates = tuple(map(str, gate_candidates))
     if any(symbol not in ordered for symbol in new):
         raise PlanningError(f"{arm_key} new entries must be a target subset")
+    if len(candidates) != gate_candidate_count or len(candidates) != len(set(candidates)):
+        raise PlanningError(f"{arm_key} gate candidate identities/count differ")
+    if any(symbol not in set(ranked["symbol"].astype(str)) for symbol in candidates):
+        raise PlanningError(f"{arm_key} gate candidate is absent from the ranked surface")
     indexed = ranked.set_index("symbol", drop=False)
     for symbol in ordered:
         rank = indexed.loc[symbol, "factor_rank"]
@@ -1024,6 +1075,7 @@ def _arm_payload(
         },
         "decision_adv_cny_by_symbol": {symbol: float(indexed.loc[symbol, "adv20"]) * 1000.0 for symbol in ordered},
         "gate_eligible_new_entry_opportunities": int(gate_opportunities),
+        "gate_candidate_new_entry_symbols": list(candidates),
         "gate_candidate_new_entry_count": int(gate_candidate_count),
         "missing_chan_state_new_entry_count": int(missing_state_count),
         "exact_gate_quota": None if quota is None else {key: int(quota[key]) for key in ("total", "retained", "new")},
@@ -1165,6 +1217,7 @@ def _build_artifact(
         blocked=f_slots.blocked_placeholders,
         exits=f_slots.exits_requested,
         gate_opportunities=len(f_slots.new_entries),
+        gate_candidates=f_slots.new_entries,
         gate_candidate_count=len(f_slots.new_entries),
         missing_state_count=0,
         quota=None,
@@ -1186,6 +1239,7 @@ def _build_artifact(
             blocked=gate.blocked_placeholders,
             exits=gate.exits_requested,
             gate_opportunities=gate.allowed_new_count,
+            gate_candidates=gate.candidates,
             gate_candidate_count=gate.candidate_new_count,
             missing_state_count=gate.missing_state_count,
             quota=quota,
@@ -1241,6 +1295,7 @@ def _build_artifact(
             blocked=r_slots.blocked_placeholders,
             exits=r_slots.exits_requested,
             gate_opportunities=len(r_slots.new_entries),
+            gate_candidates=r_slots.new_entries,
             gate_candidate_count=len(r_slots.new_entries),
             missing_state_count=0,
             quota=None,
@@ -1278,6 +1333,7 @@ def _build_artifact(
                 blocked=random_gate.blocked_placeholders,
                 exits=random_gate.exits_requested,
                 gate_opportunities=random_gate.allowed_new_count,
+                gate_candidates=random_gate.candidates,
                 gate_candidate_count=random_gate.candidate_new_count,
                 missing_state_count=0,
                 quota=quota,
@@ -1377,6 +1433,15 @@ def build_planning_artifact_from_snapshot(
 ) -> dict[str, Any]:
     """Formal adapter from an immutable, already verified data snapshot."""
 
+    observation = getattr(snapshot, "observation_through_session", None)
+    decision = pd.Timestamp(decision_dt)
+    if (
+        not isinstance(observation, str)
+        or decision.tzinfo is not None
+        or decision.normalize() != decision
+        or observation != decision.date().isoformat()
+    ):
+        raise PlanningError("verified snapshot observation_through_session must exactly equal the planning decision_dt")
     frames = frames_from_verified_snapshot(snapshot)
     protocol, _ = load_protocol(protocol_path)
     seeds = frozen_seeds(protocol)
@@ -1578,11 +1643,259 @@ def verify_planner_result(
     return payload
 
 
+def _strict_planning_batch_artifact(value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    expected = {
+        "schema",
+        "protocol_id",
+        "protocol_sha256",
+        "trial_id",
+        "data_authority",
+        "data_contract_identity_sha256",
+        "data_snapshot_sha256_sequence",
+        "cycle_count",
+        "items",
+        "batch_artifact_sha256",
+    }
+    if set(value) != expected or value.get("schema") != PLANNER_BATCH_ARTIFACT_SCHEMA:
+        raise PlanningError("planning batch artifact shape is not exact")
+    items = value.get("items")
+    if not isinstance(items, list) or len(items) != EXPECTED_CONFIRMATION_CYCLES:
+        raise PlanningError("planning batch must contain exactly the first 52 cycle artifacts")
+    if value.get("cycle_count") != EXPECTED_CONFIRMATION_CYCLES:
+        raise PlanningError("planning batch cycle_count must equal 52")
+    protocol, protocol_sha = load_protocol()
+    snapshot_sequence = value.get("data_snapshot_sha256_sequence")
+    if (
+        value.get("protocol_id") != protocol["protocol_id"]
+        or value.get("protocol_sha256") != protocol_sha
+        or value.get("trial_id") != protocol_sha
+        or value.get("data_authority") != SNAPSHOT_AUTHORITY
+        or not SHA256_RE.fullmatch(str(value.get("data_contract_identity_sha256")))
+        or not isinstance(snapshot_sequence, list)
+        or len(snapshot_sequence) != EXPECTED_CONFIRMATION_CYCLES
+        or any(not SHA256_RE.fullmatch(str(item)) for item in snapshot_sequence)
+    ):
+        raise PlanningError("planning batch identity differs from the frozen authoritative trial")
+    if value["data_contract_identity_sha256"] != data_contract_identity_sha256():
+        raise PlanningError("planning batch changes the static V2.1 data contract identity")
+    prior_decision: pd.Timestamp | None = None
+    prior_execution: pd.Timestamp | None = None
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(items):
+        if not isinstance(raw, Mapping):
+            raise PlanningError(f"planning batch item {index} must be an object")
+        item = copy.deepcopy(dict(raw))
+        _strict_artifact_shape(item)
+        if (
+            item["protocol_id"] != value["protocol_id"]
+            or item["protocol_sha256"] != value["protocol_sha256"]
+            or item["trial_id"] != value["trial_id"]
+            or item["data_authority"] != value["data_authority"]
+            or item["data_snapshot_sha256"] != snapshot_sequence[index]
+        ):
+            raise PlanningError(f"planning batch item {index} changes frozen authority identity")
+        decision = pd.Timestamp(item["decision_dt"])
+        execution = pd.Timestamp(item["exec_dt"])
+        if decision.tzinfo is not None or execution.tzinfo is not None or decision >= execution:
+            raise PlanningError(f"planning batch item {index} has an invalid decision/execution pair")
+        if prior_decision is not None and (decision <= prior_decision or execution <= prior_execution):
+            raise PlanningError("planning batch decision/execution sessions must be strictly increasing")
+        prior_decision, prior_execution = decision, execution
+        normalized.append(item)
+    claimed = str(value.get("batch_artifact_sha256"))
+    if not SHA256_RE.fullmatch(claimed):
+        raise PlanningError("planning batch artifact digest is malformed")
+    body = dict(value)
+    body.pop("batch_artifact_sha256")
+    if object_sha256(body) != claimed:
+        raise PlanningError("planning batch artifact content hash differs")
+    return normalized
+
+
+def build_planning_batch_artifact(artifacts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Freeze exactly 52 independently replayable weekly planning artifacts."""
+
+    if len(artifacts) != EXPECTED_CONFIRMATION_CYCLES:
+        raise PlanningError("formal planning batch requires exactly 52 artifacts")
+    items = [copy.deepcopy(dict(item)) for item in artifacts]
+    if not items:
+        raise PlanningError("planning batch cannot be empty")
+    first = items[0]
+    payload: dict[str, Any] = {
+        "schema": PLANNER_BATCH_ARTIFACT_SCHEMA,
+        "protocol_id": first.get("protocol_id"),
+        "protocol_sha256": first.get("protocol_sha256"),
+        "trial_id": first.get("trial_id"),
+        "data_authority": first.get("data_authority"),
+        "data_contract_identity_sha256": data_contract_identity_sha256(),
+        "data_snapshot_sha256_sequence": [item.get("data_snapshot_sha256") for item in items],
+        "cycle_count": EXPECTED_CONFIRMATION_CYCLES,
+        "items": items,
+    }
+    payload["batch_artifact_sha256"] = object_sha256(payload)
+    _strict_planning_batch_artifact(payload)
+    return payload
+
+
+def data_contract_identity_sha256() -> str:
+    """Return the immutable data-contract identity used by formal batches."""
+
+    try:
+        import xs_chan_data_v2_1 as data_v2_1
+    except ImportError as exc:  # pragma: no cover - only relevant outside the repository scripts path
+        raise PlanningError("xs_chan_data_v2_1 is unavailable") from exc
+    digest = str(data_v2_1.data_contract_identity_sha256())
+    if not SHA256_RE.fullmatch(digest):
+        raise PlanningError("V2.1 data contract identity is malformed")
+    return digest
+
+
+def planner_batch_input_from_artifact(batch: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract the exact 52-item content-addressed planner replay input."""
+
+    items = _strict_planning_batch_artifact(batch)
+    payload: dict[str, Any] = {
+        "schema": PLANNER_BATCH_INPUT_SCHEMA,
+        "protocol_id": batch["protocol_id"],
+        "protocol_sha256": batch["protocol_sha256"],
+        "trial_id": batch["trial_id"],
+        "data_authority": batch["data_authority"],
+        "data_contract_identity_sha256": batch["data_contract_identity_sha256"],
+        "data_snapshot_sha256_sequence": list(batch["data_snapshot_sha256_sequence"]),
+        "cycle_count": EXPECTED_CONFIRMATION_CYCLES,
+        "items": [planner_input_from_artifact(item) for item in items],
+    }
+    payload["batch_input_sha256"] = object_sha256(payload)
+    return payload
+
+
+def _strict_planning_batch_input(value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    expected = {
+        "schema",
+        "protocol_id",
+        "protocol_sha256",
+        "trial_id",
+        "data_authority",
+        "data_contract_identity_sha256",
+        "data_snapshot_sha256_sequence",
+        "cycle_count",
+        "items",
+        "batch_input_sha256",
+    }
+    if set(value) != expected or value.get("schema") != PLANNER_BATCH_INPUT_SCHEMA:
+        raise PlanningError("planning batch input shape is not exact")
+    items = value.get("items")
+    if not isinstance(items, list) or len(items) != EXPECTED_CONFIRMATION_CYCLES:
+        raise PlanningError("planning batch input must contain exactly 52 items")
+    if value.get("cycle_count") != EXPECTED_CONFIRMATION_CYCLES:
+        raise PlanningError("planning batch input cycle_count must equal 52")
+    snapshot_sequence = value.get("data_snapshot_sha256_sequence")
+    if (
+        value.get("data_authority") != SNAPSHOT_AUTHORITY
+        or value.get("data_contract_identity_sha256") != data_contract_identity_sha256()
+        or not isinstance(snapshot_sequence, list)
+        or len(snapshot_sequence) != EXPECTED_CONFIRMATION_CYCLES
+        or any(not SHA256_RE.fullmatch(str(item)) for item in snapshot_sequence)
+    ):
+        raise PlanningError("planning batch input has an invalid data authority closure")
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(items):
+        if not isinstance(raw, Mapping):
+            raise PlanningError(f"planning batch input item {index} must be an object")
+        item = copy.deepcopy(dict(raw))
+        _strict_planner_input(item)
+        for field in ("protocol_id", "protocol_sha256", "data_authority"):
+            if item[field] != value[field]:
+                raise PlanningError(f"planning batch input item {index} changes {field}")
+        if item["data_snapshot_sha256"] != snapshot_sequence[index]:
+            raise PlanningError(f"planning batch input item {index} changes its weekly data snapshot")
+        normalized.append(item)
+    if value.get("trial_id") != value.get("protocol_sha256"):
+        raise PlanningError("planning batch input trial_id must equal protocol_sha256")
+    claimed = str(value.get("batch_input_sha256"))
+    if not SHA256_RE.fullmatch(claimed):
+        raise PlanningError("planning batch input digest is malformed")
+    body = dict(value)
+    body.pop("batch_input_sha256")
+    if object_sha256(body) != claimed:
+        raise PlanningError("planning batch input content hash differs")
+    return normalized
+
+
+def verify_planning_batch_result(
+    batch_result: Mapping[str, Any],
+    batch_input: Mapping[str, Any],
+    snapshot: Any | None = None,
+    *,
+    snapshots_by_sha256: Mapping[str, Any] | None = None,
+    protocol_path: str | Path = PROTOCOL_PATH,
+) -> dict[str, Any]:
+    """Recompute all 52 planner cycles and return a fail-closed verification."""
+
+    errors: list[str] = []
+    result_sha: str | None = None
+    input_sha: str | None = None
+    cycle_verifications: list[dict[str, Any]] = []
+    try:
+        if not isinstance(batch_result, Mapping) or not isinstance(batch_input, Mapping):
+            raise PlanningError("planning batch result and input must be objects")
+        strict_result = copy.deepcopy(dict(batch_result))
+        strict_input = copy.deepcopy(dict(batch_input))
+        result_items = _strict_planning_batch_artifact(strict_result)
+        input_items = _strict_planning_batch_input(strict_input)
+        result_sha = str(strict_result["batch_artifact_sha256"])
+        input_sha = str(strict_input["batch_input_sha256"])
+        expected_input = planner_batch_input_from_artifact(strict_result)
+        if canonical_json(strict_input) != canonical_json(expected_input):
+            raise PlanningError("planning batch input does not exactly bind the batch result")
+        snapshot_digests = list(strict_result["data_snapshot_sha256_sequence"])
+        if snapshot is not None and snapshots_by_sha256 is not None:
+            raise PlanningError("supply either one shared snapshot or snapshots_by_sha256, not both")
+        if snapshots_by_sha256 is None:
+            if snapshot is None or len(set(snapshot_digests)) != 1:
+                raise PlanningError("a varying 52-cycle batch requires snapshots_by_sha256")
+            snapshots = {snapshot_digests[0]: snapshot}
+        else:
+            snapshots = {str(key): resolved for key, resolved in snapshots_by_sha256.items()}
+            if set(snapshots) != set(snapshot_digests):
+                raise PlanningError("snapshot resolver domain differs from the 52-cycle batch")
+        for digest, resolved in snapshots.items():
+            if str(getattr(resolved, "manifest_sha256", "")) != digest:
+                raise PlanningError(f"resolved snapshot identity differs for {digest}")
+        for index, (artifact, planner_input) in enumerate(zip(result_items, input_items, strict=True)):
+            verification = verify_planner_result(
+                artifact,
+                planner_input,
+                snapshots[snapshot_digests[index]],
+                protocol_path=protocol_path,
+            )
+            cycle_verifications.append(verification)
+            if verification.get("valid") is not True:
+                raise PlanningError(f"planning batch cycle {index + 1} semantic replay failed")
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    payload = {
+        "schema": PLANNER_BATCH_VERIFICATION_SCHEMA,
+        "valid": not errors,
+        "batch_input_sha256": input_sha,
+        "batch_artifact_sha256": result_sha,
+        "cycle_count": len(cycle_verifications),
+        "execution_decision_count": sum(int(item.get("execution_decision_count", 0)) for item in cycle_verifications),
+        "cycle_verification_sha256": [item["verification_sha256"] for item in cycle_verifications],
+        "errors": errors,
+    }
+    payload["verification_sha256"] = object_sha256(payload)
+    return payload
+
+
 __all__ = [
     "ARTIFACT_SCHEMA",
     "ExactControlError",
     "FRAME_AUTHORITY",
     "PLANNER_INPUT_SCHEMA",
+    "PLANNER_BATCH_ARTIFACT_SCHEMA",
+    "PLANNER_BATCH_INPUT_SCHEMA",
+    "PLANNER_BATCH_VERIFICATION_SCHEMA",
     "PlanningError",
     "PlanningVerification",
     "ReferenceBook",
@@ -1591,8 +1904,10 @@ __all__ = [
     "STATE_COLUMNS",
     "build_planning_artifact_from_frames",
     "build_planning_artifact_from_snapshot",
+    "build_planning_batch_artifact",
     "canonical_json",
     "compute_decision_surface",
+    "data_contract_identity_sha256",
     "empty_reference_books",
     "frame_mapping_sha256",
     "frames_from_verified_snapshot",
@@ -1600,7 +1915,9 @@ __all__ = [
     "load_protocol",
     "object_sha256",
     "planner_input_from_artifact",
+    "planner_batch_input_from_artifact",
     "reference_book_keys",
     "verify_planner_result",
+    "verify_planning_batch_result",
     "verify_planning_artifact",
 ]

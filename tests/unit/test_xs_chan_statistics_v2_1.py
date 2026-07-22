@@ -22,12 +22,81 @@ PROTOCOL = json.loads((SCRIPTS_DIR / "xs_chan_protocol_v2_1.json").read_text(enc
 PROTOCOL_SHA256 = hashlib.sha256(statistics.canonical_json_bytes(PROTOCOL)).hexdigest()
 WEEK_LABELS = [f"2026-W{index:02d}" for index in range(1, 53)]
 DAILY_LABELS = [f"2026-D{index:03d}" for index in range(260)]
-SEEDED_ARMS = {"R_match_2x", "FGR_gross", "FGR_2x", "FMGR_gross", "FMGR_2x"}
+SEEDED_ARMS = {
+    arm_id
+    for arm_id in statistics.EXPECTED_RISK_ARM_IDS
+    if any(arm_id.startswith(f"{family}_") for family in statistics.EXPECTED_SEEDED_FAMILIES)
+}
+
+
+def _pending_settlements_root(count: int, tag: str) -> str:
+    if count == 0:
+        return statistics.EMPTY_PENDING_SETTLEMENTS_ROOT_SHA256
+    return statistics.object_sha256({"pending_settlement_count": count, "tag": tag})
+
+
+def _bind_unwind_metadata(
+    unwind: dict,
+    *,
+    starting_pending_count: int = 0,
+    pending_counts: list[int] | None = None,
+) -> dict:
+    sessions = unwind["sessions"]
+    if pending_counts is None:
+        pending_counts = [0] * len(sessions)
+    assert len(pending_counts) == len(sessions)
+    unwind["starting_pending_settlement_count"] = starting_pending_count
+    unwind["starting_pending_settlements_root_sha256"] = _pending_settlements_root(starting_pending_count, "start")
+    for index, (session, pending_count) in enumerate(zip(sessions, pending_counts, strict=True)):
+        session["pending_settlement_count"] = pending_count
+        session["pending_settlements_root_sha256"] = _pending_settlements_root(pending_count, f"session:{index}")
+        session["session_event_count"] = (
+            len(session["sell_orders"])
+            + len(session["terminal_dispositions"])
+            + len(session["terminal_share_receipts"])
+        )
+        session["session_events_root_sha256"] = statistics.object_sha256(
+            {"session": session["session"], "event_count": session["session_event_count"]}
+        )
+    starts_complete = (
+        not unwind["starting_positions"] and not unwind["pending_share_conversions"] and starting_pending_count == 0
+    )
+    completion_session = unwind["confirmation_end_session"] if starts_complete else sessions[-1]["session"]
+    completion_state = {
+        "nav_cny": 10_000_000.0,
+        "cash_cny": 10_000_000.0,
+        "cash_yield_cny": 0.0,
+        "position_value_cny": 0.0,
+        "cash_receivable_value_cny": 0.0,
+        "other_asset_value_cny": 0.0,
+        "other_liability_value_cny": 0.0,
+        "dividend_tax_liability_cny": 0.0,
+        "gross_exposure": 0.0,
+        "holding_count": 0,
+        "pending_sell_count": 0,
+        "pending_sell_symbols": [],
+        "pending_settlements_root_sha256": statistics.EMPTY_PENDING_SETTLEMENTS_ROOT_SHA256,
+        "pending_settlement_count": 0,
+        "contingent_slot_symbols": [],
+        "holdings": [],
+        "pending_sells_sha256": statistics.object_sha256({}),
+    }
+    unwind.update(
+        {
+            "completion_session": completion_session,
+            "completion_economic_state": completion_state,
+            "completion_economic_state_sha256": statistics.object_sha256(completion_state),
+            "completion_state_sha256": statistics.object_sha256({"completion_session": completion_session}),
+            "post_completion_heartbeats": [],
+        }
+    )
+    return unwind
 
 
 def _path_payload(
     returns: np.ndarray,
     *,
+    arm_id: str,
     exposure: np.ndarray | None = None,
     turnover: np.ndarray | None = None,
     selection_prefix: str,
@@ -39,12 +108,105 @@ def _path_payload(
     # Ten different identities per week make the symmetric-difference count
     # exactly ten assignments when two prefixes are compared.
     weekly_selections = [[item[0] for item in selections] for _ in range(52)]
+    scenario = next(
+        item
+        for item in sorted(statistics.EXPECTED_RISK_SCENARIOS, key=len, reverse=True)
+        if arm_id.endswith(f"_{item}")
+    )
+    cost_scale = {"gross": 0.0, "1x": 1.0, "2x": 2.0, "capacity_1x": 1.0}[scenario]
+    pretrade_nav = 100_000_000.0 if scenario == "capacity_1x" else 10_000_000.0
+    costs = [
+        {
+            "commission_cny": 5.0 * cost_scale,
+            "transfer_fee_cny": 1.0 * cost_scale,
+            "stamp_duty_cny": 2.0 * cost_scale,
+            "slippage_cost_cny": 10.0 * cost_scale,
+        }
+        for _ in range(52)
+    ]
+    order_attempts = []
+    state_observations = []
+    if arm_id.startswith("FC_"):
+        for week_index, week_label in enumerate(WEEK_LABELS):
+            entry_index = week_index * 5
+            entry_session = DAILY_LABELS[entry_index]
+            exit_session = DAILY_LABELS[entry_index + 1]
+            for slot in range(opportunities):
+                symbol = f"FC-{week_index:02d}-{slot:02d}"
+                order_attempts.append(
+                    {
+                        "session": entry_session,
+                        "symbol": symbol,
+                        "side": "buy",
+                        "requested_shares": 200,
+                        "filled_shares": 100,
+                        "fill_notional_cny": 1_000.0,
+                        "adv20_cny_asof_decision": 100_000.0,
+                        "open_auction_turnover_cny": 20_000.0,
+                    }
+                )
+                state_observations.append(
+                    {
+                        "week_label": week_label,
+                        "execution_session": entry_session,
+                        "symbol": symbol,
+                        "regime": 5,
+                        "eligible_new_entry": True,
+                        "allowed_new_entry": True,
+                        "requested_shares": 200,
+                        "filled_shares": 100,
+                        "entry_fill_notional_cny": 1_000.0,
+                        "pretrade_nav_cny": pretrade_nav,
+                        "entry_price": 10.0,
+                        "exit_or_window_session": exit_session,
+                        "exit_or_window_price": 11.0,
+                    }
+                )
+    else:
+        order_attempts.append(
+            {
+                "session": DAILY_LABELS[0],
+                "symbol": "GENERIC",
+                "side": "buy",
+                "requested_shares": 200,
+                "filled_shares": 100,
+                "fill_notional_cny": 1_000.0,
+                "adv20_cny_asof_decision": 100_000.0,
+                "open_auction_turnover_cny": 20_000.0,
+            }
+        )
+    order_attempts.sort(key=lambda item: (item["session"], item["symbol"], item["side"]))
     return {
         "weekly_returns": np.asarray(returns, dtype=float).tolist(),
         "daily_post_close_gross_exposure": exposure.tolist(),
         "weekly_one_way_turnover": turnover.tolist(),
         "weekly_new_entry_identity_sets": weekly_selections,
         "weekly_gate_eligible_new_entry_opportunities": [opportunities] * 52,
+        "weekly_pretrade_nav_cny": [pretrade_nav] * 52,
+        "weekly_explicit_costs_cny": costs,
+        "order_attempts": order_attempts,
+        "state_gate_observations": state_observations,
+        "post_window_unwind": _bind_unwind_metadata(
+            {
+                "confirmation_end_session": DAILY_LABELS[-1],
+                "starting_positions": [{"symbol": "UNWIND", "shares": 100}],
+                "pending_share_conversions": [],
+                "sessions": [
+                    {
+                        "session": "2027-D001",
+                        "sell_orders": [{"symbol": "UNWIND", "requested_shares": 100, "filled_shares": 100}],
+                        "terminal_dispositions": [],
+                        "terminal_share_receipts": [],
+                        "remaining_positions": [],
+                        "fill_notional_cny": 1_100.0,
+                        "commission_cny": 5.0 * cost_scale,
+                        "transfer_fee_cny": 1.0 * cost_scale,
+                        "stamp_duty_cny": 2.0 * cost_scale,
+                        "slippage_cost_cny": 10.0 * cost_scale,
+                    }
+                ],
+            }
+        ),
     }
 
 
@@ -64,6 +226,7 @@ def _arm_path(
         paths = {
             "primary": _path_payload(
                 returns,
+                arm_id=arm_id,
                 exposure=exposure,
                 turnover=turnover,
                 selection_prefix=prefix,
@@ -76,6 +239,7 @@ def _arm_path(
         paths = {
             str(seed): _path_payload(
                 returns + offsets[index],
+                arm_id=arm_id,
                 exposure=exposure,
                 turnover=turnover,
                 selection_prefix=f"{prefix}-seed{index:02d}",
@@ -100,7 +264,7 @@ def _return_vectors() -> dict[str, np.ndarray]:
     chan_gross_noise = rng.normal(0.0, 0.00011, 52)
     chan_2x_noise = rng.normal(0.0, 0.00012, 52)
     ma_diag_noise = rng.normal(0.0, 0.00008, 52)
-    return {
+    confirmatory = {
         "F_2x": market + 0.0050 + factor_noise,
         "R_match_2x": market,
         "FC_gross": market + 0.0050 + chan_gross_noise,
@@ -114,6 +278,18 @@ def _return_vectors() -> dict[str, np.ndarray]:
         "FMGR_gross": market + 0.0010 + ma_diag_noise,
         "FMGR_2x": market + 0.0010 - ma_diag_noise,
     }
+    result: dict[str, np.ndarray] = {}
+    for family in statistics.EXPECTED_RISK_FAMILIES:
+        gross_key = f"{family}_gross"
+        two_x_key = f"{family}_2x"
+        gross = confirmatory[gross_key] if gross_key in confirmatory else confirmatory[two_x_key] + 0.00030
+        two_x = confirmatory[two_x_key] if two_x_key in confirmatory else gross - 0.00030
+        one_x = (gross + two_x) / 2.0
+        result[gross_key] = gross
+        result[f"{family}_1x"] = one_x
+        result[two_x_key] = two_x
+        result[f"{family}_capacity_1x"] = one_x - 0.00002
+    return result
 
 
 def _statistics_input() -> dict:
@@ -124,7 +300,7 @@ def _statistics_input() -> dict:
         "trial_id": PROTOCOL_SHA256,
         "window_sha256": hashlib.sha256(b"frozen-first-52-weeks").hexdigest(),
         "comparison_registry": deepcopy(PROTOCOL["statistics"]["comparison_registry"]),
-        "arm_paths": {arm: _arm_path(arm, values) for arm, values in vectors.items()},
+        "arm_paths": {arm: _arm_path(arm, vectors[arm]) for arm in statistics.EXPECTED_RISK_ARM_IDS},
         "controls": deepcopy(statistics.EXPECTED_CONTROL_THRESHOLDS),
         "bootstrap": {
             "method_seed": 20260720,
@@ -349,6 +525,226 @@ def test_statistics_semantic_verifier_rejects_forged_overall_status():
     value = _statistics_input()
     result = statistics.evaluate_statistics(value)
     result["overall_status"] = "FALSIFIED_FACTOR"
+
+    with pytest.raises(statistics.StatisticsError, match="semantic replay"):
+        statistics.verify_statistics_result(result, value)
+
+
+def test_risk_and_mechanism_report_is_recomputed_from_raw_paths():
+    result = statistics.evaluate_statistics(_statistics_input())
+    report = result["risk_and_mechanism_report"]
+
+    assert report["schema"] == statistics.RISK_MECHANISM_REPORT_SCHEMA
+    assert report["arm_order"] == list(statistics.EXPECTED_RISK_ARM_IDS)
+    assert report["report_sha256"] == statistics.object_sha256(
+        {key: item for key, item in report.items() if key != "report_sha256"}
+    )
+    fc = report["arms"]["FC_1x"]
+    assert fc["daily_exposure_distribution"]["mean"] == pytest.approx(0.50)
+    assert fc["weekly_turnover_distribution"]["p95"] == pytest.approx(0.10)
+    assert fc["fill_ratio"]["share_weighted_fill_ratio"] == pytest.approx(0.50)
+    assert fc["capacity_usage_distribution"]["mean"] == pytest.approx(0.50)
+    state_five = fc["state_specific_gate_and_fill"]["5"]
+    assert state_five["eligible_new_entry_count"] == 520
+    assert state_five["allowed_new_entry_count"] == 520
+    assert state_five["fill_count"] == 520
+    assert state_five["holding_session_distribution"]["median"] == pytest.approx(2.0)
+    assert state_five["forward_return_distribution"]["mean"] == pytest.approx(0.10)
+    unwind = fc["post_window_unwind"]
+    assert unwind["official_sessions_to_complete_distribution"]["mean"] == pytest.approx(1.0)
+    assert unwind["cost_cny_distributions"]["total"]["mean"] == pytest.approx(18.0)
+
+    attribution = report["gross_to_1x_to_2x_cost_attribution"]["FC"]
+    assert attribution["annualized_explicit_cost_rate_by_scenario"]["gross"]["total"] == 0.0
+    assert attribution["annualized_explicit_cost_rate_by_scenario"]["1x"]["total"] == pytest.approx(9.36e-5)
+    assert attribution["annualized_explicit_cost_rate_by_scenario"]["2x"]["total"] == pytest.approx(1.872e-4)
+    assert "risk_and_power" in result["comparisons"]["FC_2x_minus_FGR_2x"]
+
+
+def test_risk_path_schema_rejects_precomputed_flags_missing_arms_and_capacity_tampering():
+    precomputed = _statistics_input()
+    precomputed["arm_paths"]["F_gross"]["paths"]["primary"]["fill_ratio_pass"] = True
+    with pytest.raises(statistics.StatisticsError, match="exact V2.1 path keys"):
+        statistics.evaluate_statistics(precomputed)
+
+    missing = _statistics_input()
+    missing["arm_paths"].pop("F_capacity_1x")
+    with pytest.raises(statistics.StatisticsError, match="exact 24-arm"):
+        statistics.evaluate_statistics(missing)
+
+    over_capacity = _statistics_input()
+    order = over_capacity["arm_paths"]["F_1x"]["paths"]["primary"]["order_attempts"][0]
+    order["fill_notional_cny"] = 2_001.0
+    with pytest.raises(statistics.StatisticsError, match="exceeds the frozen dual opening capacity"):
+        statistics.evaluate_statistics(over_capacity)
+
+
+def test_state_records_and_post_window_unwind_fail_closed_under_adversarial_edits():
+    invalid_state = _statistics_input()
+    observation = invalid_state["arm_paths"]["FC_1x"]["paths"]["primary"]["state_gate_observations"][0]
+    observation["regime"] = 3
+    with pytest.raises(statistics.StatisticsError, match="changes the frozen Chan state gate"):
+        statistics.evaluate_statistics(invalid_state)
+
+    hidden_buy = _statistics_input()
+    observation = hidden_buy["arm_paths"]["FC_1x"]["paths"]["primary"]["state_gate_observations"][0]
+    observation.update(
+        requested_shares=0,
+        filled_shares=0,
+        entry_fill_notional_cny=0.0,
+        entry_price=None,
+        exit_or_window_session=None,
+        exit_or_window_price=None,
+    )
+    result = statistics.evaluate_statistics(hidden_buy)
+    assert (
+        result["risk_and_mechanism_report"]["arms"]["FC_1x"]["state_specific_gate_and_fill"]["5"]["fill_count"] == 519
+    )
+
+    fabricated_state_buy = _statistics_input()
+    observation = fabricated_state_buy["arm_paths"]["FC_1x"]["paths"]["primary"]["state_gate_observations"][0]
+    observation["symbol"] = "ABSENT-FROM-RAW-ORDERS"
+    with pytest.raises(statistics.StatisticsError, match="does not bind to its raw buy order"):
+        statistics.evaluate_statistics(fabricated_state_buy)
+
+    incomplete_unwind = _statistics_input()
+    session = incomplete_unwind["arm_paths"]["F_1x"]["paths"]["primary"]["post_window_unwind"]["sessions"][0]
+    session["sell_orders"][0]["filled_shares"] = 50
+    session["remaining_positions"] = [{"symbol": "UNWIND", "shares": 50}]
+    session["fill_notional_cny"] = 550.0
+    with pytest.raises(statistics.StatisticsError, match="continue through complete real fill"):
+        statistics.evaluate_statistics(incomplete_unwind)
+
+
+def test_symbol_level_unwind_conserves_a_delist_share_conversion_before_selling_target():
+    unwind = {
+        "confirmation_end_session": DAILY_LABELS[-1],
+        "starting_positions": [{"symbol": "A", "shares": 100}],
+        "pending_share_conversions": [],
+        "sessions": [
+            {
+                "session": "2027-D001",
+                "sell_orders": [],
+                "terminal_dispositions": [
+                    {
+                        "event_index": 100,
+                        "action_id": "swap-A-B",
+                        "action_type": "delist_share",
+                        "symbol": "A",
+                        "disposed_shares": 100,
+                    }
+                ],
+                "terminal_share_receipts": [],
+                "remaining_positions": [],
+                "fill_notional_cny": 0.0,
+                "commission_cny": 0.0,
+                "transfer_fee_cny": 0.0,
+                "stamp_duty_cny": 0.0,
+                "slippage_cost_cny": 0.0,
+            },
+            {
+                "session": "2027-D002",
+                "sell_orders": [{"symbol": "B", "requested_shares": 80, "filled_shares": 80}],
+                "terminal_dispositions": [],
+                "terminal_share_receipts": [
+                    {
+                        "event_index": 110,
+                        "action_id": "swap-A-B",
+                        "source_symbol": "A",
+                        "target_symbol": "B",
+                        "received_shares": 80,
+                    }
+                ],
+                "remaining_positions": [],
+                "fill_notional_cny": 880.0,
+                "commission_cny": 5.0,
+                "transfer_fee_cny": 1.0,
+                "stamp_duty_cny": 2.0,
+                "slippage_cost_cny": 10.0,
+            },
+        ],
+    }
+    _bind_unwind_metadata(unwind, pending_counts=[1, 0])
+
+    summary = statistics._parse_unwind(unwind, "unwind", DAILY_LABELS[-1])
+    assert summary.starting_shares == 100
+    assert summary.official_sessions_to_complete == 2
+    assert summary.fill_notional_cny == 880.0
+
+    forged = deepcopy(unwind)
+    forged["sessions"][1]["terminal_share_receipts"][0]["source_symbol"] = "FORGED"
+    with pytest.raises(statistics.StatisticsError, match="pending conversion"):
+        statistics._parse_unwind(forged, "unwind", DAILY_LABELS[-1])
+
+    partial_disposition = deepcopy(unwind)
+    partial_disposition["sessions"][0]["terminal_dispositions"][0]["disposed_shares"] = 50
+    partial_disposition["sessions"][0]["remaining_positions"] = [{"symbol": "A", "shares": 50}]
+    with pytest.raises(statistics.StatisticsError, match="complete symbol position"):
+        statistics._parse_unwind(partial_disposition, "unwind", DAILY_LABELS[-1])
+
+    already_pending = {
+        "confirmation_end_session": DAILY_LABELS[-1],
+        "starting_positions": [],
+        "pending_share_conversions": [{"action_id": "pre-window-swap", "source_symbol": "A"}],
+        "sessions": [
+            {
+                "session": "2027-D001",
+                "sell_orders": [{"symbol": "B", "requested_shares": 80, "filled_shares": 80}],
+                "terminal_dispositions": [],
+                "terminal_share_receipts": [
+                    {
+                        "event_index": 120,
+                        "action_id": "pre-window-swap",
+                        "source_symbol": "A",
+                        "target_symbol": "B",
+                        "received_shares": 80,
+                    }
+                ],
+                "remaining_positions": [],
+                "fill_notional_cny": 880.0,
+                "commission_cny": 5.0,
+                "transfer_fee_cny": 1.0,
+                "stamp_duty_cny": 2.0,
+                "slippage_cost_cny": 10.0,
+            }
+        ],
+    }
+    _bind_unwind_metadata(already_pending, starting_pending_count=1, pending_counts=[0])
+    pending_summary = statistics._parse_unwind(already_pending, "unwind", DAILY_LABELS[-1])
+    assert pending_summary.starting_shares == 0
+    assert pending_summary.official_sessions_to_complete == 1
+
+
+def test_post_completion_heartbeat_is_economically_inert_and_not_counted_as_unwind_time():
+    unwind = deepcopy(_statistics_input()["arm_paths"]["F_1x"]["paths"]["primary"]["post_window_unwind"])
+    completion_state = deepcopy(unwind["completion_economic_state"])
+    heartbeat = {
+        "session": "2027-D002",
+        "state_sha256": unwind["completion_state_sha256"],
+        **completion_state,
+        "economic_state_sha256": unwind["completion_economic_state_sha256"],
+        "administrative_events": [],
+        "session_events_root_sha256": statistics.object_sha256([]),
+        "session_event_count": 0,
+    }
+    unwind["post_completion_heartbeats"] = [heartbeat]
+    summary = statistics._parse_unwind(unwind, "unwind", DAILY_LABELS[-1])
+    assert summary.official_sessions_to_complete == 1
+
+    forged = deepcopy(unwind)
+    forged_heartbeat = forged["post_completion_heartbeats"][0]
+    forged_heartbeat["cash_cny"] += 1.0
+    forged_heartbeat["economic_state_sha256"] = statistics.object_sha256(
+        {field: forged_heartbeat[field] for field in completion_state}
+    )
+    with pytest.raises(statistics.StatisticsError, match="changes economic state"):
+        statistics._parse_unwind(forged, "unwind", DAILY_LABELS[-1])
+
+
+def test_semantic_verifier_rejects_forged_risk_or_mechanism_output():
+    value = _statistics_input()
+    result = statistics.evaluate_statistics(value)
+    result["risk_and_mechanism_report"]["arms"]["FC_1x"]["fill_ratio"]["share_weighted_fill_ratio"] = 1.0
 
     with pytest.raises(statistics.StatisticsError, match="semantic replay"):
         statistics.verify_statistics_result(result, value)

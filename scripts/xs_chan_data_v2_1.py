@@ -36,6 +36,7 @@ import stat
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,11 @@ MANIFEST_VERSION = 3
 PROTOCOL_ID = "xs_chan_pilot_v2_1_preregistered_20260720"
 FROZEN_PROTOCOL_PATH = Path(__file__).resolve().with_name("xs_chan_protocol_v2_1.json")
 SOURCE_RESPONSE_SCHEMA = "xs_chan_source_response_v2_1"
+DATA_CONTRACT_IDENTITY_SCHEMA = "xs_chan_data_contract_identity_v2_1"
+DATA_CHAIN_TRANSITION_SCHEMA = "xs_chan_data_chain_transition_v2_1"
+SNAPSHOT_EXTENSION_SCHEMA = "xs_chan_snapshot_extension_verification_v2_1"
+EXECUTION_MARKET_BINDING_SCHEMA = "xs_chan_execution_market_binding_verification_v2_1"
+EXECUTION_SOURCE_ROW_SCHEMA = "xs_chan_execution_source_row_v2_1"
 PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 SOURCE_RESPONSE_MEDIA_TYPE = "application/vnd.xs-chan.source-response+json;version=2.1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -87,8 +93,15 @@ SCOPED_RESPONSE_DATE_COLUMNS = {
     "daily_basic": "trade_date",
     "stk_limit": "trade_date",
     "official_daily_status": "trade_date",
-    "corporate_actions": "effective_date",
-    "corporate_action_evidence": "effective_date",
+}
+
+CORPORATE_ACTION_OBSERVATION_DATE = {
+    "cash_dividend": "record_date",
+    "share_change": "record_date",
+    "rights_issue": "record_date",
+    "delist_cash": "effective_date",
+    "delist_share": "effective_date",
+    "delist_writeoff": "effective_date",
 }
 
 SOURCE_ASOF = "source_asof_utc"
@@ -434,6 +447,28 @@ EVIDENCE_SPECS = {name: ARTIFACT_SPECS.pop(name) for name in ("official_daily_st
 ALL_SPECS = {**ARTIFACT_SPECS, **EVIDENCE_SPECS}
 REQUIRED_ARTIFACTS = tuple(ARTIFACT_SPECS)
 REQUIRED_EVIDENCE_OBJECTS = tuple(EVIDENCE_SPECS)
+# These objects are complete point-in-time projections whose rows legitimately
+# supersede when the collection horizon advances.  Their prior bytes remain
+# immutable and replayable through the ledger-pinned prior manifest.
+SNAPSHOT_SUPERSEDING_OBJECTS = frozenset(
+    {
+        "security_master",
+        "namechange",
+        "industry_membership",
+        "state_input_binding",
+        "namechange_reconciliation",
+        "raw_daily_reconciliation",
+        "open_auction_reconciliation",
+        "universe_reconciliation",
+        "state_audit",
+    }
+)
+SNAPSHOT_SEMANTIC_EXCLUDED_COLUMNS = {
+    "*": (SOURCE_ASOF, INGESTED_AT),
+    # The last known calendar row may acquire its official successor when the
+    # next segment is published; both complete snapshots validate that link.
+    "calendar": (SOURCE_ASOF, INGESTED_AT, "next_trade_date"),
+}
 OBJECT_AUTHORITIES = {
     **{
         name: ("official_source_archive" if spec.source_endpoint else "xs_chan_data_v2_1.reconciliation")
@@ -462,6 +497,22 @@ STATE_COMPONENT_HASH_COLUMNS = {
     "official_daily_status": ALL_SPECS["official_daily_status"].names,
 }
 STATE_INPUT_HASH_COLUMNS = tuple(name for name in ALL_SPECS["state_input_binding"].names if name != "input_row_sha256")
+
+# Calendar rows beyond this horizon are scheduling metadata only.  Every table
+# below contains observations that must already exist at the manifest cutoff.
+OBSERVATION_HORIZON_COLUMNS = {
+    "raw_daily": "trade_date",
+    "adj_factor": "trade_date",
+    "namechange": "effective_from",
+    "official_daily_status": "trade_date",
+    "state_input_binding": "trade_date",
+    "open_auction": "trade_date",
+    "daily_basic": "trade_date",
+    "stk_limit": "trade_date",
+    "industry_membership": "effective_from",
+    "chan_states": "dt",
+    "state_audit": "checkpoint_dt",
+}
 
 
 @dataclass(frozen=True)
@@ -518,6 +569,7 @@ class VerifiedDataSnapshot:
         "_responses",
         "created_at_utc",
         "manifest_sha256",
+        "observation_through_session",
     )
 
     def __init__(
@@ -525,13 +577,20 @@ class VerifiedDataSnapshot:
         *,
         manifest_sha256: str,
         created_at_utc: str,
+        observation_through_session: str,
         manifest: Mapping[str, Any],
         artifact_blobs: Mapping[str, bytes],
         evidence_blobs: Mapping[str, bytes],
         responses: Mapping[str, Mapping[str, Any]],
     ) -> None:
+        if not isinstance(observation_through_session, str):
+            raise ContractError("observation_through_session must be canonical YYYY-MM-DD")
+        canonical_observation = _ledger_date(observation_through_session, "observation_through_session")
+        if manifest.get("observation_through_session") != canonical_observation:
+            raise ContractError("observation_through_session differs from the snapshot manifest")
         self.manifest_sha256 = manifest_sha256
         self.created_at_utc = created_at_utc
+        self.observation_through_session = canonical_observation
         self._manifest = copy.deepcopy(dict(manifest))
         self._artifact_blobs = {name: bytes(blob) for name, blob in artifact_blobs.items()}
         self._evidence_blobs = {name: bytes(blob) for name, blob in evidence_blobs.items()}
@@ -589,6 +648,198 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_object_sha256(value: Any) -> str:
+    """Hash canonical JSON without the record-serialization final LF."""
+
+    return sha256_bytes(canonical_json_bytes(value)[:-1])
+
+
+def data_validation_report_sha256(report_or_mapping: DataValidationReport | Mapping[str, Any]) -> str:
+    """Return the ledger-compatible semantic digest of a validation report.
+
+    Ledger records address JSON objects rather than newline-delimited records,
+    so this digest intentionally excludes :func:`canonical_json_bytes`' final
+    line feed.  A :class:`DataValidationReport` and its ``to_dict()`` result
+    therefore have exactly the same identity.
+    """
+
+    if isinstance(report_or_mapping, DataValidationReport):
+        payload: Mapping[str, Any] = report_or_mapping.to_dict()
+    elif isinstance(report_or_mapping, Mapping):
+        payload = report_or_mapping
+    else:
+        raise ContractError("data validation report must be a DataValidationReport or mapping")
+    return _canonical_object_sha256(copy.deepcopy(dict(payload)))
+
+
+def _contract_spec_identity(name: str, spec: ArtifactSpec, *, role: str) -> dict[str, Any]:
+    return {
+        "role": role,
+        "columns": [list(column) for column in spec.columns],
+        "primary_key": list(spec.key),
+        "nullable": sorted(spec.nullable),
+        "allow_empty": spec.allow_empty,
+        "source_endpoint": spec.source_endpoint,
+        "authority": OBJECT_AUTHORITIES[name],
+        "media_type": PARQUET_MEDIA_TYPE,
+    }
+
+
+def data_contract_identity_sha256() -> str:
+    """Return the stable semantic identity of the complete V2.1 data contract.
+
+    This identity is deliberately independent of any snapshot contents.  It
+    binds the frozen protocol plus every exact parquet schema, primary key,
+    nullability rule, authority, source endpoint, response envelope, and
+    canonicalization choice needed to interpret a future snapshot.
+    """
+
+    objects = {
+        name: _contract_spec_identity(
+            name,
+            ALL_SPECS[name],
+            role="artifact" if name in ARTIFACT_SPECS else "evidence_object",
+        )
+        for name in sorted(ALL_SPECS)
+    }
+    payload = {
+        "schema": DATA_CONTRACT_IDENTITY_SCHEMA,
+        "contract_id": CONTRACT_ID,
+        "manifest_version": MANIFEST_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "protocol_sha256": frozen_protocol_sha256(),
+        "manifest_canonicalization": "utf8_json_sort_keys_true_separators_comma_colon_final_lf",
+        "manifest_fields": sorted(
+            {
+                "contract_id",
+                "manifest_version",
+                "protocol_id",
+                "protocol_sha256",
+                "created_at_utc",
+                "observation_through_session",
+                "artifacts",
+                "evidence_objects",
+                "source_objects",
+            }
+        ),
+        "semantic_object_canonicalization": "utf8_json_sort_keys_true_separators_comma_colon_no_final_lf",
+        "required_artifacts": sorted(REQUIRED_ARTIFACTS),
+        "required_evidence_objects": sorted(REQUIRED_EVIDENCE_OBJECTS),
+        "objects": objects,
+        "source_response": {
+            "schema_version": SOURCE_RESPONSE_SCHEMA,
+            "media_type": SOURCE_RESPONSE_MEDIA_TYPE,
+            "envelope_fields": sorted(
+                {
+                    "schema_version",
+                    "provider",
+                    "endpoint",
+                    "scope",
+                    "source_asof_utc",
+                    "requested_at_utc",
+                    "responded_at_utc",
+                    "ingested_at_utc",
+                    "kind",
+                    "rows",
+                }
+            ),
+            "scope_fields": ["end_date", "start_date", "ts_code"],
+            "allowed_kinds": ["POSITIVE", "ZERO"],
+            "global_endpoints": sorted(GLOBAL_ENDPOINTS),
+            "symbol_endpoints": sorted(SYMBOL_ENDPOINTS),
+            "scoped_response_date_columns": dict(sorted(SCOPED_RESPONSE_DATE_COLUMNS.items())),
+        },
+        "snapshot_successor_policy": {
+            "version": "ledger_pinned_rolling_snapshot_v1",
+            "immutable_overlap_objects": sorted(set(ALL_SPECS) - SNAPSHOT_SUPERSEDING_OBJECTS),
+            "superseding_projection_objects": sorted(SNAPSHOT_SUPERSEDING_OBJECTS),
+            "semantic_excluded_columns": {
+                name: list(columns) for name, columns in sorted(SNAPSHOT_SEMANTIC_EXCLUDED_COLUMNS.items())
+            },
+            "source_response_retention": "prior_manifest_remains_ledger_pinned_not_required_in_successor",
+        },
+        "observation_horizon_policy": {
+            "manifest_field": "observation_through_session",
+            "format": "canonical_yyyy_mm_dd_open_session",
+            "calendar_future_rows": "allowed_for_next_session_scheduling_only",
+            "observed_fact_date_columns": dict(sorted(OBSERVATION_HORIZON_COLUMNS.items())),
+            "corporate_action_observation_date": dict(sorted(CORPORATE_ACTION_OBSERVATION_DATE.items())),
+            "non_calendar_source_scope_end": "observation_through_session",
+        },
+        "formal_gates": list(FORMAL_GATES),
+    }
+    return _canonical_object_sha256(payload)
+
+
+def _ledger_date(value: str | date, label: str) -> str:
+    if isinstance(value, datetime):
+        raise ContractError(f"{label} must be a date, not a datetime")
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        raise ContractError(f"{label} must be YYYY-MM-DD")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ContractError(f"{label} must be YYYY-MM-DD") from exc
+    if value != parsed.isoformat():
+        raise ContractError(f"{label} must use canonical YYYY-MM-DD format")
+    return value
+
+
+def _ledger_utc(value: str | datetime, label: str) -> str:
+    # Match xs_chan_oos_ledger_v2_1._canonical_utc exactly: despite the public
+    # annotation accepting datetime for compatibility, ledger records require
+    # a canonical UTC string with six fractional digits and a trailing Z.
+    if not isinstance(value, str):
+        raise ContractError(f"{label} must be a canonical UTC string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ContractError(f"{label} must be a timezone-aware timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ContractError(f"{label} must be timezone-aware")
+    canonical = parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if value != canonical:
+        raise ContractError(f"{label} must use canonical UTC Z format with microseconds")
+    return canonical
+
+
+def _required_sha256(value: Any, label: str) -> str:
+    if not _is_sha256(value):
+        raise ContractError(f"{label} must be a lowercase SHA256 digest")
+    return value
+
+
+def data_chain_transition_sha256(
+    *,
+    data_contract_identity_sha256: str,
+    previous_data_chain_head_sha256: str,
+    decision_session: str | date,
+    snapshot_cutoff_utc: str | datetime,
+    data_manifest_sha256: str,
+    data_validation_report_sha256: str,
+) -> str:
+    """Derive a decision-time chain head byte-for-byte equal to the ledger."""
+
+    payload = {
+        "schema": DATA_CHAIN_TRANSITION_SCHEMA,
+        "data_contract_identity_sha256": _required_sha256(
+            data_contract_identity_sha256, "data_contract_identity_sha256"
+        ),
+        "previous_data_chain_head_sha256": _required_sha256(
+            previous_data_chain_head_sha256, "previous_data_chain_head_sha256"
+        ),
+        "decision_session": _ledger_date(decision_session, "decision_session"),
+        "snapshot_cutoff_utc": _ledger_utc(snapshot_cutoff_utc, "snapshot_cutoff_utc"),
+        "data_manifest_sha256": _required_sha256(data_manifest_sha256, "data_manifest_sha256"),
+        "data_validation_report_sha256": _required_sha256(
+            data_validation_report_sha256, "data_validation_report_sha256"
+        ),
+    }
+    return _canonical_object_sha256(payload)
 
 
 def symbol_set_sha256(values: Sequence[object] | pd.Series | pd.Index) -> str:
@@ -917,6 +1168,7 @@ def _validate_manifest_shape(
         "protocol_id",
         "protocol_sha256",
         "created_at_utc",
+        "observation_through_session",
         "artifacts",
         "evidence_objects",
         "source_objects",
@@ -931,6 +1183,11 @@ def _validate_manifest_shape(
     created = _parse_utc(manifest.get("created_at_utc"), label="manifest.created_at_utc")
     if created > pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=5):
         raise ContractError("manifest.created_at_utc is in the future")
+    observation = manifest.get("observation_through_session")
+    if not isinstance(observation, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", observation) is None:
+        raise ContractError("manifest.observation_through_session must use canonical YYYY-MM-DD format")
+    if _parse_date(observation, label="manifest.observation_through_session").strftime("%Y-%m-%d") != observation:
+        raise ContractError("manifest.observation_through_session must use canonical YYYY-MM-DD format")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(REQUIRED_ARTIFACTS):
         raise ContractError("manifest artifact set differs from the exact V2.1 contract")
@@ -1091,6 +1348,8 @@ def _parse_source_responses(source_blobs: Mapping[str, bytes], created: pd.Times
             if symbol is not None and row.get("ts_code") != symbol:
                 raise ContractError(f"source response row escapes its symbol scope: {endpoint}/{symbol}")
             date_column = SCOPED_RESPONSE_DATE_COLUMNS.get(endpoint)
+            if endpoint == "corporate_actions":
+                date_column = CORPORATE_ACTION_OBSERVATION_DATE.get(str(row.get("action_type")))
             if date_column is not None:
                 row_date = _parse_date(row[date_column], label=f"{endpoint}.{date_column}")
                 if row_date < start or row_date > end:
@@ -1113,9 +1372,61 @@ def _add_failure(report: DataValidationReport, code: str, message: str, gate: st
     return False
 
 
-def _validate_artifact_semantics(report: DataValidationReport, frames: Mapping[str, pd.DataFrame]) -> bool:
+def _validate_observation_horizon(
+    report: DataValidationReport,
+    frames: Mapping[str, pd.DataFrame],
+    observation: pd.Timestamp,
+) -> bool:
+    """Reject market/event facts beyond the manifest's causal cutoff."""
+
     gate = "artifact_semantics"
     good = True
+    calendar = frames["calendar"]
+    observation_rows = calendar.loc[calendar["trade_date"].eq(observation)]
+    if len(observation_rows) != 1 or not bool(observation_rows.iloc[0]["is_open"]):
+        good &= _add_failure(
+            report,
+            "observation_horizon_calendar",
+            "observation_through_session must name exactly one official open calendar session",
+            gate,
+            "calendar",
+        )
+    for artifact, column in OBSERVATION_HORIZON_COLUMNS.items():
+        frame = frames[artifact]
+        if not frame.empty and frame[column].gt(observation).any():
+            first = frame.loc[frame[column].gt(observation), column].min().strftime("%Y-%m-%d")
+            good &= _add_failure(
+                report,
+                "observation_horizon_leakage",
+                f"{artifact}.{column} contains post-horizon fact {first}",
+                gate,
+                artifact,
+            )
+
+    actions = frames["corporate_actions"]
+    if not actions.empty:
+        observation_dates = pd.Series(pd.NaT, index=actions.index, dtype="datetime64[ns]")
+        for action_type, column in CORPORATE_ACTION_OBSERVATION_DATE.items():
+            selected = actions["action_type"].eq(action_type)
+            observation_dates.loc[selected] = actions.loc[selected, column]
+        leaked = observation_dates.gt(observation)
+        if leaked.any():
+            action_id = str(actions.loc[leaked, "action_id"].iloc[0])
+            good &= _add_failure(
+                report,
+                "observation_horizon_leakage",
+                f"corporate action {action_id} was not observable by observation_through_session",
+                gate,
+                "corporate_actions",
+            )
+    return bool(good)
+
+
+def _validate_artifact_semantics(
+    report: DataValidationReport, frames: Mapping[str, pd.DataFrame], observation: pd.Timestamp
+) -> bool:
+    gate = "artifact_semantics"
+    good = _validate_observation_horizon(report, frames, observation)
     calendar = frames["calendar"]
     if not calendar["is_open"].all() or not calendar["trade_date"].is_monotonic_increasing:
         good &= _add_failure(report, "calendar_semantics", "calendar must be sorted open sessions", gate, "calendar")
@@ -1560,10 +1871,14 @@ def _validate_source_archive_binding(
 
 
 def _expected_lifecycle_keys(
-    calendar: pd.DataFrame, master: pd.DataFrame
+    calendar: pd.DataFrame,
+    master: pd.DataFrame,
+    observation: pd.Timestamp,
 ) -> tuple[pd.MultiIndex, set[str], pd.Timestamp, pd.Timestamp]:
-    dates = pd.DatetimeIndex(calendar["trade_date"])
-    start, end = dates.min(), dates.max()
+    dates = pd.DatetimeIndex(calendar.loc[calendar["trade_date"].le(observation), "trade_date"])
+    if dates.empty:
+        raise ContractError("calendar has no session at or before observation_through_session")
+    start, end = dates.min(), observation
     tuples: list[tuple[str, pd.Timestamp]] = []
     relevant: set[str] = set()
     for row in master.itertuples(index=False):
@@ -1594,9 +1909,12 @@ def _validate_universe_coverage(
     report: DataValidationReport,
     frames: Mapping[str, pd.DataFrame],
     responses: Mapping[str, Mapping[str, Any]],
+    observation: pd.Timestamp,
 ) -> tuple[bool, set[str]]:
     gate = "universe_response_coverage"
-    expected_status_keys, relevant, start, end = _expected_lifecycle_keys(frames["calendar"], frames["security_master"])
+    expected_status_keys, relevant, start, end = _expected_lifecycle_keys(
+        frames["calendar"], frames["security_master"], observation
+    )
     response_map = _response_by_key(responses)
     expected_response_keys = {(endpoint, None) for endpoint in GLOBAL_ENDPOINTS}
     expected_response_keys.update((endpoint, symbol) for endpoint in SYMBOL_ENDPOINTS for symbol in relevant)
@@ -1610,12 +1928,14 @@ def _validate_universe_coverage(
             f"source response set is not exact; missing={missing[:5]}, extra={extra[:5]}",
             gate,
         )
+    calendar_end = frames["calendar"]["trade_date"].max()
     for response in responses.values():
-        if response["_start"] != start or response["_end"] != end:
+        expected_end = calendar_end if response["endpoint"] == "calendar" else end
+        if response["_start"] != start or response["_end"] != expected_end:
             good &= _add_failure(
                 report,
                 "response_date_scope",
-                "every source request must bind the complete calendar range",
+                "source request scope must end at the observation horizon except for future calendar scheduling",
                 gate,
             )
             break
@@ -1794,6 +2114,7 @@ def _validate_namechange_evidence(
     frames: Mapping[str, pd.DataFrame],
     responses: Mapping[str, Mapping[str, Any]],
     relevant: set[str],
+    observation: pd.Timestamp,
 ) -> bool:
     gate = "namechange_response_evidence"
     response_map = _response_by_key(responses)
@@ -1801,7 +2122,7 @@ def _validate_namechange_evidence(
     master_symbols = set(frames["security_master"]["ts_code"])
     reconciliation = frames["namechange_reconciliation"].set_index("ts_code", drop=False)
     start = frames["calendar"]["trade_date"].min()
-    end = frames["calendar"]["trade_date"].max()
+    end = observation
     good = True
     if not physical_symbols.issubset(master_symbols) or not physical_symbols.issubset(relevant):
         good &= _add_failure(
@@ -1868,17 +2189,22 @@ def _validate_namechange_evidence(
     return bool(good)
 
 
-def _validate_terminal_actions(report: DataValidationReport, frames: Mapping[str, pd.DataFrame]) -> bool:
+def _validate_terminal_actions(
+    report: DataValidationReport, frames: Mapping[str, pd.DataFrame], observation: pd.Timestamp
+) -> bool:
     gate = "terminal_actions_exact"
     master = frames["security_master"]
     actions = frames["corporate_actions"]
     start = frames["calendar"]["trade_date"].min()
-    end = frames["calendar"]["trade_date"].max()
+    end = observation
     required = master.loc[
         master["list_status"].eq("D") & master["delist_date"].between(start, end, inclusive="both"),
         ["ts_code", "delist_date"],
     ].rename(columns={"delist_date": "effective_date"})
-    actual = actions.loc[actions["action_type"].isin(TERMINAL_ACTION_TYPES), ["ts_code", "effective_date"]]
+    actual = actions.loc[
+        actions["action_type"].isin(TERMINAL_ACTION_TYPES) & actions["effective_date"].le(end),
+        ["ts_code", "effective_date"],
+    ]
     required_keys = Counter(map(tuple, required.itertuples(index=False, name=None)))
     actual_keys = Counter(map(tuple, actual.itertuples(index=False, name=None)))
     good = True
@@ -2112,6 +2438,7 @@ def _validate_loaded(
     source_blobs: Mapping[str, bytes],
 ) -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]]]:
     frames: dict[str, pd.DataFrame] = {}
+    observation = _parse_date(manifest["observation_through_session"], label="manifest.observation_through_session")
     schema_good = True
     object_blobs = {**artifact_blobs, **evidence_blobs}
     for name in (*REQUIRED_ARTIFACTS, *REQUIRED_EVIDENCE_OBJECTS):
@@ -2130,7 +2457,7 @@ def _validate_loaded(
         return frames, {}
 
     guarded_checks = (
-        ("artifact_semantics", lambda: _validate_artifact_semantics(report, frames)),
+        ("artifact_semantics", lambda: _validate_artifact_semantics(report, frames, observation)),
         ("source_time_order", lambda: _validate_source_time_order(report, frames, created)),
     )
     for gate, check in guarded_checks:
@@ -2161,13 +2488,13 @@ def _validate_loaded(
 
     relevant: set[str] = set()
     try:
-        coverage_good, relevant = _validate_universe_coverage(report, frames, responses)
+        coverage_good, relevant = _validate_universe_coverage(report, frames, responses, observation)
         report.gates["universe_response_coverage"] = coverage_good
     except Exception as exc:
         report.add("coverage_exception", f"failed closed: {type(exc).__name__}: {exc}", "universe_response_coverage")
     try:
         report.gates["namechange_response_evidence"] = _validate_namechange_evidence(
-            report, frames, responses, relevant
+            report, frames, responses, relevant, observation
         )
     except Exception as exc:
         report.add(
@@ -2176,7 +2503,7 @@ def _validate_loaded(
             "namechange_response_evidence",
         )
     try:
-        report.gates["terminal_actions_exact"] = _validate_terminal_actions(report, frames)
+        report.gates["terminal_actions_exact"] = _validate_terminal_actions(report, frames, observation)
     except Exception as exc:
         report.add("terminal_exception", f"failed closed: {type(exc).__name__}: {exc}", "terminal_actions_exact")
     try:
@@ -2190,6 +2517,7 @@ def _validate_loaded(
     report.evidence.update(
         {
             "created_at_utc": manifest["created_at_utc"],
+            "observation_through_session": manifest["observation_through_session"],
             "protocol_id": manifest["protocol_id"],
             "protocol_sha256": manifest["protocol_sha256"],
             "artifact_sha256": {name: manifest["artifacts"][name]["sha256"] for name in sorted(manifest["artifacts"])},
@@ -2232,6 +2560,7 @@ def load_verified_snapshot(
         snapshot = VerifiedDataSnapshot(
             manifest_sha256=manifest_sha,
             created_at_utc=manifest["created_at_utc"],
+            observation_through_session=manifest["observation_through_session"],
             manifest=manifest,
             artifact_blobs=artifact_blobs,
             evidence_blobs=evidence_blobs,
@@ -2256,19 +2585,997 @@ def validate_data_manifest(manifest_path: str | Path) -> DataValidationReport:
     return report
 
 
+def _snapshot_manifest_binding(snapshot: VerifiedDataSnapshot, *, label: str) -> tuple[dict[str, Any], pd.Timestamp]:
+    """Re-establish the content bindings exposed by a verified snapshot."""
+
+    if not isinstance(snapshot, VerifiedDataSnapshot):
+        raise ContractError(f"{label} must be a VerifiedDataSnapshot")
+    manifest = snapshot.manifest_dict()
+    created, artifact_entries, evidence_entries, source_entries = _validate_manifest_shape(manifest)
+    if snapshot.created_at_utc != manifest["created_at_utc"]:
+        raise ContractError(f"{label} created_at_utc differs from its manifest")
+    if snapshot.observation_through_session != manifest["observation_through_session"]:
+        raise ContractError(f"{label} observation_through_session differs from its manifest")
+    if snapshot.manifest_sha256 != sha256_bytes(canonical_json_bytes(manifest)):
+        raise ContractError(f"{label} manifest_sha256 does not address its manifest")
+    if set(snapshot.artifact_names) != set(REQUIRED_ARTIFACTS):
+        raise ContractError(f"{label} artifact set differs from the contract")
+    if set(snapshot.evidence_object_names) != set(REQUIRED_EVIDENCE_OBJECTS):
+        raise ContractError(f"{label} evidence-object set differs from the contract")
+    for name, entry in artifact_entries.items():
+        payload = snapshot.read_artifact_bytes(name)
+        if len(payload) != entry["size"] or sha256_bytes(payload) != entry["sha256"]:
+            raise ContractError(f"{label} artifact bytes are not manifest-bound: {name}")
+    for name, entry in evidence_entries.items():
+        payload = bytes(snapshot._evidence_blobs[name])
+        if len(payload) != entry["size"] or sha256_bytes(payload) != entry["sha256"]:
+            raise ContractError(f"{label} evidence bytes are not manifest-bound: {name}")
+    expected_sources = {entry["sha256"]: entry for entry in source_entries}
+    if set(snapshot.source_response_sha256) != set(expected_sources):
+        raise ContractError(f"{label} source-response set differs from its manifest")
+    for digest, entry in expected_sources.items():
+        payload = canonical_json_bytes(snapshot.read_source_response(digest))
+        if len(payload) != entry["size"] or sha256_bytes(payload) != digest:
+            raise ContractError(f"{label} source response is not content-addressed: {digest}")
+    return manifest, created
+
+
+def _snapshot_row_index(
+    snapshot: VerifiedDataSnapshot,
+    name: str,
+    *,
+    semantic: bool = False,
+) -> dict[tuple[Any, ...], str]:
+    spec = ALL_SPECS[name]
+    frame = snapshot.read_parquet(name) if name in ARTIFACT_SPECS else snapshot.read_evidence_parquet(name)
+    if tuple(frame.columns) != spec.names:
+        raise ContractError(f"{name} columns differ from the exact contract")
+    result: dict[tuple[Any, ...], str] = {}
+    for row in frame.to_dict(orient="records"):
+        key = tuple(
+            _normalise_scalar(
+                row[column],
+                spec.kinds[column],
+                label=f"{name}.{column}",
+                nullable=column in spec.nullable,
+            )
+            for column in spec.key
+        )
+        if key in result:
+            raise ContractError(f"{name} contains duplicate primary key {key!r}")
+        if semantic:
+            excluded = set(SNAPSHOT_SEMANTIC_EXCLUDED_COLUMNS.get("*", ()))
+            excluded.update(SNAPSHOT_SEMANTIC_EXCLUDED_COLUMNS.get(name, ()))
+            normalized = {
+                column: _normalise_scalar(
+                    row[column],
+                    spec.kinds[column],
+                    label=f"{name}.{column}",
+                    nullable=column in spec.nullable,
+                )
+                for column in spec.names
+                if column not in excluded
+            }
+            result[key] = _canonical_object_sha256({"artifact": name, "semantic_row": normalized})
+        else:
+            result[key] = canonical_row_sha256(name, row)
+    return result
+
+
+def verify_snapshot_extension(previous: VerifiedDataSnapshot, current: VerifiedDataSnapshot) -> dict[str, Any]:
+    """Verify one causal successor in the ledger-pinned rolling snapshot chain.
+
+    Prior manifests and their response objects remain immutable because their
+    physical hashes are already committed by the ledger.  A successor may use
+    a new complete response set and may replace explicitly registered
+    point-in-time projections.  For market/event facts, however, every old
+    primary key must remain and its semantic values (excluding collection
+    provenance timestamps) must be unchanged.  New keys are append-only.
+    """
+
+    report: dict[str, Any] = {
+        "schema": SNAPSHOT_EXTENSION_SCHEMA,
+        "valid": False,
+        "data_contract_identity_sha256": data_contract_identity_sha256(),
+        "previous_manifest_sha256": getattr(previous, "manifest_sha256", None),
+        "current_manifest_sha256": getattr(current, "manifest_sha256", None),
+        "previous_created_at_utc": getattr(previous, "created_at_utc", None),
+        "current_created_at_utc": getattr(current, "created_at_utc", None),
+        "previous_observation_through_session": getattr(previous, "observation_through_session", None),
+        "current_observation_through_session": getattr(current, "observation_through_session", None),
+        "row_counts": {},
+        "superseding_projection_objects": sorted(SNAPSHOT_SUPERSEDING_OBJECTS),
+        "previous_source_response_count": 0,
+        "current_source_response_count": 0,
+        "retained_source_response_count": 0,
+        "retired_source_response_count": 0,
+        "appended_source_response_count": 0,
+        "errors": [],
+    }
+    try:
+        previous_manifest, previous_created = _snapshot_manifest_binding(previous, label="previous snapshot")
+        current_manifest, current_created = _snapshot_manifest_binding(current, label="current snapshot")
+        identity_fields = ("contract_id", "manifest_version", "protocol_id", "protocol_sha256")
+        for field_name in identity_fields:
+            if previous_manifest[field_name] != current_manifest[field_name]:
+                raise ContractError(f"snapshot {field_name} changed across the extension")
+        if current_created < previous_created:
+            raise ContractError("current snapshot created_at_utc precedes the previous snapshot")
+        previous_observation = _parse_date(
+            previous_manifest["observation_through_session"], label="previous observation_through_session"
+        )
+        current_observation = _parse_date(
+            current_manifest["observation_through_session"], label="current observation_through_session"
+        )
+        if current_observation < previous_observation:
+            raise ContractError("current observation_through_session precedes the previous snapshot")
+
+        row_counts: dict[str, dict[str, int]] = {}
+        for name in sorted(ALL_SPECS):
+            old_rows = _snapshot_row_index(previous, name, semantic=True)
+            new_rows = _snapshot_row_index(current, name, semantic=True)
+            if name in SNAPSHOT_SUPERSEDING_OBJECTS:
+                row_counts[name] = {
+                    "previous": len(old_rows),
+                    "current": len(new_rows),
+                    "appended": max(0, len(new_rows) - len(old_rows)),
+                }
+                continue
+            missing = old_rows.keys() - new_rows.keys()
+            if missing:
+                first = min(missing, key=repr)
+                raise ContractError(f"{name} deleted old primary-key row {first!r}")
+            changed = [key for key in old_rows.keys() & new_rows.keys() if old_rows[key] != new_rows[key]]
+            if changed:
+                first = min(changed, key=repr)
+                raise ContractError(f"{name} modified old primary-key row {first!r}")
+            row_counts[name] = {
+                "previous": len(old_rows),
+                "current": len(new_rows),
+                "appended": len(new_rows) - len(old_rows),
+            }
+        report["row_counts"] = row_counts
+
+        old_sources = set(previous.source_response_sha256)
+        new_sources = set(current.source_response_sha256)
+        for digest in old_sources & new_sources:
+            if previous.read_source_response(digest) != current.read_source_response(digest):
+                raise ContractError(f"current snapshot modified source response {digest}")
+        report["previous_source_response_count"] = len(old_sources)
+        report["current_source_response_count"] = len(new_sources)
+        report["retained_source_response_count"] = len(old_sources & new_sources)
+        report["retired_source_response_count"] = len(old_sources - new_sources)
+        report["appended_source_response_count"] = len(new_sources - old_sources)
+        report["valid"] = True
+    except Exception as exc:
+        report["errors"] = [f"{type(exc).__name__}: {exc}"]
+    report["verification_sha256"] = _canonical_object_sha256(report)
+    return report
+
+
+def execution_source_row_sha256(role: str, evidence: Mapping[str, Any]) -> str:
+    """Address one execution row by its immutable snapshot-source evidence.
+
+    ``role`` is deliberately part of the address, so an opening observation,
+    closing observation, and corporate-action observation cannot alias even if
+    a malformed producer supplies otherwise identical JSON.  Producers should
+    use the exact evidence payloads reconstructed by
+    :func:`verify_execution_market_inputs`; a digest over self-reported market
+    values is not sufficient for the formal gate.
+    """
+
+    if role not in {"open", "eod", "corporate_action"}:
+        raise ContractError(f"unknown execution source-row role {role!r}")
+    if not isinstance(evidence, Mapping):
+        raise ContractError("execution source-row evidence must be a mapping")
+    return sha256_bytes(
+        canonical_json_bytes(
+            {
+                "schema": EXECUTION_SOURCE_ROW_SCHEMA,
+                "role": role,
+                "evidence": copy.deepcopy(dict(evidence)),
+            }
+        )
+    )
+
+
+def _execution_date(value: Any, label: str) -> str:
+    return _parse_date(value, label=label).strftime("%Y-%m-%d")
+
+
+def _execution_number(value: Any, label: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ContractError(f"{label} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ContractError(f"{label} must be a finite number") from exc
+    if not np.isfinite(number):
+        raise ContractError(f"{label} must be a finite number")
+    return number
+
+
+def _require_execution_float(value: Any, expected: float, label: str) -> None:
+    actual = _execution_number(value, label)
+    if actual.hex() != float(expected).hex():
+        raise ContractError(f"{label} differs from the immutable data snapshot")
+
+
+def _frame_row(frame: pd.DataFrame, key: tuple[str, pd.Timestamp], artifact: str) -> dict[str, Any] | None:
+    matches = frame.loc[(frame["ts_code"].eq(key[0])) & (frame["trade_date"].eq(key[1]))]
+    if matches.empty:
+        return None
+    if len(matches) != 1:
+        raise ContractError(f"{artifact} has duplicate execution key {key[0]}/{key[1].date()}")
+    return matches.iloc[0].to_dict()
+
+
+def _execution_response_index(
+    snapshot: VerifiedDataSnapshot,
+) -> dict[tuple[str, str | None], tuple[str, dict[str, Any]]]:
+    result: dict[tuple[str, str | None], tuple[str, dict[str, Any]]] = {}
+    for digest in snapshot.source_response_sha256:
+        response = snapshot.read_source_response(digest)
+        try:
+            key = (str(response["endpoint"]), response["scope"]["ts_code"])
+        except (KeyError, TypeError) as exc:
+            raise ContractError("verified snapshot contains a malformed source response") from exc
+        if key in result:
+            raise ContractError(f"duplicate verified source response {key!r}")
+        result[key] = (digest, response)
+    return result
+
+
+def _decision_adv20_cny(raw: pd.DataFrame, symbol: str, decision: pd.Timestamp) -> tuple[float, list[str]]:
+    history = raw.loc[(raw["ts_code"].eq(symbol)) & (raw["trade_date"].le(decision))].sort_values(
+        "trade_date", kind="mergesort"
+    )
+    if len(history) < 20:
+        raise ContractError(f"{symbol} has fewer than 20 causal raw rows through decision {decision.date()}")
+    window = history.tail(20)
+    # The official raw ``amount`` unit is thousand CNY; the execution engine's
+    # capacity input is CNY.  Match the planner's rolling(20, min_periods=20)
+    # semantics before applying that exact unit conversion.
+    adv_thousand_cny = float(window["amount"].rolling(20, min_periods=20).mean().iloc[-1])
+    if not np.isfinite(adv_thousand_cny):
+        raise ContractError(f"{symbol} has no finite causal ADV20 through decision {decision.date()}")
+    row_hashes = [canonical_row_sha256("raw_daily", row) for row in window.to_dict(orient="records")]
+    return adv_thousand_cny * 1000.0, row_hashes
+
+
+def _auction_binding(
+    *,
+    auction: pd.DataFrame,
+    responses: Mapping[tuple[str, str | None], tuple[str, dict[str, Any]]],
+    symbol: str,
+    session: pd.Timestamp,
+    terminal_delisted: bool = False,
+) -> tuple[float, str | None, str, str]:
+    response_entry = responses.get(("open_auction", symbol))
+    if response_entry is None:
+        raise ContractError(f"missing archived open-auction response for {symbol}")
+    response_sha, response = response_entry
+    scope = response.get("scope")
+    if not isinstance(scope, Mapping):
+        raise ContractError(f"malformed open-auction response scope for {symbol}")
+    start = _parse_date(scope.get("start_date"), label=f"open_auction/{symbol}.start_date")
+    end = _parse_date(scope.get("end_date"), label=f"open_auction/{symbol}.end_date")
+    if not start <= session <= end:
+        raise ContractError(f"open-auction response does not cover {symbol}/{session.date()}")
+    row = _frame_row(auction, (symbol, session), "open_auction")
+    kind = response.get("kind")
+    if kind == "ZERO":
+        if row is not None:
+            raise ContractError(f"ZERO open-auction response conflicts with a row for {symbol}/{session.date()}")
+        return 0.0, None, response_sha, kind
+    if kind != "POSITIVE":
+        raise ContractError(f"unknown open-auction response kind for {symbol}")
+    # A POSITIVE partition is not negative evidence for an omitted day.  The
+    # per-session row must exist; substituting full-day amount or a continuous-
+    # auction proxy is explicitly forbidden by the frozen protocol.
+    if row is None:
+        if terminal_delisted:
+            return 0.0, None, response_sha, kind
+        raise ContractError(f"POSITIVE open-auction response omits execution row {symbol}/{session.date()}")
+    amount_cny = float(row["auction_amount"]) * 1000.0
+    if terminal_delisted and amount_cny != 0:
+        raise ContractError(f"terminal delisted auction turnover must be zero for {symbol}/{session.date()}")
+    return amount_cny, canonical_row_sha256("open_auction", row), response_sha, kind
+
+
+def _corporate_action_source_evidence(
+    snapshot: VerifiedDataSnapshot, action_row: Mapping[str, Any], evidence_row: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "data_snapshot_sha256": snapshot.manifest_sha256,
+        "action_id": str(action_row["action_id"]),
+        "corporate_action_row_sha256": canonical_row_sha256("corporate_actions", action_row),
+        "corporate_action_evidence_row_sha256": canonical_row_sha256("corporate_action_evidence", evidence_row),
+        "source_document_sha256": str(evidence_row["source_document_sha256"]),
+    }
+
+
+def _expected_execution_action(
+    snapshot: VerifiedDataSnapshot, action_row: Mapping[str, Any], evidence_row: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Translate one official action row to the execution schema.
+
+    Entitlement actions are keyed to ``record_date``.  This helper remains
+    isolated because those actions have two distinct lifecycle dates, whereas
+    terminal actions are keyed to ``effective_date``.
+    """
+
+    action_type = str(action_row["action_type"])
+    source_evidence = _corporate_action_source_evidence(snapshot, action_row, evidence_row)
+    source_sha = execution_source_row_sha256("corporate_action", source_evidence)
+    result: dict[str, Any] = {
+        "action_id": str(action_row["action_id"]),
+        "symbol": str(action_row["ts_code"]),
+        "action_type": action_type,
+        "source_row_sha256": source_sha,
+    }
+    if action_type in {"cash_dividend", "share_change", "rights_issue"}:
+        if pd.isna(action_row["record_date"]):
+            raise ContractError(f"entitlement action {action_row['action_id']} lacks record_date")
+        event_session = pd.Timestamp(action_row["record_date"]).strftime("%Y-%m-%d")
+        result.update(
+            record_session=event_session,
+            effective_session=pd.Timestamp(action_row["effective_date"]).strftime("%Y-%m-%d"),
+        )
+    else:
+        event_session = pd.Timestamp(action_row["effective_date"]).strftime("%Y-%m-%d")
+        result["effective_session"] = event_session
+    if action_type == "cash_dividend":
+        result.update(
+            gross_cash_per_share=float(action_row["gross_cash_per_share"]),
+            payment_session=pd.Timestamp(action_row["payment_date"]).strftime("%Y-%m-%d"),
+        )
+    elif action_type == "share_change":
+        result.update(
+            post_to_pre_ratio=float(action_row["post_to_pre_ratio"]),
+            fractional_cash_price=float(action_row["fractional_cash_price"]),
+            action_subtype=str(action_row["action_subtype"]),
+            taxable_dividend_per_pre_action_share=float(action_row["taxable_dividend_per_pre_action_share"]),
+            new_share_registration_session=pd.Timestamp(action_row["new_share_registration_date"]).strftime("%Y-%m-%d"),
+        )
+    elif action_type == "rights_issue":
+        result.update(
+            official_disposal_proceeds_per_entitled_share=float(
+                action_row["official_disposal_proceeds_per_entitled_share"]
+            ),
+            payment_session=pd.Timestamp(action_row["payment_date"]).strftime("%Y-%m-%d"),
+        )
+    elif action_type == "delist_cash":
+        result.update(
+            cash_per_share=float(action_row["terminal_cash_per_share"]),
+            terminal_reason=str(action_row["terminal_reason"]),
+            disposal_settlement_session=pd.Timestamp(action_row["disposal_settlement_date"]).strftime("%Y-%m-%d"),
+        )
+    elif action_type == "delist_share":
+        result.update(
+            target_symbol=str(action_row["target_symbol"]),
+            target_share_ratio=float(action_row["target_share_ratio"]),
+            fractional_cash_price=float(action_row["fractional_cash_price"]),
+            terminal_reason=str(action_row["terminal_reason"]),
+            disposal_settlement_session=pd.Timestamp(action_row["disposal_settlement_date"]).strftime("%Y-%m-%d"),
+        )
+    elif action_type == "delist_writeoff":
+        result.update(
+            terminal_reason=str(action_row["terminal_reason"]),
+            no_value_evidence_sha256=str(action_row["no_value_evidence_sha256"]),
+            disposal_settlement_session=pd.Timestamp(action_row["disposal_settlement_date"]).strftime("%Y-%m-%d"),
+        )
+    else:  # pragma: no cover - the data validator rejects this first
+        raise ContractError(f"unsupported corporate action type {action_type!r}")
+    return event_session, result
+
+
+def _same_execution_object(actual: Mapping[str, Any], expected: Mapping[str, Any], label: str) -> None:
+    if set(actual) != set(expected):
+        raise ContractError(f"{label} keys differ from the snapshot-bound execution schema")
+    for key, expected_value in expected.items():
+        actual_value = actual[key]
+        if isinstance(expected_value, float):
+            _require_execution_float(actual_value, expected_value, f"{label}.{key}")
+        elif actual_value != expected_value:
+            raise ContractError(f"{label}.{key} differs from the immutable data snapshot")
+
+
+def verify_execution_market_inputs(
+    snapshot: VerifiedDataSnapshot, execution_inputs: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Bind every execution market observation to one verified data snapshot.
+
+    The verifier is intentionally fail closed.  It proves a common contiguous
+    official-session timeline, exact next-session settlement, official status,
+    raw open/pre-close/close, limits, causal ADV20, same-session official call-
+    auction turnover (including POSITIVE/ZERO response semantics), and exact
+    corporate-action/evidence translation.  Repeated symbol/session facts
+    across arms, seeds, and cost scenarios must be byte-equivalent.
+    """
+
+    errors: list[str] = []
+    evidence: dict[str, Any] = {}
+    input_count = len(execution_inputs) if isinstance(execution_inputs, Sequence) else 0
+    counts = {"open": 0, "eod": 0, "corporate_action": 0}
+    try:
+        if not isinstance(snapshot, VerifiedDataSnapshot):
+            raise ContractError("execution market binding requires a VerifiedDataSnapshot")
+        if (
+            not isinstance(execution_inputs, Sequence)
+            or isinstance(execution_inputs, (str, bytes, bytearray))
+            or not execution_inputs
+        ):
+            raise ContractError("execution_inputs must be a non-empty sequence")
+        manifest = snapshot.manifest_dict()
+        protocol_sha = manifest.get("protocol_sha256")
+        if not _is_sha256(protocol_sha):
+            raise ContractError("snapshot manifest lacks a protocol identity")
+        calendar = snapshot.read_parquet("calendar").sort_values("trade_date", kind="mergesort")
+        master = snapshot.read_parquet("security_master")
+        raw = snapshot.read_parquet("raw_daily")
+        status = snapshot.read_evidence_parquet("official_daily_status")
+        limits = snapshot.read_parquet("stk_limit")
+        auction = snapshot.read_parquet("open_auction")
+        actions = snapshot.read_parquet("corporate_actions")
+        action_evidence = snapshot.read_parquet("corporate_action_evidence")
+        responses = _execution_response_index(snapshot)
+        calendar_by_date = {pd.Timestamp(row.trade_date): row for row in calendar.itertuples(index=False)}
+        master_by_symbol = {str(row["ts_code"]): row for row in master.to_dict(orient="records")}
+        evidence_by_action = {str(row["action_id"]): row for row in action_evidence.to_dict(orient="records")}
+        expected_actions_by_session_symbol: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+        for action_row in actions.to_dict(orient="records"):
+            action_id = str(action_row["action_id"])
+            evidence_row = evidence_by_action.get(action_id)
+            if evidence_row is None:
+                raise ContractError(f"corporate action {action_id} lacks authority evidence")
+            event_session, expected_action = _expected_execution_action(snapshot, action_row, evidence_row)
+            key = (event_session, str(action_row["ts_code"]))
+            expected_actions_by_session_symbol.setdefault(key, {})[action_id] = expected_action
+
+        common_timeline: list[str] | None = None
+        open_facts: dict[tuple[str, str], str] = {}
+        eod_facts: dict[tuple[str, str], str] = {}
+        action_facts: dict[tuple[str, str], str] = {}
+        input_hashes: list[str] = []
+        for input_index, execution_input in enumerate(execution_inputs):
+            label = f"execution_inputs[{input_index}]"
+            if not isinstance(execution_input, Mapping):
+                raise ContractError(f"{label} must be a mapping")
+            expected_top = {
+                "schema",
+                "protocol_sha256",
+                "data_snapshot_sha256",
+                "trial_id",
+                "arm_id",
+                "seed_id",
+                "scenario_id",
+                "initial_capital_cny",
+                "annual_cash_yield",
+                "terminal_policy",
+                "cost_model",
+                "sessions",
+            }
+            if set(execution_input) != expected_top or execution_input.get("schema") != "xs_chan_execution_input_v2_1":
+                raise ContractError(f"{label} has an invalid exact top-level schema")
+            if execution_input["data_snapshot_sha256"] != snapshot.manifest_sha256:
+                raise ContractError(f"{label} names a different data snapshot")
+            if execution_input["protocol_sha256"] != protocol_sha:
+                raise ContractError(f"{label} names a different protocol")
+            sessions = execution_input["sessions"]
+            if not isinstance(sessions, list) or not sessions:
+                raise ContractError(f"{label}.sessions must be a non-empty list")
+            timeline = [_execution_date(item.get("session"), f"{label}.sessions.session") for item in sessions]
+            if common_timeline is None:
+                common_timeline = timeline
+            elif timeline != common_timeline:
+                raise ContractError("all execution inputs must use the same official session timeline")
+            active_decision: pd.Timestamp | None = None
+            used_anchor = False
+            previous_session: pd.Timestamp | None = None
+            for session_index, session_input in enumerate(sessions):
+                session_label = f"{label}.sessions[{session_index}]"
+                if not isinstance(session_input, Mapping) or set(session_input) != {
+                    "session",
+                    "settlement_session",
+                    "open_snapshot",
+                    "eod_snapshot",
+                    "corporate_actions",
+                    "decision",
+                }:
+                    raise ContractError(f"{session_label} has invalid exact keys")
+                session_text = timeline[session_index]
+                session = pd.Timestamp(session_text)
+                calendar_row = calendar_by_date.get(session)
+                if calendar_row is None or not bool(calendar_row.is_open):
+                    raise ContractError(f"{session_text} is not an official open session")
+                if previous_session is not None and session != calendar_by_date[previous_session].next_trade_date:
+                    raise ContractError("execution timeline omits an official session")
+                previous_session = session
+                if pd.isna(calendar_row.next_trade_date):
+                    raise ContractError(f"official next settlement session is unavailable after {session_text}")
+                expected_settlement = pd.Timestamp(calendar_row.next_trade_date).strftime("%Y-%m-%d")
+                if (
+                    _execution_date(session_input["settlement_session"], f"{session_label}.settlement_session")
+                    != expected_settlement
+                ):
+                    raise ContractError(f"{session_label}.settlement_session is not the official next trade session")
+                decision = session_input["decision"]
+                if decision is not None:
+                    if not isinstance(decision, Mapping):
+                        raise ContractError(f"{session_label}.decision must be a mapping or null")
+                    active_decision = _parse_date(
+                        decision.get("decision_session"), label=f"{session_label}.decision.decision_session"
+                    )
+                    if active_decision not in calendar_by_date or active_decision >= session:
+                        raise ContractError(f"{session_label}.decision_session is not an earlier official session")
+                    adv_decision = active_decision
+                elif active_decision is None and session_index == 0:
+                    if pd.isna(calendar_row.prev_trade_date):
+                        raise ContractError(f"{session_label} anchor has no official previous session for ADV20")
+                    adv_decision = pd.Timestamp(calendar_row.prev_trade_date)
+                    used_anchor = True
+                elif active_decision is None:
+                    raise ContractError(f"{session_label} must carry the first explicit post-anchor decision")
+                else:
+                    adv_decision = active_decision
+
+                open_rows = session_input["open_snapshot"]
+                eod_rows = session_input["eod_snapshot"]
+                if not isinstance(open_rows, list) or not isinstance(eod_rows, list):
+                    raise ContractError(f"{session_label} market snapshots must be lists")
+                open_by_symbol = {str(row.get("symbol")): row for row in open_rows if isinstance(row, Mapping)}
+                eod_by_symbol = {str(row.get("symbol")): row for row in eod_rows if isinstance(row, Mapping)}
+                if (
+                    len(open_by_symbol) != len(open_rows)
+                    or len(eod_by_symbol) != len(eod_rows)
+                    or not open_by_symbol
+                    or set(open_by_symbol) != set(eod_by_symbol)
+                    or "" in open_by_symbol
+                ):
+                    raise ContractError(f"{session_label} has duplicate/empty/different open and EOD symbol domains")
+                for symbol in sorted(open_by_symbol):
+                    open_row = open_by_symbol[symbol]
+                    eod_row = eod_by_symbol[symbol]
+                    if set(open_row) != {
+                        "symbol",
+                        "open",
+                        "pre_close",
+                        "status",
+                        "limit_up",
+                        "limit_down",
+                        "adv20_cny_asof_decision",
+                        "open_auction_turnover_cny",
+                        "lot_size",
+                        "source_row_sha256",
+                    } or set(eod_row) != {"symbol", "close", "status", "source_row_sha256"}:
+                        raise ContractError(f"{session_label}/{symbol} market row keys are not exact")
+                    expected_source_actions = expected_actions_by_session_symbol.get((session_text, symbol), {})
+                    terminal_actions = [
+                        action
+                        for action in expected_source_actions.values()
+                        if action["action_type"] in TERMINAL_ACTION_TYPES
+                    ]
+                    status_row = _frame_row(status, (symbol, session), "official_daily_status")
+                    if status_row is None:
+                        master_row = master_by_symbol.get(symbol)
+                        lifecycle_delisted = bool(
+                            master_row is not None
+                            and master_row["list_status"] == "D"
+                            and not pd.isna(master_row["delist_date"])
+                            and pd.Timestamp(master_row["delist_date"]) == session
+                        )
+                        if not lifecycle_delisted or len(terminal_actions) != 1:
+                            raise ContractError(f"missing official status row for {symbol}/{session_text}")
+                        expected_status = "delisted"
+                        official_status = "DELISTED"
+                        status_sha: str | None = None
+                    else:
+                        if terminal_actions:
+                            raise ContractError(
+                                f"terminal effective date must use lifecycle-derived delisted status for "
+                                f"{symbol}/{session_text}"
+                            )
+                        official_status = str(status_row["official_status"])
+                        expected_status = {"TRADING": "trading", "SUSPENDED": "suspended"}.get(official_status)
+                        if expected_status is None:
+                            raise ContractError(f"unsupported official status for {symbol}/{session_text}")
+                        status_sha = canonical_row_sha256("official_daily_status", status_row)
+                    if open_row["status"] != expected_status or eod_row["status"] != expected_status:
+                        raise ContractError(
+                            f"execution status differs from official status for {symbol}/{session_text}"
+                        )
+                    raw_row = _frame_row(raw, (symbol, session), "raw_daily")
+                    limit_row = _frame_row(limits, (symbol, session), "stk_limit")
+                    raw_sha: str | None = None
+                    limit_sha: str | None = None
+                    if official_status == "TRADING":
+                        if raw_row is None or limit_row is None:
+                            raise ContractError(
+                                f"trading execution row lacks raw/limit source for {symbol}/{session_text}"
+                            )
+                        expected_open = float(raw_row["open"])
+                        expected_pre_close = float(raw_row["pre_close"])
+                        expected_close = float(raw_row["close"])
+                        expected_up = float(limit_row["up_limit"])
+                        expected_down = float(limit_row["down_limit"])
+                        raw_sha = canonical_row_sha256("raw_daily", raw_row)
+                        limit_sha = canonical_row_sha256("stk_limit", limit_row)
+                    else:
+                        if raw_row is not None or limit_row is not None:
+                            raise ContractError(
+                                f"suspended execution row unexpectedly has raw/limit source for {symbol}/{session_text}"
+                            )
+                        expected_open = expected_pre_close = expected_close = expected_up = expected_down = 0.0
+                    adv_cny, adv_source_rows = _decision_adv20_cny(raw, symbol, adv_decision)
+                    auction_cny, auction_row_sha, auction_response_sha, _ = _auction_binding(
+                        auction=auction,
+                        responses=responses,
+                        symbol=symbol,
+                        session=session,
+                        terminal_delisted=expected_status == "delisted",
+                    )
+                    if expected_status == "delisted" and auction_cny != 0:
+                        raise ContractError(
+                            f"terminal delisted status requires zero auction turnover for {symbol}/{session_text}"
+                        )
+                    terminal_source_sha = sorted(action["source_row_sha256"] for action in terminal_actions)
+                    _require_execution_float(open_row["open"], expected_open, f"{session_label}/{symbol}.open")
+                    _require_execution_float(
+                        open_row["pre_close"], expected_pre_close, f"{session_label}/{symbol}.pre_close"
+                    )
+                    _require_execution_float(open_row["limit_up"], expected_up, f"{session_label}/{symbol}.limit_up")
+                    _require_execution_float(
+                        open_row["limit_down"], expected_down, f"{session_label}/{symbol}.limit_down"
+                    )
+                    _require_execution_float(
+                        open_row["adv20_cny_asof_decision"], adv_cny, f"{session_label}/{symbol}.adv20"
+                    )
+                    _require_execution_float(
+                        open_row["open_auction_turnover_cny"],
+                        auction_cny,
+                        f"{session_label}/{symbol}.open_auction_turnover",
+                    )
+                    if open_row["lot_size"] != 100:
+                        raise ContractError(f"{session_label}/{symbol}.lot_size differs from frozen board lot")
+                    _require_execution_float(eod_row["close"], expected_close, f"{session_label}/{symbol}.close")
+                    open_source_evidence = {
+                        "data_snapshot_sha256": snapshot.manifest_sha256,
+                        "symbol": symbol,
+                        "session": session_text,
+                        "decision_session": adv_decision.strftime("%Y-%m-%d"),
+                        "official_status_row_sha256": status_sha,
+                        "raw_daily_row_sha256": raw_sha,
+                        "stk_limit_row_sha256": limit_sha,
+                        "adv20_raw_row_sha256": adv_source_rows,
+                        "open_auction_row_sha256": auction_row_sha,
+                        "open_auction_response_sha256": auction_response_sha,
+                        "terminal_action_source_sha256": terminal_source_sha,
+                    }
+                    eod_source_evidence = {
+                        "data_snapshot_sha256": snapshot.manifest_sha256,
+                        "symbol": symbol,
+                        "session": session_text,
+                        "official_status_row_sha256": status_sha,
+                        "raw_daily_row_sha256": raw_sha,
+                        "terminal_action_source_sha256": terminal_source_sha,
+                    }
+                    expected_open_sha = execution_source_row_sha256("open", open_source_evidence)
+                    expected_eod_sha = execution_source_row_sha256("eod", eod_source_evidence)
+                    if open_row["source_row_sha256"] != expected_open_sha:
+                        raise ContractError(f"{session_label}/{symbol} opening source digest is not snapshot-bound")
+                    if eod_row["source_row_sha256"] != expected_eod_sha:
+                        raise ContractError(f"{session_label}/{symbol} EOD source digest is not snapshot-bound")
+                    open_fact = sha256_bytes(canonical_json_bytes(dict(open_row)))
+                    eod_fact = sha256_bytes(canonical_json_bytes(dict(eod_row)))
+                    fact_key = (session_text, symbol)
+                    if fact_key in open_facts and open_facts[fact_key] != open_fact:
+                        raise ContractError(f"overlapping opening fact differs for {symbol}/{session_text}")
+                    if fact_key in eod_facts and eod_facts[fact_key] != eod_fact:
+                        raise ContractError(f"overlapping EOD fact differs for {symbol}/{session_text}")
+                    open_facts[fact_key] = open_fact
+                    eod_facts[fact_key] = eod_fact
+                    counts["open"] += 1
+                    counts["eod"] += 1
+
+                supplied_actions = session_input["corporate_actions"]
+                if not isinstance(supplied_actions, list):
+                    raise ContractError(f"{session_label}.corporate_actions must be a list")
+                supplied_by_id = {
+                    str(action.get("action_id")): action for action in supplied_actions if isinstance(action, Mapping)
+                }
+                if len(supplied_by_id) != len(supplied_actions) or "" in supplied_by_id:
+                    raise ContractError(f"{session_label} has duplicate/empty corporate action ids")
+                expected_by_id: dict[str, dict[str, Any]] = {}
+                for symbol in open_by_symbol:
+                    expected_by_id.update(expected_actions_by_session_symbol.get((session_text, symbol), {}))
+                if set(supplied_by_id) != set(expected_by_id):
+                    raise ContractError(f"{session_label} corporate actions are not exact for its symbol domain")
+                for action_id, expected_action in sorted(expected_by_id.items()):
+                    actual_action = supplied_by_id[action_id]
+                    _same_execution_object(actual_action, expected_action, f"{session_label}.action[{action_id}]")
+                    action_fact = sha256_bytes(canonical_json_bytes(dict(actual_action)))
+                    fact_key = (session_text, action_id)
+                    if fact_key in action_facts and action_facts[fact_key] != action_fact:
+                        raise ContractError(f"overlapping corporate action differs for {action_id}/{session_text}")
+                    action_facts[fact_key] = action_fact
+                    counts["corporate_action"] += 1
+            if used_anchor and active_decision is None:
+                raise ContractError(f"{label} contains an anchor but no subsequent explicit decision")
+            input_hashes.append(sha256_bytes(canonical_json_bytes(dict(execution_input))))
+
+        evidence = {
+            "data_snapshot_sha256": snapshot.manifest_sha256,
+            "protocol_sha256": protocol_sha,
+            "execution_input_sha256": input_hashes,
+            "official_session_timeline": common_timeline,
+            "open_fact_sha256": [
+                {"session": key[0], "symbol": key[1], "sha256": digest} for key, digest in sorted(open_facts.items())
+            ],
+            "eod_fact_sha256": [
+                {"session": key[0], "symbol": key[1], "sha256": digest} for key, digest in sorted(eod_facts.items())
+            ],
+            "corporate_action_fact_sha256": [
+                {"session": key[0], "action_id": key[1], "sha256": digest}
+                for key, digest in sorted(action_facts.items())
+            ],
+        }
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    body = {
+        "schema": EXECUTION_MARKET_BINDING_SCHEMA,
+        "valid": not errors,
+        "data_snapshot_sha256": snapshot.manifest_sha256 if isinstance(snapshot, VerifiedDataSnapshot) else None,
+        "execution_input_count": input_count,
+        "official_session_count": len(evidence.get("official_session_timeline", [])),
+        "bound_open_row_count": counts["open"],
+        "bound_eod_row_count": counts["eod"],
+        "bound_corporate_action_count": counts["corporate_action"],
+        "evidence_sha256": sha256_bytes(canonical_json_bytes(evidence)),
+        "errors": errors,
+    }
+    return {**body, "verification_sha256": sha256_bytes(canonical_json_bytes(body))}
+
+
+def verify_state_recompute(snapshot: VerifiedDataSnapshot) -> dict[str, Any]:
+    """Recompute every state projection, plus the frozen deterministic 100×20 prefix audit."""
+
+    return _verify_state_recompute(
+        snapshot,
+        prefix_audit_symbol_target=100,
+        cutoffs_per_prefix_audit_symbol=20,
+    )
+
+
+def _verify_state_recompute(
+    snapshot: VerifiedDataSnapshot,
+    *,
+    prefix_audit_symbol_target: int,
+    cutoffs_per_prefix_audit_symbol: int,
+) -> dict[str, Any]:
+    """Internal configurable state proof used to test full-domain/audit separation."""
+
+    schema = "xs_chan_state_recompute_verification_v2_1"
+    errors: list[str] = []
+    evidence: dict[str, Any] = {}
+    source_symbol_count = 0
+    recomputed_symbol_count = 0
+    prefix_audit_symbol_count = 0
+    mismatch_count = 0
+    try:
+        if not isinstance(snapshot, VerifiedDataSnapshot):
+            raise ContractError("state recompute requires a VerifiedDataSnapshot")
+        if (
+            isinstance(prefix_audit_symbol_target, bool)
+            or not isinstance(prefix_audit_symbol_target, int)
+            or prefix_audit_symbol_target <= 0
+        ):
+            raise ContractError("prefix_audit_symbol_target must be a positive integer")
+        if (
+            isinstance(cutoffs_per_prefix_audit_symbol, bool)
+            or not isinstance(cutoffs_per_prefix_audit_symbol, int)
+            or cutoffs_per_prefix_audit_symbol <= 0
+        ):
+            raise ContractError("cutoffs_per_prefix_audit_symbol must be a positive integer")
+        import xs_chan_state_cache as state_cache
+
+        raw = snapshot.read_parquet("raw_daily")
+        binding = snapshot.read_evidence_parquet("state_input_binding")
+        stored_states = snapshot.read_parquet("chan_states").copy()
+        stored_audit = snapshot.read_parquet("state_audit").copy()
+        included = binding.loc[binding["included_in_state_engine"]].copy()
+        raw_columns = raw[["ts_code", "trade_date", "vol", "amount", "pct_chg"]]
+        source = included.merge(
+            raw_columns,
+            on=["ts_code", "trade_date"],
+            how="left",
+            validate="one_to_one",
+        )
+        if source[["vol", "amount", "pct_chg"]].isna().any().any():
+            raise ContractError("state-engine source merge contains missing raw market fields")
+        source = source.rename(
+            columns={
+                "ts_code": "symbol",
+                "trade_date": "dt",
+                "adjusted_open": "open",
+                "adjusted_high": "high",
+                "adjusted_low": "low",
+                "adjusted_close": "close",
+            }
+        )
+        source = source[["symbol", "dt", "open", "high", "low", "close", "vol", "amount", "pct_chg"]]
+        source["symbol"] = source["symbol"].astype(str)
+        source["dt"] = pd.to_datetime(source["dt"])
+        source_symbols = sorted(set(binding["ts_code"].astype(str)))
+        source_symbol_count = len(source_symbols)
+        stored_states["symbol"] = stored_states["symbol"].astype(str)
+        stored_states["dt"] = pd.to_datetime(stored_states["dt"])
+        stored_audit["symbol"] = stored_audit["symbol"].astype("string")
+        stored_audit["checkpoint_dt"] = pd.to_datetime(stored_audit["checkpoint_dt"])
+
+        protocol_sha = frozen_protocol_sha256()
+        projection_by_symbol: dict[str, Any] = {}
+        source_frames: dict[str, pd.DataFrame] = {}
+        for symbol in source_symbols:
+            frame = source.loc[source["symbol"].eq(symbol)].sort_values("dt", kind="mergesort").reset_index(drop=True)
+            source_frames[symbol] = frame
+            recomputed = state_cache.generate_projection(frame)
+            stored = state_cache.validate_projection(
+                stored_states.loc[stored_states["symbol"].eq(symbol), ["symbol", "dt", "regime"]].copy(),
+                allow_empty=True,
+            )
+            recomputed_sha = state_cache.projection_sha256(recomputed)
+            stored_sha = state_cache.projection_sha256(stored)
+            matched = recomputed.equals(stored)
+            projection_by_symbol[symbol] = {
+                "source_rows": len(frame),
+                "recomputed_projection_sha256": recomputed_sha,
+                "stored_projection_sha256": stored_sha,
+                "matched": matched,
+            }
+            recomputed_symbol_count += 1
+            if not matched:
+                mismatch_count += 1
+                errors.append(f"ContractError: full state projection differs for {symbol}")
+        extra_state_symbols = sorted(set(stored_states["symbol"]) - set(source_symbols))
+        if extra_state_symbols:
+            mismatch_count += len(extra_state_symbols)
+            errors.append(f"ContractError: stored states contain unknown symbols {extra_state_symbols[:5]}")
+
+        eligible = [
+            symbol
+            for symbol in source_symbols
+            if len(source_frames[symbol]) - state_cache.WARMUP_BARS >= cutoffs_per_prefix_audit_symbol
+        ]
+        eligible.sort(key=lambda symbol: sha256_bytes(f"{protocol_sha}:state-prefix:{symbol}".encode()))
+        prefix_audit_symbols = eligible[:prefix_audit_symbol_target]
+        if len(prefix_audit_symbols) != prefix_audit_symbol_target:
+            errors.append(
+                "ContractError: state prefix audit requires "
+                f"{prefix_audit_symbol_target} symbols with at least "
+                f"{state_cache.WARMUP_BARS + cutoffs_per_prefix_audit_symbol} valid bars; "
+                f"found {len(prefix_audit_symbols)}"
+            )
+
+        prefix_audit_by_symbol: dict[str, Any] = {}
+        for symbol in prefix_audit_symbols:
+            frame = source_frames[symbol]
+            audit = state_cache.audit_frame_prefix_invariance(frame, checkpoints=cutoffs_per_prefix_audit_symbol)
+            rows = stored_audit.loc[stored_audit["symbol"].eq(symbol)].sort_values(
+                ["checkpoint_dt", "prefix_rows"], kind="mergesort"
+            )
+            actual_rows: list[dict[str, Any]] = []
+            for comparison in audit["comparisons"]:
+                mismatches = comparison["field_mismatches"]
+                actual_rows.append(
+                    {
+                        "symbol": symbol,
+                        "checkpoint_dt": pd.Timestamp(comparison["cutoff"]),
+                        "prefix_rows": int(comparison["prefix_rows"]),
+                        "expected_rows": int(comparison["expected_rows"]),
+                        "actual_rows": int(comparison["actual_rows"]),
+                        "expected_sha256": str(comparison["expected_sha256"]),
+                        "actual_sha256": str(comparison["actual_sha256"]),
+                        "symbol_mismatches": int(mismatches["symbol"]),
+                        "dt_mismatches": int(mismatches["dt"]),
+                        "regime_mismatches": int(mismatches["regime"]),
+                        "passed": bool(comparison["passed"]),
+                    }
+                )
+            actual = _typed_state_audit_for_comparison(actual_rows, stored_audit.columns)
+            expected_audit = rows.reset_index(drop=True)
+            matched = (
+                len(rows) == cutoffs_per_prefix_audit_symbol and bool(audit["passed"]) and actual.equals(expected_audit)
+            )
+            prefix_audit_by_symbol[symbol] = {
+                "source_rows": len(frame),
+                "comparison_count": len(actual),
+                "recomputed_audit_sha256": sha256_bytes(canonical_json_bytes(_records_for_digest(actual))),
+                "stored_audit_sha256": sha256_bytes(canonical_json_bytes(_records_for_digest(expected_audit))),
+                "matched": matched,
+            }
+            prefix_audit_symbol_count += 1
+            if not matched:
+                mismatch_count += 1
+                errors.append(f"ContractError: stored state prefix audit differs from independent replay for {symbol}")
+        evidence = {
+            "snapshot_sha256": snapshot.manifest_sha256,
+            "protocol_sha256": protocol_sha,
+            "source_symbols": source_symbols,
+            "source_symbol_count": source_symbol_count,
+            "recomputed_symbol_count": recomputed_symbol_count,
+            "projection_by_symbol": projection_by_symbol,
+            "prefix_audit_symbols": prefix_audit_symbols,
+            "required_prefix_audit_symbol_count": prefix_audit_symbol_target,
+            "prefix_audit_symbol_count": prefix_audit_symbol_count,
+            "cutoffs_per_prefix_audit_symbol": cutoffs_per_prefix_audit_symbol,
+            "prefix_audit_by_symbol": prefix_audit_by_symbol,
+            "mismatch_count": mismatch_count,
+        }
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    body = {
+        "schema": schema,
+        "valid": not errors,
+        "source_symbol_count": source_symbol_count,
+        "recomputed_symbol_count": recomputed_symbol_count,
+        "required_prefix_audit_symbol_count": prefix_audit_symbol_target,
+        "prefix_audit_symbol_count": prefix_audit_symbol_count,
+        "cutoffs_per_prefix_audit_symbol": cutoffs_per_prefix_audit_symbol,
+        "mismatch_count": mismatch_count,
+        "evidence_sha256": sha256_bytes(canonical_json_bytes(evidence)),
+        "errors": errors,
+    }
+    return {**body, "verification_sha256": sha256_bytes(canonical_json_bytes(body))}
+
+
+def _records_for_digest(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in frame.to_dict(orient="records"):
+        records.append(
+            {key: value.isoformat() if isinstance(value, pd.Timestamp) else value for key, value in row.items()}
+        )
+    return records
+
+
+def _typed_state_audit_for_comparison(rows: list[dict[str, Any]], columns: Any) -> pd.DataFrame:
+    result = pd.DataFrame(rows, columns=list(columns))
+    result["symbol"] = result["symbol"].astype("string")
+    result["checkpoint_dt"] = pd.to_datetime(result["checkpoint_dt"]).astype("datetime64[ns]")
+    for column in (
+        "prefix_rows",
+        "expected_rows",
+        "actual_rows",
+        "symbol_mismatches",
+        "dt_mismatches",
+        "regime_mismatches",
+    ):
+        result[column] = result[column].astype("int64")
+    for column in ("expected_sha256", "actual_sha256"):
+        result[column] = result[column].astype("string")
+    result["passed"] = result["passed"].astype("bool")
+    return result
+
+
 __all__ = [
     "ALL_SPECS",
     "ARTIFACT_SPECS",
     "COMPUTED_AT",
     "CONTRACT_ID",
+    "CORPORATE_ACTION_OBSERVATION_DATE",
     "CORPORATE_ACTION_TYPES",
+    "DATA_CHAIN_TRANSITION_SCHEMA",
+    "DATA_CONTRACT_IDENTITY_SCHEMA",
     "DataValidationReport",
     "EVIDENCE_SPECS",
+    "EXECUTION_MARKET_BINDING_SCHEMA",
+    "EXECUTION_SOURCE_ROW_SCHEMA",
     "FROZEN_PROTOCOL_PATH",
     "FORMAL_GATES",
     "INGESTED_AT",
     "MANIFEST_VERSION",
     "OFFICIAL_STATUSES",
+    "OBSERVATION_HORIZON_COLUMNS",
     "OBJECT_AUTHORITIES",
     "PARQUET_MEDIA_TYPE",
     "PROTOCOL_ID",
@@ -2277,11 +3584,17 @@ __all__ = [
     "SOURCE_ASOF",
     "SOURCE_RESPONSE_MEDIA_TYPE",
     "SOURCE_RESPONSE_SCHEMA",
+    "SNAPSHOT_EXTENSION_SCHEMA",
+    "SNAPSHOT_SUPERSEDING_OBJECTS",
     "STATE_INPUT_HASH_COLUMNS",
     "VerifiedDataSnapshot",
     "canonical_json_bytes",
     "canonical_row_sha256",
     "canonical_source_row",
+    "data_chain_transition_sha256",
+    "data_contract_identity_sha256",
+    "data_validation_report_sha256",
+    "execution_source_row_sha256",
     "frozen_protocol_sha256",
     "load_verified_snapshot",
     "object_provenance_sha256",
@@ -2290,4 +3603,7 @@ __all__ = [
     "state_input_row_sha256",
     "symbol_set_sha256",
     "validate_data_manifest",
+    "verify_execution_market_inputs",
+    "verify_snapshot_extension",
+    "verify_state_recompute",
 ]

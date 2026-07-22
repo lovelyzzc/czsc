@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import sys
 from collections import Counter
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +94,7 @@ def test_artifact_freezes_all_252_family_seed_scenario_decisions(formal_case):
     assert artifact["frozen_seeds"] == list(range(20260720, 20260740))
     assert len(artifact["arms"]) == 63
     assert len(artifact["execution_decisions"]) == 252
+    assert planner.SCENARIOS == ("gross", "1x", "2x", "capacity_1x")
     assert planner.verify_planning_artifact(artifact, frames=frames).valid
     for arm in artifact["arms"].values():
         assert len(set(arm["cost_scenario_selection_identity_sha256"].values())) == 1
@@ -179,6 +182,7 @@ def test_blocked_exit_occupies_a_reference_slot_before_chan_quota(formal_case):
     changed["FC"] = planner.ReferenceBook(
         actual_holdings=("BLOCKED.OUT",),
         blocked_exit_symbols=("BLOCKED.OUT",),
+        contingent_slot_symbols=(),
         sizing_nav_cny_by_scenario=base.sizing_nav_cny_by_scenario,
         sizing_nav_record_sha256_by_scenario=base.sizing_nav_record_sha256_by_scenario,
     )
@@ -194,6 +198,54 @@ def test_blocked_exit_occupies_a_reference_slot_before_chan_quota(formal_case):
     assert len(fc["ordered_symbols"]) + len(fc["blocked_exit_placeholders"]) <= 50
 
 
+def test_unsettled_share_consideration_reserves_a_reference_slot(formal_case):
+    frames, decision, execution, books, _ = formal_case
+    changed = dict(books)
+    base = books["F"]
+    changed["F"] = planner.ReferenceBook(
+        actual_holdings=(),
+        blocked_exit_symbols=(),
+        contingent_slot_symbols=("FUTURE.TARGET",),
+        sizing_nav_cny_by_scenario=base.sizing_nav_cny_by_scenario,
+        sizing_nav_record_sha256_by_scenario=base.sizing_nav_record_sha256_by_scenario,
+    )
+    artifact = planner.build_planning_artifact_from_frames(
+        frames=frames,
+        decision_dt=decision,
+        exec_dt=execution,
+        reference_books=changed,
+    )
+    factor = artifact["arms"]["F"]
+    assert factor["blocked_exit_placeholders"] == ["FUTURE.TARGET"]
+    assert len(factor["ordered_symbols"]) == 49
+
+
+def test_formal_snapshot_observation_must_equal_decision_session(formal_case, monkeypatch):
+    frames, decision, execution, books, _ = formal_case
+
+    class Snapshot:
+        manifest_sha256 = "a" * 64
+        observation_through_session = (decision + pd.Timedelta(days=1)).date().isoformat()
+
+    monkeypatch.setattr(planner, "frames_from_verified_snapshot", lambda _: frames)
+    with pytest.raises(planner.PlanningError, match="must exactly equal"):
+        planner.build_planning_artifact_from_snapshot(
+            snapshot=Snapshot(),
+            decision_dt=decision,
+            exec_dt=execution,
+            reference_books=books,
+        )
+
+    Snapshot.observation_through_session = decision.date().isoformat()
+    artifact = planner.build_planning_artifact_from_snapshot(
+        snapshot=Snapshot(),
+        decision_dt=decision,
+        exec_dt=execution,
+        reference_books=books,
+    )
+    assert artifact["decision_dt"] == decision.date().isoformat()
+
+
 def test_planner_input_is_strict_and_content_addressed(formal_case):
     _, _, _, _, artifact = formal_case
     planner_input = planner.planner_input_from_artifact(artifact)
@@ -202,3 +254,58 @@ def test_planner_input_is_strict_and_content_addressed(formal_case):
     forged["decision_dt"] = "2099-01-01"
     with pytest.raises(planner.PlanningError, match="content hash"):
         planner._strict_planner_input(forged)
+
+
+def test_planner_uses_canonical_protocol_digest_for_trial_identity():
+    protocol, protocol_sha256 = planner.load_protocol()
+    raw_sha256 = hashlib.sha256(planner.PROTOCOL_PATH.read_bytes()).hexdigest()
+
+    assert protocol_sha256 == planner.object_sha256(protocol)
+    assert protocol_sha256 == "8501bdd242cdd961b13cb4688cc7e2fd6d621342f85039a3223a18c4579ea203"
+    assert protocol_sha256 != raw_sha256
+
+
+def test_formal_planner_batch_is_exactly_52_cycles_and_fails_closed(formal_case):
+    _, _, _, _, artifact = formal_case
+    with pytest.raises(planner.PlanningError, match="exactly 52"):
+        planner.build_planning_batch_artifact([artifact])
+
+    verification = planner.verify_planning_batch_result(
+        {"schema": planner.PLANNER_BATCH_ARTIFACT_SCHEMA},
+        {"schema": planner.PLANNER_BATCH_INPUT_SCHEMA},
+        snapshot=None,
+    )
+    assert verification["valid"] is False
+    assert verification["cycle_count"] == 0
+    assert verification["execution_decision_count"] == 0
+
+
+def test_formal_planner_batch_binds_each_week_to_its_own_snapshot(formal_case):
+    _, _, _, _, artifact = formal_case
+    start = date(2026, 7, 17)
+    artifacts = []
+    for index in range(52):
+        item = copy.deepcopy(artifact)
+        decision = start + timedelta(days=7 * index)
+        item["data_authority"] = planner.SNAPSHOT_AUTHORITY
+        item["data_snapshot_sha256"] = hashlib.sha256(f"snapshot:{index}".encode()).hexdigest()
+        item["decision_dt"] = decision.isoformat()
+        item["exec_dt"] = (decision + timedelta(days=3)).isoformat()
+        item["artifact_sha256"] = planner.object_sha256(
+            {key: value for key, value in item.items() if key != "artifact_sha256"}
+        )
+        artifacts.append(item)
+
+    batch = planner.build_planning_batch_artifact(artifacts)
+    assert batch["data_contract_identity_sha256"] == planner.data_contract_identity_sha256()
+    assert batch["data_snapshot_sha256_sequence"] == [item["data_snapshot_sha256"] for item in artifacts]
+    assert len(set(batch["data_snapshot_sha256_sequence"])) == 52
+
+    batch_input = planner.planner_batch_input_from_artifact(batch)
+    forged = copy.deepcopy(batch_input)
+    forged["data_snapshot_sha256_sequence"][1] = forged["data_snapshot_sha256_sequence"][0]
+    forged["batch_input_sha256"] = planner.object_sha256(
+        {key: value for key, value in forged.items() if key != "batch_input_sha256"}
+    )
+    with pytest.raises(planner.PlanningError, match="weekly data snapshot"):
+        planner._strict_planning_batch_input(forged)

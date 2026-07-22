@@ -28,6 +28,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -39,7 +40,7 @@ from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 PROTOCOL_ID = "xs_chan_pilot_v2_1_preregistered_20260720"
 CANONICAL_PROTOCOL_SHA256 = "8501bdd242cdd961b13cb4688cc7e2fd6d621342f85039a3223a18c4579ea203"
 ZERO_HASH = "0" * 64
@@ -47,22 +48,53 @@ MIN_COMPLETE_WEEKS = 52
 EXCHANGE_TIMEZONE = "Asia/Shanghai"
 DECISION_CLOSE_LOCAL = "15:00:00"
 EXECUTION_OPEN_LOCAL = "09:30:00"
-OPEN_EXECUTION_DEADLINE_LOCAL = "10:00:00"
+OPEN_EXECUTION_DEADLINE_LOCAL = "15:00:00"
 SESSION_CLOSE_LOCAL = "15:00:00"
 
-GENESIS_CONFIG_SCHEMA = "xs_chan_v2_1_genesis_config_v1"
-GENESIS_PAYLOAD_SCHEMA = "xs_chan_v2_1_genesis_v1"
+GENESIS_CONFIG_SCHEMA = "xs_chan_v2_1_genesis_config_v2"
+GENESIS_PAYLOAD_SCHEMA = "xs_chan_v2_1_genesis_v2"
 PORTFOLIO_STATE_SCHEMA = "xs_chan_portfolio_state_v2_1"
-CALENDAR_SEGMENT_SCHEMA = "xs_chan_v2_1_calendar_segment_v1"
+CALENDAR_SEGMENT_SCHEMA = "xs_chan_v2_1_calendar_segment_v2"
 ANCHOR_RECEIPT_SCHEMA = "xs_chan_external_anchor_receipt_v1"
 ANCHOR_ALGORITHM = "rsa-pkcs1v15-sha256"
-REGISTRY_CLAIM_SCHEMA = "xs_chan_v2_1_primary_chain_claim_v1"
-DECISION_SCHEMA = "xs_chan_v2_1_decision_v1"
-OPEN_EXECUTION_SCHEMA = "xs_chan_v2_1_session_open_execution_v1"
-EOD_VALUATION_SCHEMA = "xs_chan_v2_1_session_eod_valuation_v1"
-WEEKLY_CLOSE_SCHEMA = "xs_chan_v2_1_cycle_close_v1"
+REGISTRY_CLAIM_SCHEMA = "xs_chan_v2_1_primary_chain_claim_v2"
+REGISTRY_DOCUMENT_SCHEMA = "xs_chan_v2_1_primary_chain_registry_document_v1"
+DECISION_SCHEMA = "xs_chan_v2_1_decision_v2"
+UNWIND_DECISION_SCHEMA = "xs_chan_v2_1_post_window_unwind_decision_v1"
+OPEN_EXECUTION_SCHEMA = "xs_chan_v2_1_session_open_execution_v2"
+EOD_VALUATION_SCHEMA = "xs_chan_v2_1_session_eod_valuation_v2"
+UNWIND_EOD_VALUATION_SCHEMA = "xs_chan_v2_1_post_window_unwind_eod_valuation_v1"
+WEEKLY_CLOSE_SCHEMA = "xs_chan_v2_1_cycle_close_v2"
 TERMINAL_SCHEMA = "xs_chan_v2_1_terminal_v1"
+FINAL_EVALUATION_SCHEMA = "xs_chan_v2_1_final_evaluation_v1"
 CONFIRMATION_IDENTITY_SCHEMA = "xs_chan_v2_1_confirmation_window_identity_v1"
+READINESS_COMMITMENT_SCHEMA = "xs_chan_pre_candidate_readiness_commitment_v2_1"
+
+FORMAL_LIFECYCLE_STATES = frozenset(
+    {
+        "LOCKED_PENDING_ENGINEERING_AND_FORWARD_DATA",
+        "READY_TO_ANCHOR_PRIMARY_GENESIS",
+        "PRIMARY_FORWARD_COLLECTION_ACTIVE",
+        "PRIMARY_WINDOW_COMPLETE_PENDING_REPLAY",
+        "PRIMARY_CHAIN_TERMINATED_INVALID",
+        "EVALUATED",
+    }
+)
+UNWIND_WEEK_ID = "POST_WINDOW_UNWIND"
+PREDECESSOR_PROTOCOL_SHA256 = "0ec5cb260f2aec78a6dce838880140981fdd1a64b5c9a2dcf64be010ba5c8b62"
+RNG_ALGORITHM_VERSION = "xs_chan_rng_v2_1_sha256_seedsequence_v1"
+RNG_ROOT_SEED = 20260720
+RNG_SEEDS = tuple(range(RNG_ROOT_SEED, RNG_ROOT_SEED + 20))
+SCENARIO_IDS = ("gross", "1x", "2x", "capacity_1x")
+SINGLE_BOOK_IDS = ("F", "FC", "FMA")
+SEEDED_BOOK_FAMILIES = ("R_match", "FGR", "FMGR")
+BOOK_IDS = SINGLE_BOOK_IDS + tuple(f"{family}@{seed}" for family in SEEDED_BOOK_FAMILIES for seed in RNG_SEEDS)
+INITIAL_CAPITAL_CNY_BY_SCENARIO = {
+    "gross": 10_000_000.0,
+    "1x": 10_000_000.0,
+    "2x": 10_000_000.0,
+    "capacity_1x": 100_000_000.0,
+}
 
 EXPECTED_DEPENDENCY_KEYS = frozenset(
     {
@@ -71,6 +103,7 @@ EXPECTED_DEPENDENCY_KEYS = frozenset(
         "feature_engine",
         "research_engine",
         "execution_engine",
+        "ledger_engine",
         "statistics_engine",
         "replay_verifier",
     }
@@ -112,11 +145,20 @@ _GENESIS_CONFIG_KEYS = {
     "schema",
     "protocol_id",
     "protocol_sha256",
+    "predecessor_protocol_sha256",
     "data_bundle_sha256",
+    "data_contract_identity_sha256",
+    "genesis_data_chain_head_sha256",
+    "genesis_data_validation_report_sha256",
     "dependency_sha256",
     "readiness_gates",
-    "initial_portfolio_state",
-    "initial_portfolio_state_sha256",
+    "readiness_report_sha256",
+    "initial_state_sha256_by_book_scenario",
+    "initial_state_root_sha256",
+    "rng_identity",
+    "formal_start_eligibility",
+    "genesis_calendar_segment",
+    "genesis_calendar_head_sha256",
     "trial_id",
     "trial_registry_namespace",
     "trial_registry_authority_sha256",
@@ -138,11 +180,42 @@ _INITIAL_PORTFOLIO_KEYS = {
     "last_close",
     "cash_receivables",
     "dividend_tax_liabilities",
+    "share_entitlements",
+    "processed_action_ids",
     "other_assets",
     "other_liabilities",
     "borrowed_cash_cny",
 }
 _READINESS_EVIDENCE_KEYS = {"status", "evidence_sha256"}
+_READINESS_COMMITMENT_KEYS = {
+    "schema",
+    "protocol_id",
+    "protocol_sha256",
+    "trial_id",
+    "data_contract_identity_sha256",
+    "created_at_utc",
+    "dependency_sha256",
+    "engineering_gates",
+    "report_sha256",
+}
+_RNG_IDENTITY_KEYS = {"algorithm_version", "root_seed", "seed_count", "seeds", "identity_freeze"}
+_FORMAL_START_ELIGIBILITY_KEYS = {
+    "schema",
+    "readiness_report_sha256",
+    "readiness_anchor_receipt_sha256",
+    "readiness_completed_at_utc",
+    "eligibility_cutoff_utc",
+    "candidate_decision_session",
+    "candidate_execution_week",
+    "candidate_eligible_count",
+    "minimum_eligible_symbol_count",
+    "earlier_completed_weeks",
+    "calendar_head_sha256",
+    "data_snapshot_sha256",
+    "planner_verifier_sha256",
+    "evidence_sha256",
+}
+_EARLIER_ELIGIBILITY_WEEK_KEYS = {"week_id", "decision_session", "eligible_symbol_count", "evidence_sha256"}
 _ANCHOR_IDENTITY_KEYS = {"algorithm", "provider", "key_id", "public_key_sha256"}
 _ANCHOR_RECEIPT_KEYS = {
     "schema",
@@ -160,19 +233,50 @@ _CALENDAR_SEGMENT_KEYS = {
     "coverage_start",
     "coverage_end",
     "sessions",
+    "week_labels",
     "source_id",
     "source_uri",
     "source_sha256",
+    "source_published_at_utc",
     "source_retrieved_at_utc",
+    "previous_calendar_head_sha256",
+    "new_calendar_head_sha256",
 }
 _DECISION_KEYS = {
     "schema",
     "snapshot_cutoff_utc",
     "engine_sha256",
     "decision_artifact_sha256",
-    "portfolio_before_sha256",
-    "pending_sells_before_sha256",
+    "book_state_before_root_sha256",
+    "pending_sells_before_root_sha256",
     "calendar_state_sha256",
+    "eligible_symbol_count",
+    "eligibility_evidence_sha256",
+    "data_chain_head_sha256",
+    "data_manifest_sha256",
+    "previous_data_chain_head_sha256",
+    "data_validation_report_sha256",
+    "planner_artifact_sha256",
+}
+_UNWIND_DECISION_KEYS = {
+    "schema",
+    "snapshot_cutoff_utc",
+    "engine_sha256",
+    "data_manifest_sha256",
+    "previous_data_chain_head_sha256",
+    "data_validation_report_sha256",
+    "data_chain_head_sha256",
+    "confirmation_window_identity_sha256",
+    "book_state_before_root_sha256",
+    "pending_sells_before_root_sha256",
+    "aggregate_position_count_before",
+    "aggregate_pending_sell_count_before",
+    "exit_orders_root_sha256",
+    "full_exit_coverage_root_sha256",
+    "book_state_after_decision_root_sha256",
+    "pending_sells_after_decision_root_sha256",
+    "aggregate_pending_sell_count_after_decision",
+    "unwind_evidence_root_sha256",
 }
 _OPEN_EXECUTION_KEYS = {
     "schema",
@@ -180,20 +284,24 @@ _OPEN_EXECUTION_KEYS = {
     "engine_sha256",
     "decision_record_sha256",
     "previous_eod_record_sha256",
-    "portfolio_before_sha256",
-    "pending_sells_before_sha256",
+    "book_state_before_root_sha256",
+    "pending_sells_before_root_sha256",
     "pending_sell_count_before",
+    "aggregate_position_count_before",
     "open_prices_sha256",
     "opening_auction_turnover_sha256",
     "limit_state_sha256",
     "corporate_actions_sha256",
-    "requested_orders_sha256",
-    "fills_sha256",
-    "fees_sha256",
-    "execution_result_sha256",
-    "portfolio_after_sha256",
-    "pending_sells_after_sha256",
+    "terminal_share_receipts_root_sha256",
+    "terminal_share_receipt_count",
+    "requested_orders_root_sha256",
+    "fills_root_sha256",
+    "fees_root_sha256",
+    "execution_result_root_sha256",
+    "book_state_after_root_sha256",
+    "pending_sells_after_root_sha256",
     "pending_sell_count_after",
+    "aggregate_position_count_after",
 }
 _EOD_KEYS = {
     "schema",
@@ -202,11 +310,22 @@ _EOD_KEYS = {
     "session_open_execution_sha256",
     "raw_close_snapshot_sha256",
     "corporate_actions_sha256",
-    "portfolio_before_eod_sha256",
-    "portfolio_state_sha256",
-    "pending_sells_sha256",
+    "book_state_before_eod_root_sha256",
+    "book_state_root_sha256",
+    "pending_sells_root_sha256",
     "pending_sell_count",
-    "nav_artifact_sha256",
+    "aggregate_position_count",
+    "nav_root_sha256",
+    "exposure_root_sha256",
+    "turnover_root_sha256",
+}
+_UNWIND_EOD_KEYS = _EOD_KEYS | {
+    "data_manifest_sha256",
+    "previous_data_chain_head_sha256",
+    "data_validation_report_sha256",
+    "data_chain_head_sha256",
+    "aggregate_pending_settlements_root_sha256",
+    "aggregate_pending_settlement_count",
 }
 _WEEKLY_CLOSE_KEYS = {
     "schema",
@@ -214,24 +333,79 @@ _WEEKLY_CLOSE_KEYS = {
     "execution_engine_sha256",
     "statistics_engine_sha256",
     "eod_record_sha256",
-    "portfolio_state_sha256",
-    "pending_sells_sha256",
+    "book_state_root_sha256",
+    "pending_sells_root_sha256",
     "pending_sell_count",
-    "weekly_returns_sha256",
-    "statistics_input_sha256",
+    "aggregate_position_count",
+    "weekly_returns_root_sha256",
+    "statistics_input_root_sha256",
 }
 _TERMINAL_KEYS = {"schema", "outcome", "reason_code", "evidence_sha256", "details_sha256"}
+_FINAL_EVALUATION_KEYS = {
+    "schema",
+    "snapshot_cutoff_utc",
+    "confirmation_window_identity_sha256",
+    "statistics_result_sha256",
+    "semantic_replay_evidence_sha256",
+    "evaluation_status",
+    "post_window_unwind_completed",
+    "post_window_unwind_session_count",
+    "post_window_unwind_cost_cny",
+    "remaining_position_count",
+    "remaining_pending_sell_count",
+    "remaining_pending_settlement_count",
+    "unwind_completion_book_state_root_sha256",
+    "unwind_completion_pending_sells_root_sha256",
+    "unwind_completion_pending_settlements_root_sha256",
+    "unwind_evidence_sha256",
+    "final_evaluation_artifact_sha256",
+}
+FORMAL_EVALUATION_STATUSES = frozenset(
+    {
+        "INVALID_DATA_OR_ENGINEERING",
+        "INVALID_CHAIN",
+        "FORWARD_COLLECTION_REQUIRED",
+        "INVALID_CONTROL",
+        "INSUFFICIENT_INTERVENTION",
+        "FALSIFIED_FACTOR",
+        "INCONCLUSIVE_FACTOR",
+        "FACTOR_PASSED_TIMING_FALSIFIED",
+        "FACTOR_PASSED_TIMING_INCONCLUSIVE",
+        "FORWARD_EVIDENCE_PASSED_SHADOW_ONLY",
+    }
+)
 _SHA_FIELDS_BY_SCHEMA = {
-    DECISION_SCHEMA: _DECISION_KEYS - {"schema", "snapshot_cutoff_utc"},
+    DECISION_SCHEMA: _DECISION_KEYS - {"schema", "snapshot_cutoff_utc", "eligible_symbol_count"},
+    UNWIND_DECISION_SCHEMA: _UNWIND_DECISION_KEYS
+    - {
+        "schema",
+        "snapshot_cutoff_utc",
+        "aggregate_position_count_before",
+        "aggregate_pending_sell_count_before",
+        "aggregate_pending_sell_count_after_decision",
+    },
     OPEN_EXECUTION_SCHEMA: _OPEN_EXECUTION_KEYS
     - {
         "schema",
         "snapshot_cutoff_utc",
         "pending_sell_count_before",
         "pending_sell_count_after",
+        "aggregate_position_count_before",
+        "aggregate_position_count_after",
+        "terminal_share_receipt_count",
     },
-    EOD_VALUATION_SCHEMA: _EOD_KEYS - {"schema", "snapshot_cutoff_utc", "pending_sell_count"},
-    WEEKLY_CLOSE_SCHEMA: _WEEKLY_CLOSE_KEYS - {"schema", "snapshot_cutoff_utc", "pending_sell_count"},
+    EOD_VALUATION_SCHEMA: _EOD_KEYS
+    - {"schema", "snapshot_cutoff_utc", "pending_sell_count", "aggregate_position_count"},
+    UNWIND_EOD_VALUATION_SCHEMA: _UNWIND_EOD_KEYS
+    - {
+        "schema",
+        "snapshot_cutoff_utc",
+        "pending_sell_count",
+        "aggregate_position_count",
+        "aggregate_pending_settlement_count",
+    },
+    WEEKLY_CLOSE_SCHEMA: _WEEKLY_CLOSE_KEYS
+    - {"schema", "snapshot_cutoff_utc", "pending_sell_count", "aggregate_position_count"},
 }
 _SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 
@@ -409,6 +583,7 @@ class _ReplayState:
     config: dict[str, Any]
     anchor_identity: dict[str, Any]
     receipts_verified: bool
+    registry_receipt_verified: bool = False
     segments: list[dict[str, Any]] = field(default_factory=list)
     sessions: list[date] = field(default_factory=list)
     completed_weeks: list[dict[str, Any]] = field(default_factory=list)
@@ -421,6 +596,15 @@ class _ReplayState:
     portfolio_sha256: str = ""
     pending_sells_sha256: str = ""
     pending_sell_count: int = 0
+    position_count: int = 0
+    data_chain_head_sha256: str = ""
+    unwind_evidence_root_sha256: str | None = None
+    unwind_next_session_after: date | None = None
+    unwind_session: date | None = None
+    unwind_session_count: int = 0
+    pending_settlements_sha256: str | None = None
+    pending_settlement_count: int | None = None
+    final_evaluation: LedgerRecord | None = None
     terminal: LedgerRecord | None = None
 
 
@@ -441,6 +625,43 @@ def _object_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)[:-1]).hexdigest()
 
 
+def formal_start_eligibility_evidence_sha256(value: Mapping[str, Any]) -> str:
+    """Derive the canonical digest of formal-start evidence, excluding itself."""
+
+    body = dict(value)
+    body.pop("evidence_sha256", None)
+    return _object_sha256(body)
+
+
+def data_chain_transition_sha256(
+    *,
+    data_contract_identity_sha256: str,
+    previous_data_chain_head_sha256: str,
+    decision_session: str | date,
+    snapshot_cutoff_utc: str | datetime,
+    data_manifest_sha256: str,
+    data_validation_report_sha256: str,
+) -> str:
+    """Derive one append-only, decision-time data-chain head."""
+
+    payload = {
+        "schema": "xs_chan_data_chain_transition_v2_1",
+        "data_contract_identity_sha256": _require_sha256(
+            data_contract_identity_sha256, "data_contract_identity_sha256"
+        ),
+        "previous_data_chain_head_sha256": _require_sha256(
+            previous_data_chain_head_sha256, "previous_data_chain_head_sha256"
+        ),
+        "decision_session": _normalise_date(decision_session, "decision_session").isoformat(),
+        "snapshot_cutoff_utc": _format_utc(_canonical_utc(snapshot_cutoff_utc, "snapshot_cutoff_utc")),
+        "data_manifest_sha256": _require_sha256(data_manifest_sha256, "data_manifest_sha256"),
+        "data_validation_report_sha256": _require_sha256(
+            data_validation_report_sha256, "data_validation_report_sha256"
+        ),
+    }
+    return _object_sha256(payload)
+
+
 def sha256_file(path: str | Path) -> str:
     """Return a streaming SHA-256 digest for an evidence artifact."""
     digest = hashlib.sha256()
@@ -450,20 +671,49 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def empty_initial_portfolio() -> dict[str, Any]:
-    """Return ``empty_portfolio(10_000_000.0).as_dict()`` exactly."""
+def empty_initial_portfolio(initial_capital_cny: float = 10_000_000.0) -> dict[str, Any]:
+    """Return the canonical empty execution state for one scenario."""
+    if (
+        type(initial_capital_cny) not in {int, float}
+        or not math.isfinite(float(initial_capital_cny))
+        or not float(initial_capital_cny) > 0
+    ):
+        raise LedgerValidationError("initial_capital_cny must be a positive finite number")
     return {
         "schema": PORTFOLIO_STATE_SCHEMA,
-        "cash_cny": 10_000_000.0,
+        "cash_cny": float(initial_capital_cny),
         "positions": {},
         "pending_sells": {},
         "last_close": {},
         "cash_receivables": {},
         "dividend_tax_liabilities": {},
+        "share_entitlements": {},
+        "processed_action_ids": [],
         "other_assets": [],
         "other_liabilities": [],
         "borrowed_cash_cny": 0.0,
     }
+
+
+def canonical_initial_state_sha256_by_book_scenario() -> dict[str, dict[str, str]]:
+    """Return all 63 book x 4 scenario canonical initial-state digests."""
+    scenario_hashes = {
+        scenario: _object_sha256(empty_initial_portfolio(capital))
+        for scenario, capital in INITIAL_CAPITAL_CNY_BY_SCENARIO.items()
+    }
+    return {book_id: {scenario: scenario_hashes[scenario] for scenario in SCENARIO_IDS} for book_id in BOOK_IDS}
+
+
+def canonical_initial_state_root_sha256() -> str:
+    """Return the aggregate root consumed by every later all-book state transition."""
+    return _object_sha256(canonical_initial_state_sha256_by_book_scenario())
+
+
+def canonical_initial_pending_sells_root_sha256() -> str:
+    """Return the aggregate empty pending-sell root for all book/scenario leaves."""
+    empty_pending = _object_sha256({})
+    leaves = {book_id: dict.fromkeys(SCENARIO_IDS, empty_pending) for book_id in BOOK_IDS}
+    return _object_sha256(leaves)
 
 
 def _require_sha256(value: Any, label: str) -> str:
@@ -553,13 +803,132 @@ def _week_id(day: date) -> str:
     return f"{iso.year:04d}-W{iso.week:02d}"
 
 
-def _validate_initial_portfolio(value: Any) -> dict[str, Any]:
-    portfolio = _exact_mapping(value, _INITIAL_PORTFOLIO_KEYS, "initial_portfolio_state")
-    if portfolio != empty_initial_portfolio():
-        raise LedgerValidationError(
-            "initial_portfolio_state must equal xs_chan_execution_v2_1.empty_portfolio(10_000_000.0).as_dict()"
+def _validate_initial_state_matrix(value: Any) -> dict[str, dict[str, str]]:
+    books = _exact_mapping(value, set(BOOK_IDS), "initial_state_sha256_by_book_scenario")
+    expected = canonical_initial_state_sha256_by_book_scenario()
+    result: dict[str, dict[str, str]] = {}
+    for book_id in BOOK_IDS:
+        scenarios = _exact_mapping(
+            books[book_id], set(SCENARIO_IDS), f"initial_state_sha256_by_book_scenario.{book_id}"
         )
-    return portfolio
+        result[book_id] = {
+            scenario: _require_sha256(scenarios[scenario], f"initial state {book_id}/{scenario}")
+            for scenario in SCENARIO_IDS
+        }
+        if result[book_id] != expected[book_id]:
+            raise LedgerValidationError(f"initial state differs from the canonical empty state for {book_id}")
+    return result
+
+
+def _validate_rng_identity(value: Any) -> dict[str, Any]:
+    identity = _exact_mapping(value, _RNG_IDENTITY_KEYS, "rng_identity")
+    expected = {
+        "algorithm_version": RNG_ALGORITHM_VERSION,
+        "root_seed": RNG_ROOT_SEED,
+        "seed_count": len(RNG_SEEDS),
+        "seeds": list(RNG_SEEDS),
+        "identity_freeze": "all_arm_and_seed_symbol_identities_frozen_before_any_cost_or_capacity_replay",
+    }
+    if identity != expected:
+        raise LedgerValidationError("rng_identity differs from the preregistered RNG identity")
+    return identity
+
+
+def _validate_formal_start_eligibility(
+    value: Any,
+    *,
+    oos_start: date,
+    candidate_decision_session: date,
+    readiness_report_sha256: str,
+    calendar_head_sha256: str,
+    data_snapshot_sha256: str,
+    planner_verifier_sha256: str,
+    calendar_sessions: Sequence[date],
+) -> dict[str, Any]:
+    evidence = _exact_mapping(value, _FORMAL_START_ELIGIBILITY_KEYS, "formal_start_eligibility")
+    if evidence["schema"] != "xs_chan_v2_1_formal_start_eligibility_v2":
+        raise LedgerValidationError("formal_start_eligibility.schema is unsupported")
+    cutoff = _canonical_utc(evidence["eligibility_cutoff_utc"], "formal_start_eligibility.eligibility_cutoff_utc")
+    if cutoff >= _local_boundary(oos_start, "00:00:00", EXCHANGE_TIMEZONE):
+        raise LedgerValidationError("formal-start eligibility evidence must predate oos_start_date")
+    if cutoff != _local_boundary(candidate_decision_session, DECISION_CLOSE_LOCAL, EXCHANGE_TIMEZONE):
+        raise LedgerValidationError("formal-start eligibility cutoff must equal the candidate decision close")
+    readiness_completed = _canonical_utc(
+        evidence["readiness_completed_at_utc"],
+        "formal_start_eligibility.readiness_completed_at_utc",
+    )
+    if readiness_completed >= cutoff:
+        raise LedgerValidationError("readiness must complete before the formal-start eligibility cutoff")
+    readiness_local_date = readiness_completed.astimezone(ZoneInfo(EXCHANGE_TIMEZONE)).date()
+    if readiness_local_date < min(calendar_sessions):
+        raise LedgerValidationError("genesis calendar does not cover the full post-readiness eligibility domain")
+    if evidence["minimum_eligible_symbol_count"] != 50:
+        raise LedgerValidationError("formal-start minimum eligible symbol count must be 50")
+    if type(evidence["candidate_eligible_count"]) is not int or evidence["candidate_eligible_count"] < 50:
+        raise LedgerValidationError("formal-start eligible symbol count must be at least 50")
+    if evidence["candidate_decision_session"] != candidate_decision_session.isoformat():
+        raise LedgerValidationError("formal-start candidate decision is not the last official pre-OOS session")
+    if evidence["candidate_execution_week"] != _week_id(oos_start):
+        raise LedgerValidationError("formal-start candidate execution week differs from oos_start_date")
+    expected_bindings = {
+        "readiness_report_sha256": readiness_report_sha256,
+        "calendar_head_sha256": calendar_head_sha256,
+        "data_snapshot_sha256": data_snapshot_sha256,
+        "planner_verifier_sha256": planner_verifier_sha256,
+    }
+    for key, expected in expected_bindings.items():
+        if _require_sha256(evidence[key], f"formal_start_eligibility.{key}") != expected:
+            raise LedgerValidationError(f"formal-start {key} differs from its Genesis binding")
+    evidence["readiness_anchor_receipt_sha256"] = _require_sha256(
+        evidence["readiness_anchor_receipt_sha256"],
+        "formal_start_eligibility.readiness_anchor_receipt_sha256",
+    )
+    if type(evidence["earlier_completed_weeks"]) is not list:
+        raise LedgerValidationError("formal-start earlier_completed_weeks must be a complete ordered list")
+    expected_earlier: list[tuple[str, date]] = []
+    monday = oos_start - timedelta(weeks=1)
+    while monday >= min(calendar_sessions):
+        prior_sessions = [item for item in calendar_sessions if item < monday]
+        if prior_sessions:
+            decision_session = prior_sessions[-1]
+            decision_close = _local_boundary(decision_session, DECISION_CLOSE_LOCAL, EXCHANGE_TIMEZONE)
+            if readiness_completed < decision_close < cutoff:
+                expected_earlier.append((_week_id(monday), decision_session))
+        monday -= timedelta(weeks=1)
+    expected_earlier.reverse()
+    if len(evidence["earlier_completed_weeks"]) != len(expected_earlier):
+        raise LedgerValidationError("formal-start evidence omits or adds a readiness-to-candidate completed week")
+    earlier: list[dict[str, Any]] = []
+    previous_decision: date | None = None
+    for index, (item, expected_week) in enumerate(
+        zip(evidence["earlier_completed_weeks"], expected_earlier, strict=True)
+    ):
+        row = _exact_mapping(item, _EARLIER_ELIGIBILITY_WEEK_KEYS, f"earlier_completed_weeks[{index}]")
+        decision_session = _normalise_date(row["decision_session"], "earlier eligibility decision_session")
+        if decision_session >= candidate_decision_session:
+            raise LedgerValidationError("earlier eligibility evidence must strictly precede the candidate")
+        if previous_decision is not None and decision_session <= previous_decision:
+            raise LedgerValidationError("earlier eligibility weeks must be strictly ordered")
+        if (row["week_id"], decision_session) != expected_week:
+            raise LedgerValidationError("earlier eligibility row differs from the complete anchored-calendar domain")
+        count = _validate_count(row["eligible_symbol_count"], "earlier eligible_symbol_count")
+        if count >= 50:
+            raise LedgerValidationError(
+                "candidate is not the earliest completed week with at least 50 eligible symbols"
+            )
+        row["evidence_sha256"] = _require_sha256(row["evidence_sha256"], "earlier eligibility evidence")
+        row["decision_session"] = decision_session.isoformat()
+        earlier.append(row)
+        previous_decision = decision_session
+    evidence["earlier_completed_weeks"] = earlier
+    evidence["readiness_completed_at_utc"] = _format_utc(readiness_completed)
+    evidence["evidence_sha256"] = _require_sha256(
+        evidence["evidence_sha256"], "formal_start_eligibility.evidence_sha256"
+    )
+    evidence["eligibility_cutoff_utc"] = _format_utc(cutoff)
+    if evidence["evidence_sha256"] != formal_start_eligibility_evidence_sha256(evidence):
+        raise LedgerValidationError("formal-start eligibility evidence digest is not canonically derived")
+    return evidence
 
 
 def _validate_readiness_gates(value: Any) -> dict[str, Any]:
@@ -587,20 +956,37 @@ def _validate_genesis_config(value: Mapping[str, Any]) -> dict[str, Any]:
         raise LedgerValidationError(
             f"protocol_sha256 must equal the frozen canonical protocol digest {CANONICAL_PROTOCOL_SHA256}"
         )
+    config["predecessor_protocol_sha256"] = _require_sha256(
+        config["predecessor_protocol_sha256"], "predecessor_protocol_sha256"
+    )
+    if config["predecessor_protocol_sha256"] != PREDECESSOR_PROTOCOL_SHA256:
+        raise LedgerValidationError("predecessor_protocol_sha256 differs from the frozen V2 predecessor")
     config["data_bundle_sha256"] = _require_sha256(config["data_bundle_sha256"], "data_bundle_sha256")
+    config["data_contract_identity_sha256"] = _require_sha256(
+        config["data_contract_identity_sha256"], "data_contract_identity_sha256"
+    )
+    config["genesis_data_chain_head_sha256"] = _require_sha256(
+        config["genesis_data_chain_head_sha256"], "genesis_data_chain_head_sha256"
+    )
+    config["genesis_data_validation_report_sha256"] = _require_sha256(
+        config["genesis_data_validation_report_sha256"], "genesis_data_validation_report_sha256"
+    )
     dependencies = _exact_mapping(config["dependency_sha256"], EXPECTED_DEPENDENCY_KEYS, "dependency_sha256")
     config["dependency_sha256"] = {
         name: _require_sha256(dependencies[name], f"dependency_sha256.{name}")
         for name in sorted(EXPECTED_DEPENDENCY_KEYS)
     }
     config["readiness_gates"] = _validate_readiness_gates(config["readiness_gates"])
-    config["initial_portfolio_state"] = _validate_initial_portfolio(config["initial_portfolio_state"])
-    config["initial_portfolio_state_sha256"] = _require_sha256(
-        config["initial_portfolio_state_sha256"], "initial_portfolio_state_sha256"
+    config["readiness_report_sha256"] = _require_sha256(config["readiness_report_sha256"], "readiness_report_sha256")
+    config["initial_state_sha256_by_book_scenario"] = _validate_initial_state_matrix(
+        config["initial_state_sha256_by_book_scenario"]
     )
-    expected_initial_hash = _object_sha256(config["initial_portfolio_state"])
-    if config["initial_portfolio_state_sha256"] != expected_initial_hash:
-        raise LedgerValidationError("initial_portfolio_state_sha256 does not match the canonical execution state")
+    config["initial_state_root_sha256"] = _require_sha256(
+        config["initial_state_root_sha256"], "initial_state_root_sha256"
+    )
+    if config["initial_state_root_sha256"] != _object_sha256(config["initial_state_sha256_by_book_scenario"]):
+        raise LedgerValidationError("initial_state_root_sha256 does not match all 252 book/scenario leaves")
+    config["rng_identity"] = _validate_rng_identity(config["rng_identity"])
     if config["trial_id"] != config["protocol_sha256"]:
         raise LedgerValidationError("trial_id must exactly equal canonical protocol_sha256")
     if (
@@ -619,6 +1005,57 @@ def _validate_genesis_config(value: Mapping[str, Any]) -> dict[str, Any]:
     if start.weekday() != 0:
         raise LedgerValidationError("oos_start_date must be a Monday confirmation-week boundary")
     config["oos_start_date"] = start.isoformat()
+    genesis_segment = _validate_segment(config["genesis_calendar_segment"])
+    if genesis_segment["segment_index"] != 0:
+        raise LedgerValidationError("genesis calendar segment_index must be zero")
+    if genesis_segment["previous_calendar_head_sha256"] != ZERO_HASH:
+        raise LedgerValidationError("genesis calendar must start from the zero calendar head")
+    if genesis_segment["source_id"] != config["calendar_source_id"]:
+        raise LedgerValidationError("genesis calendar source differs from calendar_source_id")
+    if config["genesis_calendar_head_sha256"] != genesis_segment["new_calendar_head_sha256"]:
+        raise LedgerValidationError("genesis_calendar_head_sha256 differs from the first segment head")
+    segment_sessions = [_normalise_date(item, "genesis calendar session") for item in genesis_segment["sessions"]]
+    first_week_end = start + timedelta(days=6)
+    if not any(item < start for item in segment_sessions):
+        raise LedgerValidationError("genesis calendar must include the prior decision session")
+    if not any(start <= item <= first_week_end for item in segment_sessions):
+        raise LedgerValidationError("genesis calendar must include the first execution week")
+    if _normalise_date(genesis_segment["coverage_end"], "coverage_end") < first_week_end:
+        raise LedgerValidationError("genesis calendar must cover through the first execution week")
+    covered_oos_weeks = {
+        label for item, label in zip(segment_sessions, genesis_segment["week_labels"], strict=True) if item >= start
+    }
+    confirmation_horizon_end = start + timedelta(weeks=MIN_COMPLETE_WEEKS) - timedelta(days=1)
+    if (
+        len(covered_oos_weeks) >= MIN_COMPLETE_WEEKS
+        or _normalise_date(genesis_segment["coverage_end"], "coverage_end") >= confirmation_horizon_end
+    ):
+        raise LedgerValidationError("genesis may not preload the future 52-week confirmation calendar")
+    config["genesis_calendar_segment"] = genesis_segment
+    config["genesis_calendar_head_sha256"] = _require_sha256(
+        config["genesis_calendar_head_sha256"], "genesis_calendar_head_sha256"
+    )
+    candidate_decision = max(item for item in segment_sessions if item < start)
+    config["formal_start_eligibility"] = _validate_formal_start_eligibility(
+        config["formal_start_eligibility"],
+        oos_start=start,
+        candidate_decision_session=candidate_decision,
+        readiness_report_sha256=config["readiness_report_sha256"],
+        calendar_head_sha256=config["genesis_calendar_head_sha256"],
+        data_snapshot_sha256=config["data_bundle_sha256"],
+        planner_verifier_sha256=config["dependency_sha256"]["research_engine"],
+        calendar_sessions=segment_sessions,
+    )
+    expected_genesis_data_head = data_chain_transition_sha256(
+        data_contract_identity_sha256=config["data_contract_identity_sha256"],
+        previous_data_chain_head_sha256=ZERO_HASH,
+        decision_session=config["formal_start_eligibility"]["candidate_decision_session"],
+        snapshot_cutoff_utc=config["formal_start_eligibility"]["eligibility_cutoff_utc"],
+        data_manifest_sha256=config["data_bundle_sha256"],
+        data_validation_report_sha256=config["genesis_data_validation_report_sha256"],
+    )
+    if config["genesis_data_chain_head_sha256"] != expected_genesis_data_head:
+        raise LedgerValidationError("genesis_data_chain_head_sha256 is not derived from the Genesis data evidence")
     if config["min_complete_weeks"] != MIN_COMPLETE_WEEKS:
         raise LedgerValidationError(f"min_complete_weeks must be frozen at {MIN_COMPLETE_WEEKS}")
     if config["exchange_timezone"] != EXCHANGE_TIMEZONE:
@@ -639,32 +1076,122 @@ def _validate_genesis_config(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _primary_chain_id(config: Mapping[str, Any]) -> str:
     identity = {
-        "schema": "xs_chan_v2_1_primary_chain_identity_v1",
+        "schema": "xs_chan_v2_1_primary_chain_identity_v2",
         "protocol_id": config["protocol_id"],
         "protocol_sha256": config["protocol_sha256"],
-        "data_bundle_sha256": config["data_bundle_sha256"],
         "trial_id": config["trial_id"],
         "trial_registry_namespace": config["trial_registry_namespace"],
         "trial_registry_authority_sha256": config["trial_registry_authority_sha256"],
         "chain_role": "PRIMARY",
+        "genesis_config_sha256": _sha256_bytes(_canonical_bytes(config)),
     }
     return _sha256_bytes(_canonical_bytes(identity))
+
+
+def _registry_authority_sha256(verifier: RsaPkcs1v15Sha256ReceiptVerifier) -> str:
+    if not isinstance(verifier, RsaPkcs1v15Sha256ReceiptVerifier):
+        raise ReceiptVerificationError("a concrete registry receipt verifier is required")
+    return _object_sha256(verifier.identity)
+
+
+def _primary_registry_claim_core(
+    genesis_config: Mapping[str, Any],
+    *,
+    receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+) -> dict[str, Any]:
+    if not isinstance(receipt_verifier, RsaPkcs1v15Sha256ReceiptVerifier):
+        raise ReceiptVerificationError("a concrete timestamp receipt verifier is required")
+    config = _validate_genesis_config(genesis_config)
+    authority_sha256 = _registry_authority_sha256(registry_receipt_verifier)
+    if config["trial_registry_authority_sha256"] != authority_sha256:
+        raise ReceiptVerificationError("registry verifier differs from the authority frozen by Genesis")
+    genesis_core = {
+        "schema": "xs_chan_v2_1_genesis_core_v1",
+        "config": config,
+        "primary_chain_id": _primary_chain_id(config),
+        "anchor_verifier_identity": receipt_verifier.identity,
+    }
+    return {
+        "schema": REGISTRY_CLAIM_SCHEMA,
+        "registry_operation": "ATOMIC_REGISTER_PRIMARY_IF_ABSENT",
+        "claim_result": "REGISTERED_AS_FIRST_PRIMARY",
+        "uniqueness_scope_sha256": _object_sha256(
+            {
+                "trial_registry_namespace": config["trial_registry_namespace"],
+                "trial_id": config["trial_id"],
+                "chain_role": "PRIMARY",
+            }
+        ),
+        "trial_registry_namespace": config["trial_registry_namespace"],
+        "trial_registry_authority_sha256": authority_sha256,
+        "protocol_id": config["protocol_id"],
+        "protocol_sha256": config["protocol_sha256"],
+        "trial_id": config["trial_id"],
+        "chain_role": "PRIMARY",
+        "primary_chain_id": _primary_chain_id(config),
+        "genesis_core_sha256": _sha256_bytes(_canonical_bytes(genesis_core)),
+        "registry_verifier_identity": registry_receipt_verifier.identity,
+    }
+
+
+def primary_registry_claim_commitment_sha256(
+    genesis_config: Mapping[str, Any],
+    *,
+    receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+) -> str:
+    """Return the immutable external primary-registry claim subject."""
+    core = _primary_registry_claim_core(
+        genesis_config,
+        receipt_verifier=receipt_verifier,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
+    return _sha256_bytes(_canonical_bytes(core))
 
 
 def genesis_commitment_sha256(
     genesis_config: Mapping[str, Any],
     *,
     receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+    registry_external_anchor: Mapping[str, Any],
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
 ) -> str:
-    """Return the artifact digest an external signer must timestamp for genesis."""
-    if not isinstance(receipt_verifier, RsaPkcs1v15Sha256ReceiptVerifier):
-        raise ReceiptVerificationError("a concrete RSA receipt verifier is required")
+    """Return the Genesis timestamp subject after verifying the external registry claim."""
     config = _validate_genesis_config(genesis_config)
+    registry_claim = primary_registry_claim_commitment_sha256(
+        config,
+        receipt_verifier=receipt_verifier,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
+    registry_receipt = registry_receipt_verifier.verify(
+        registry_external_anchor,
+        expected_subject_sha256=registry_claim,
+    )
+    start = _normalise_date(config["oos_start_date"], "oos_start_date")
+    start_boundary = _local_boundary(start, "00:00:00", config["exchange_timezone"])
+    retrieved = _canonical_utc(
+        config["genesis_calendar_segment"]["source_retrieved_at_utc"],
+        "genesis calendar retrieved_at",
+    )
+    eligibility_cutoff = _canonical_utc(
+        config["formal_start_eligibility"]["eligibility_cutoff_utc"],
+        "formal-start eligibility cutoff",
+    )
+    if (
+        registry_receipt.issued_at_utc < max(retrieved, eligibility_cutoff)
+        or registry_receipt.issued_at_utc >= start_boundary
+    ):
+        raise ReceiptVerificationError("primary registry receipt is outside the Genesis eligibility interval")
     core = {
-        "schema": "xs_chan_v2_1_genesis_commitment_v1",
+        "schema": "xs_chan_v2_1_genesis_commitment_v2",
         "config": config,
         "primary_chain_id": _primary_chain_id(config),
         "anchor_verifier_identity": receipt_verifier.identity,
+        "registry_verifier_identity": registry_receipt_verifier.identity,
+        "primary_registry_claim_commitment_sha256": registry_claim,
+        "primary_registry_external_anchor": dict(registry_external_anchor),
+        "primary_registry_external_anchor_receipt_sha256": registry_receipt.receipt_sha256,
     }
     return _sha256_bytes(_canonical_bytes(core))
 
@@ -686,6 +1213,11 @@ def _validate_segment(value: Mapping[str, Any]) -> dict[str, Any]:
         raise LedgerValidationError("calendar segment sessions must be strictly increasing and unique")
     if any(item < start or item > end for item in sessions):
         raise LedgerValidationError("calendar session lies outside its coverage interval")
+    if type(segment["week_labels"]) is not list or len(segment["week_labels"]) != len(sessions):
+        raise LedgerValidationError("calendar segment week_labels must parallel sessions exactly")
+    expected_week_labels = [_week_id(item) for item in sessions]
+    if segment["week_labels"] != expected_week_labels:
+        raise LedgerValidationError("calendar week_labels must be the canonical ISO week for each session")
     if not isinstance(segment["source_id"], str) or not segment["source_id"].strip():
         raise LedgerValidationError("calendar_segment.source_id must be non-empty")
     uri = segment["source_uri"]
@@ -695,19 +1227,48 @@ def _validate_segment(value: Mapping[str, Any]) -> dict[str, Any]:
     if parsed_uri.scheme != "https" or not parsed_uri.netloc:
         raise LedgerValidationError("calendar_segment.source_uri must be an HTTPS URL")
     segment["source_sha256"] = _require_sha256(segment["source_sha256"], "calendar_segment.source_sha256")
+    published = _canonical_utc(segment["source_published_at_utc"], "calendar_segment.source_published_at_utc")
     retrieved = _canonical_utc(segment["source_retrieved_at_utc"], "calendar_segment.source_retrieved_at_utc")
+    if published > retrieved:
+        raise LedgerValidationError("calendar source published_at cannot follow retrieved_at")
+    segment["previous_calendar_head_sha256"] = _require_sha256(
+        segment["previous_calendar_head_sha256"], "calendar_segment.previous_calendar_head_sha256"
+    )
+    segment["new_calendar_head_sha256"] = _require_sha256(
+        segment["new_calendar_head_sha256"], "calendar_segment.new_calendar_head_sha256"
+    )
     segment["coverage_start"] = start.isoformat()
     segment["coverage_end"] = end.isoformat()
     segment["sessions"] = [item.isoformat() for item in sessions]
+    segment["week_labels"] = expected_week_labels
+    segment["source_published_at_utc"] = _format_utc(published)
     segment["source_retrieved_at_utc"] = _format_utc(retrieved)
+    expected_head = calendar_segment_head_sha256(segment)
+    if segment["new_calendar_head_sha256"] != expected_head:
+        raise LedgerValidationError("calendar segment new head does not match its canonical content")
     return segment
+
+
+def calendar_segment_head_sha256(segment: Mapping[str, Any]) -> str:
+    """Compute the rolling official-calendar head without trusting ``new_calendar_head_sha256``."""
+    if not isinstance(segment, Mapping):
+        raise LedgerValidationError("calendar_segment must be an object")
+    value = _exact_mapping(segment, _CALENDAR_SEGMENT_KEYS, "calendar_segment")
+    previous = _require_sha256(value["previous_calendar_head_sha256"], "previous_calendar_head_sha256")
+    core_segment = {key: value[key] for key in sorted(_CALENDAR_SEGMENT_KEYS - {"new_calendar_head_sha256"})}
+    core = {
+        "schema": "xs_chan_v2_1_calendar_head_transition_v1",
+        "previous_calendar_head_sha256": previous,
+        "segment": core_segment,
+    }
+    return _sha256_bytes(_canonical_bytes(core))
 
 
 def calendar_segment_commitment_sha256(primary_chain_id: str, segment: Mapping[str, Any]) -> str:
     """Return the signed commitment for one official-calendar segment."""
     chain_id = _require_sha256(primary_chain_id, "primary_chain_id")
     core = {
-        "schema": "xs_chan_v2_1_calendar_segment_commitment_v1",
+        "schema": "xs_chan_v2_1_calendar_segment_commitment_v2",
         "primary_chain_id": chain_id,
         "segment": _validate_segment(segment),
     }
@@ -886,16 +1447,12 @@ def _scan_records(root: Path) -> tuple[LedgerRecord, ...]:
 
 
 def _calendar_state_sha256(segments: Sequence[Mapping[str, Any]]) -> str:
-    identity = [
-        {
-            "segment_index": segment["segment_index"],
-            "commitment_sha256": segment["commitment_sha256"],
-            "coverage_start": segment["segment"]["coverage_start"],
-            "coverage_end": segment["segment"]["coverage_end"],
-        }
-        for segment in segments
-    ]
-    return _sha256_bytes(_canonical_bytes(identity))
+    if not segments:
+        return ZERO_HASH
+    return _require_sha256(
+        segments[-1]["segment"]["new_calendar_head_sha256"],
+        "latest calendar head",
+    )
 
 
 def _week_specs(state: _ReplayState) -> list[WeekSpec]:
@@ -935,10 +1492,53 @@ def _expected_week(state: _ReplayState) -> WeekSpec | None:
     return specs[index] if index < len(specs) else None
 
 
+def _next_unwind_session(state: _ReplayState) -> date | None:
+    if len(state.completed_weeks) < MIN_COMPLETE_WEEKS:
+        return None
+    after = state.unwind_next_session_after
+    if after is None:
+        after = _normalise_date(state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["close_dt"], "close_dt")
+    return next((session for session in state.sessions if session > after), None)
+
+
 def _event_window(state: _ReplayState) -> tuple[str, datetime, datetime] | None:
-    if state.terminal is not None or len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
+    if state.terminal is not None or state.final_evaluation is not None:
         return None
     timezone = state.config["exchange_timezone"]
+    if len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
+        if state.phase == "WINDOW_COMPLETE":
+            session = _next_unwind_session(state)
+            if session is None:
+                return None
+            close_sequence = state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["weekly_close_sequence"]
+            return (
+                "decision",
+                state.records[close_sequence].recorded_at_utc,
+                _local_boundary(session, state.config["execution_open_local"], timezone),
+            )
+        if state.phase in {"UNWIND_DECIDED", "UNWIND_AWAIT_SESSION_OPEN"}:
+            session = _next_unwind_session(state)
+            if session is None:
+                return None
+            return (
+                "session_open_execution",
+                _local_boundary(session, state.config["execution_open_local"], timezone),
+                _local_boundary(session, state.config["open_execution_deadline_local"], timezone),
+            )
+        if state.phase == "UNWIND_OPENED":
+            if state.unwind_session is None:
+                raise LedgerValidationError("post-window unwind session is missing")
+            later_sessions = [item for item in state.sessions if item > state.unwind_session]
+            return (
+                "session_eod_valuation",
+                _local_boundary(state.unwind_session, state.config["session_close_local"], timezone),
+                _local_boundary(later_sessions[0], state.config["execution_open_local"], timezone)
+                if later_sessions
+                else datetime.max.replace(tzinfo=UTC),
+            )
+        if state.phase == "UNWIND_COMPLETE_PENDING_REPLAY":
+            return None
+        raise LedgerValidationError(f"unknown post-window replay phase: {state.phase}")
     if state.phase == "IDLE":
         week = _expected_week(state)
         if week is None:
@@ -964,24 +1564,21 @@ def _event_window(state: _ReplayState) -> tuple[str, datetime, datetime] | None:
         assert state.active_week is not None
         session = state.active_week.sessions[state.next_session_index]
         later_sessions = [item for item in state.sessions if item > session]
-        if not later_sessions:
-            raise LedgerValidationError("calendar must cover the next session before EOD valuation")
         return (
             "session_eod_valuation",
             _local_boundary(session, state.config["session_close_local"], timezone),
-            _local_boundary(later_sessions[0], state.config["execution_open_local"], timezone),
+            _local_boundary(later_sessions[0], state.config["execution_open_local"], timezone)
+            if later_sessions
+            else datetime.max.replace(tzinfo=UTC),
         )
     if state.phase == "FINAL_EOD":
         assert state.active_week is not None
-        later_sessions = [item for item in state.sessions if item > state.active_week.close_dt]
-        if not later_sessions:
-            raise LedgerValidationError("calendar must cover the next session before cycle_close")
         return (
             "cycle_close",
             state.last_eod_record.recorded_at_utc
             if state.last_eod_record is not None
             else datetime.min.replace(tzinfo=UTC),
-            _local_boundary(later_sessions[0], state.config["execution_open_local"], timezone),
+            datetime.max.replace(tzinfo=UTC),
         )
     raise LedgerValidationError(f"unknown replay phase: {state.phase}")
 
@@ -1032,6 +1629,28 @@ def _validate_event_data(value: Any, schema: str, keys: set[str], label: str) ->
     return data
 
 
+def _advance_data_chain(
+    state: _ReplayState,
+    data: Mapping[str, Any],
+    *,
+    decision_session: str,
+    label: str,
+) -> None:
+    if data["previous_data_chain_head_sha256"] != state.data_chain_head_sha256:
+        raise LedgerValidationError(f"{label} previous data-chain head differs from chain state")
+    expected = data_chain_transition_sha256(
+        data_contract_identity_sha256=state.config["data_contract_identity_sha256"],
+        previous_data_chain_head_sha256=state.data_chain_head_sha256,
+        decision_session=decision_session,
+        snapshot_cutoff_utc=data["snapshot_cutoff_utc"],
+        data_manifest_sha256=data["data_manifest_sha256"],
+        data_validation_report_sha256=data["data_validation_report_sha256"],
+    )
+    if data["data_chain_head_sha256"] != expected:
+        raise LedgerValidationError(f"{label} data-chain head is not derived from its immutable snapshot transition")
+    state.data_chain_head_sha256 = expected
+
+
 def _apply_calendar_segment(
     state: _ReplayState,
     record: LedgerRecord,
@@ -1039,6 +1658,10 @@ def _apply_calendar_segment(
     external_anchor: Mapping[str, Any],
     verified_receipt: VerifiedReceipt | None,
 ) -> None:
+    if state.phase == "UNWIND_COMPLETE_PENDING_REPLAY":
+        raise LedgerValidationError(
+            "the irreversible all-book unwind-completion point permits only final evaluation or abort"
+        )
     payload = _exact_mapping(
         record.data["payload"],
         {"segment_index", "segment", "commitment_sha256"},
@@ -1049,18 +1672,18 @@ def _apply_calendar_segment(
         raise LedgerValidationError("calendar segment index fields disagree")
     if segment["segment_index"] != len(state.segments):
         raise LedgerValidationError("calendar segment indexes must be contiguous from zero")
+    current_head = _calendar_state_sha256(state.segments)
+    if segment["previous_calendar_head_sha256"] != current_head:
+        raise LedgerValidationError("calendar extension previous head differs from the current calendar head")
     commitment = calendar_segment_commitment_sha256(_primary_chain_id(state.config), segment)
     if payload["commitment_sha256"] != commitment:
         raise LedgerValidationError("calendar segment commitment_sha256 mismatch")
     start = _normalise_date(segment["coverage_start"], "coverage_start")
-    if state.segments:
-        previous_end = _normalise_date(state.segments[-1]["segment"]["coverage_end"], "coverage_end")
-        if start != previous_end + timedelta(days=1):
-            raise LedgerValidationError("calendar coverage segments must be contiguous without overlap or gaps")
-    else:
-        oos_start = _normalise_date(state.config["oos_start_date"], "oos_start_date")
-        if start >= oos_start:
-            raise LedgerValidationError("first calendar segment must cover at least one pre-OOS decision date")
+    if not state.segments:
+        raise LedgerValidationError("calendar segment zero must be committed inside Genesis")
+    previous_end = _normalise_date(state.segments[-1]["segment"]["coverage_end"], "coverage_end")
+    if start != previous_end + timedelta(days=1):
+        raise LedgerValidationError("calendar coverage segments must be contiguous without overlap or gaps")
     sessions = [_normalise_date(item, "calendar session") for item in segment["sessions"]]
     if not sessions:
         raise LedgerValidationError("calendar extension must contain at least one official session")
@@ -1072,6 +1695,7 @@ def _apply_calendar_segment(
     if record.recorded_at_utc >= effective_boundary:
         raise LedgerTimingError("calendar extension must be appended before its first new session opens")
     retrieved = _canonical_utc(segment["source_retrieved_at_utc"], "source_retrieved_at_utc")
+    published = _canonical_utc(segment["source_published_at_utc"], "source_published_at_utc")
     if retrieved > record.recorded_at_utc:
         raise LedgerTimingError("calendar source retrieval exceeds the record timestamp")
     if segment["source_id"] != state.config["calendar_source_id"]:
@@ -1080,13 +1704,13 @@ def _apply_calendar_segment(
     if receipt["provider"] != state.anchor_identity["provider"] or receipt["key_id"] != state.anchor_identity["key_id"]:
         raise ReceiptVerificationError("calendar receipt signer differs from genesis")
     claimed_issued_at = _canonical_utc(receipt["issued_at_utc"], "receipt.issued_at_utc")
-    if claimed_issued_at < retrieved or claimed_issued_at >= effective_boundary:
+    if claimed_issued_at < max(retrieved, published) or claimed_issued_at >= effective_boundary:
         raise ReceiptVerificationError("calendar receipt is outside retrieval-to-first-open interval")
     if verified_receipt is not None:
         _verify_receipt_timing(
             verified_receipt,
             recorded_at_utc=record.recorded_at_utc,
-            earliest_utc=retrieved,
+            earliest_utc=max(retrieved, published),
             latest_utc=effective_boundary,
         )
     state.segments.append(
@@ -1095,6 +1719,7 @@ def _apply_calendar_segment(
             "segment": segment,
             "commitment_sha256": commitment,
             "record_hash": record.record_hash,
+            "record_sequence": record.sequence,
         }
     )
     state.sessions.extend(sessions)
@@ -1103,8 +1728,95 @@ def _apply_calendar_segment(
 
 def _apply_decision(state: _ReplayState, record: LedgerRecord) -> None:
     _validate_window(state, "decision", record.recorded_at_utc)
+    if len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
+        payload = _exact_mapping(
+            record.data["payload"],
+            {"week_id", "decision_kind", "decision_dt", "execution_dt", "data"},
+            "post-window unwind decision payload",
+        )
+        session = _next_unwind_session(state)
+        if session is None:
+            raise LedgerValidationError("post-window unwind decision has no covered execution session")
+        expected = (
+            UNWIND_WEEK_ID,
+            "POST_WINDOW_UNWIND",
+            state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["close_dt"],
+            session.isoformat(),
+        )
+        actual = (
+            payload["week_id"],
+            payload["decision_kind"],
+            payload["decision_dt"],
+            payload["execution_dt"],
+        )
+        if actual != expected:
+            raise LedgerValidationError("post-window unwind decision identity mismatch")
+        data = _validate_event_data(
+            payload["data"],
+            UNWIND_DECISION_SCHEMA,
+            _UNWIND_DECISION_KEYS,
+            "post-window unwind decision.data",
+        )
+        if data["engine_sha256"] != state.config["dependency_sha256"]["execution_engine"]:
+            raise LedgerValidationError("post-window unwind decision uses the wrong execution engine")
+        window = _confirmation_window(state)
+        if window is None or data["confirmation_window_identity_sha256"] != window["identity_sha256"]:
+            raise LedgerValidationError("post-window unwind decision does not bind the confirmation window")
+        if data["book_state_before_root_sha256"] != state.portfolio_sha256:
+            raise LedgerValidationError("post-window unwind pre-state differs from the all-book root")
+        if data["pending_sells_before_root_sha256"] != state.pending_sells_sha256:
+            raise LedgerValidationError("post-window unwind pending root differs from chain state")
+        if (
+            _validate_count(data["aggregate_position_count_before"], "aggregate_position_count_before")
+            != state.position_count
+        ):
+            raise LedgerValidationError("post-window unwind position count differs from chain state")
+        if (
+            _validate_count(data["aggregate_pending_sell_count_before"], "aggregate_pending_sell_count_before")
+            != state.pending_sell_count
+        ):
+            raise LedgerValidationError("post-window unwind pending count differs from chain state")
+        after_pending_count = _validate_count(
+            data["aggregate_pending_sell_count_after_decision"],
+            "aggregate_pending_sell_count_after_decision",
+        )
+        if after_pending_count != state.position_count:
+            raise LedgerValidationError(
+                "post-window unwind decision must place every aggregate position into exit/pending"
+            )
+        expected_exit_coverage = _object_sha256(
+            {
+                "book_state_before_root_sha256": state.portfolio_sha256,
+                "aggregate_position_count_before": state.position_count,
+                "exit_orders_root_sha256": data["exit_orders_root_sha256"],
+            }
+        )
+        if data["full_exit_coverage_root_sha256"] != expected_exit_coverage:
+            raise LedgerValidationError("post-window unwind full-exit coverage root is not ledger-derived")
+        close_sequence = state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["weekly_close_sequence"]
+        _validate_snapshot(
+            data["snapshot_cutoff_utc"],
+            "post-window unwind decision.data.snapshot_cutoff_utc",
+            earliest=state.records[close_sequence].recorded_at_utc,
+            recorded_at=record.recorded_at_utc,
+        )
+        _advance_data_chain(
+            state,
+            data,
+            decision_session=payload["decision_dt"],
+            label="post-window unwind decision",
+        )
+        state.decision_record = record
+        state.unwind_evidence_root_sha256 = data["unwind_evidence_root_sha256"]
+        state.portfolio_sha256 = data["book_state_after_decision_root_sha256"]
+        state.pending_sells_sha256 = data["pending_sells_after_decision_root_sha256"]
+        state.pending_sell_count = after_pending_count
+        state.phase = "UNWIND_DECIDED"
+        return
     payload = _exact_mapping(
-        record.data["payload"], {"week_id", "decision_dt", "execution_dt", "close_dt", "data"}, "decision payload"
+        record.data["payload"],
+        {"week_id", "decision_kind", "decision_dt", "execution_dt", "close_dt", "data"},
+        "decision payload",
     )
     week = _expected_week(state)
     if week is None:
@@ -1115,18 +1827,27 @@ def _apply_decision(state: _ReplayState, record: LedgerRecord) -> None:
         week.execution_dt.isoformat(),
         week.close_dt.isoformat(),
     )
-    actual_identity = (payload["week_id"], payload["decision_dt"], payload["execution_dt"], payload["close_dt"])
+    actual_identity = (
+        payload["week_id"],
+        payload["decision_dt"],
+        payload["execution_dt"],
+        payload["close_dt"],
+    )
     if actual_identity != expected_identity:
         raise LedgerValidationError("decision does not match the next actual complete calendar week")
+    if payload["decision_kind"] != "CONFIRMATORY_CYCLE":
+        raise LedgerValidationError("confirmatory decision_kind must be CONFIRMATORY_CYCLE")
     data = _validate_event_data(payload["data"], DECISION_SCHEMA, _DECISION_KEYS, "decision.data")
     if data["engine_sha256"] != state.config["dependency_sha256"]["research_engine"]:
         raise LedgerValidationError("decision engine differs from the frozen research engine")
-    if data["portfolio_before_sha256"] != state.portfolio_sha256:
-        raise LedgerValidationError("decision portfolio_before_sha256 differs from chain state")
-    if data["pending_sells_before_sha256"] != state.pending_sells_sha256:
-        raise LedgerValidationError("decision pending_sells_before_sha256 differs from chain state")
+    if data["book_state_before_root_sha256"] != state.portfolio_sha256:
+        raise LedgerValidationError("decision all-book pre-state root differs from chain state")
+    if data["pending_sells_before_root_sha256"] != state.pending_sells_sha256:
+        raise LedgerValidationError("decision pending-sell root differs from chain state")
     if data["calendar_state_sha256"] != week.calendar_state_sha256:
         raise LedgerValidationError("decision calendar_state_sha256 differs from anchored calendar state")
+    if _validate_count(data["eligible_symbol_count"], "decision eligible_symbol_count") < 50:
+        raise LedgerValidationError("eligible_symbol_count below 50 requires chain_abort, not a decision")
     earliest = _local_boundary(
         week.decision_dt, state.config["decision_close_local"], state.config["exchange_timezone"]
     )
@@ -1135,6 +1856,12 @@ def _apply_decision(state: _ReplayState, record: LedgerRecord) -> None:
         "decision.data.snapshot_cutoff_utc",
         earliest=earliest,
         recorded_at=record.recorded_at_utc,
+    )
+    _advance_data_chain(
+        state,
+        data,
+        decision_session=payload["decision_dt"],
+        label="confirmatory decision",
     )
     state.active_week = week
     state.phase = "DECIDED"
@@ -1146,35 +1873,57 @@ def _apply_decision(state: _ReplayState, record: LedgerRecord) -> None:
 
 def _apply_open_execution(state: _ReplayState, record: LedgerRecord) -> None:
     _validate_window(state, "session_open_execution", record.recorded_at_utc)
-    assert state.active_week is not None and state.decision_record is not None
-    session = state.active_week.sessions[state.next_session_index]
+    is_unwind = len(state.completed_weeks) >= MIN_COMPLETE_WEEKS
+    if is_unwind:
+        session = _next_unwind_session(state)
+        if session is None:
+            raise LedgerValidationError("no anchored calendar session is available for post-window unwind")
+        expected_week_id = UNWIND_WEEK_ID
+        if state.decision_record is None:
+            raise LedgerValidationError("post-window unwind open has no exit decision")
+        origin_hash = state.decision_record.record_hash
+    else:
+        assert state.active_week is not None and state.decision_record is not None
+        session = state.active_week.sessions[state.next_session_index]
+        expected_week_id = state.active_week.week_id
+        origin_hash = state.decision_record.record_hash
     payload = _exact_mapping(
         record.data["payload"],
         {"week_id", "session_dt", "decision_hash", "data"},
         "session_open_execution payload",
     )
-    if payload["week_id"] != state.active_week.week_id or payload["session_dt"] != session.isoformat():
+    if payload["week_id"] != expected_week_id or payload["session_dt"] != session.isoformat():
         raise LedgerValidationError("session_open_execution session identity mismatch")
-    if payload["decision_hash"] != state.decision_record.record_hash:
-        raise LedgerValidationError("session_open_execution does not reference the cycle decision")
+    if payload["decision_hash"] != origin_hash:
+        raise LedgerValidationError("session_open_execution does not reference its frozen decision/origin")
     data = _validate_event_data(
         payload["data"], OPEN_EXECUTION_SCHEMA, _OPEN_EXECUTION_KEYS, "session_open_execution.data"
     )
     if data["engine_sha256"] != state.config["dependency_sha256"]["execution_engine"]:
         raise LedgerValidationError("session_open_execution engine differs from the frozen execution engine")
-    if data["decision_record_sha256"] != state.decision_record.record_hash:
+    if data["decision_record_sha256"] != origin_hash:
         raise LedgerValidationError("session_open_execution decision hash fields disagree")
     expected_eod = state.last_eod_record.record_hash if state.last_eod_record is not None else ZERO_HASH
     if data["previous_eod_record_sha256"] != expected_eod:
         raise LedgerValidationError("session_open_execution previous EOD reference mismatch")
-    if data["portfolio_before_sha256"] != state.portfolio_sha256:
+    if data["book_state_before_root_sha256"] != state.portfolio_sha256:
         raise LedgerValidationError("session_open_execution pre-open portfolio differs from chain state")
     before_count = _validate_count(data["pending_sell_count_before"], "pending_sell_count_before")
-    if before_count != state.pending_sell_count or data["pending_sells_before_sha256"] != state.pending_sells_sha256:
+    if (
+        before_count != state.pending_sell_count
+        or data["pending_sells_before_root_sha256"] != state.pending_sells_sha256
+    ):
         raise LedgerValidationError("session_open_execution pre-open pending sells differ from chain state")
+    before_positions = _validate_count(data["aggregate_position_count_before"], "aggregate_position_count_before")
+    if before_positions != state.position_count:
+        raise LedgerValidationError("session_open_execution position count differs from chain state")
     after_count = _validate_count(data["pending_sell_count_after"], "pending_sell_count_after")
-    if state.next_session_index > 0 and after_count > before_count:
-        raise LedgerValidationError("pending sell count cannot increase without a new cycle decision")
+    after_positions = _validate_count(data["aggregate_position_count_after"], "aggregate_position_count_after")
+    share_receipts = _validate_count(data["terminal_share_receipt_count"], "terminal_share_receipt_count")
+    if (is_unwind or state.next_session_index > 0) and after_count > before_count + share_receipts:
+        raise LedgerValidationError("pending sell count increase exceeds terminal share receipts")
+    if is_unwind and after_positions > before_positions + share_receipts:
+        raise LedgerValidationError("post-window position increase exceeds terminal share receipts")
     earliest = _local_boundary(session, state.config["execution_open_local"], state.config["exchange_timezone"])
     _validate_snapshot(
         data["snapshot_cutoff_utc"],
@@ -1182,29 +1931,44 @@ def _apply_open_execution(state: _ReplayState, record: LedgerRecord) -> None:
         earliest=earliest,
         recorded_at=record.recorded_at_utc,
     )
-    state.portfolio_sha256 = data["portfolio_after_sha256"]
-    state.pending_sells_sha256 = data["pending_sells_after_sha256"]
+    state.portfolio_sha256 = data["book_state_after_root_sha256"]
+    state.pending_sells_sha256 = data["pending_sells_after_root_sha256"]
     state.pending_sell_count = after_count
+    state.position_count = after_positions
     state.last_open_record = record
-    state.phase = "OPENED"
+    if is_unwind:
+        state.unwind_session = session
+        state.phase = "UNWIND_OPENED"
+    else:
+        state.phase = "OPENED"
 
 
 def _apply_eod(state: _ReplayState, record: LedgerRecord) -> None:
     _validate_window(state, "session_eod_valuation", record.recorded_at_utc)
-    assert state.active_week is not None and state.last_open_record is not None
-    session = state.active_week.sessions[state.next_session_index]
+    is_unwind = len(state.completed_weeks) >= MIN_COMPLETE_WEEKS
+    assert state.last_open_record is not None
+    if is_unwind:
+        if state.unwind_session is None:
+            raise LedgerValidationError("post-window unwind EOD has no open session")
+        session = state.unwind_session
+        expected_week_id = UNWIND_WEEK_ID
+    else:
+        assert state.active_week is not None
+        session = state.active_week.sessions[state.next_session_index]
+        expected_week_id = state.active_week.week_id
     payload = _exact_mapping(record.data["payload"], {"week_id", "session_dt", "data"}, "session_eod_valuation payload")
-    if payload["week_id"] != state.active_week.week_id or payload["session_dt"] != session.isoformat():
+    if payload["week_id"] != expected_week_id or payload["session_dt"] != session.isoformat():
         raise LedgerValidationError("session_eod_valuation session identity mismatch")
-    data = _validate_event_data(payload["data"], EOD_VALUATION_SCHEMA, _EOD_KEYS, "session_eod_valuation.data")
+    data_schema = UNWIND_EOD_VALUATION_SCHEMA if is_unwind else EOD_VALUATION_SCHEMA
+    data_keys = _UNWIND_EOD_KEYS if is_unwind else _EOD_KEYS
+    data = _validate_event_data(payload["data"], data_schema, data_keys, "session_eod_valuation.data")
     if data["engine_sha256"] != state.config["dependency_sha256"]["execution_engine"]:
         raise LedgerValidationError("session_eod_valuation engine differs from frozen execution engine")
     if data["session_open_execution_sha256"] != state.last_open_record.record_hash:
         raise LedgerValidationError("session_eod_valuation does not reference its same-session open record")
     count = _validate_count(data["pending_sell_count"], "pending_sell_count")
-    if count != state.pending_sell_count or data["pending_sells_sha256"] != state.pending_sells_sha256:
-        raise LedgerValidationError("session_eod_valuation pending-sell state differs from chain state")
-    if data["portfolio_before_eod_sha256"] != state.portfolio_sha256:
+    positions = _validate_count(data["aggregate_position_count"], "aggregate_position_count")
+    if data["book_state_before_eod_root_sha256"] != state.portfolio_sha256:
         raise LedgerValidationError("session_eod_valuation pre-EOD portfolio differs from chain state")
     earliest = _local_boundary(session, state.config["session_close_local"], state.config["exchange_timezone"])
     _validate_snapshot(
@@ -1213,9 +1977,33 @@ def _apply_eod(state: _ReplayState, record: LedgerRecord) -> None:
         earliest=earliest,
         recorded_at=record.recorded_at_utc,
     )
-    state.portfolio_sha256 = data["portfolio_state_sha256"]
+    if is_unwind:
+        _advance_data_chain(
+            state,
+            data,
+            decision_session=session.isoformat(),
+            label="post-window unwind EOD",
+        )
+        state.pending_settlements_sha256 = data["aggregate_pending_settlements_root_sha256"]
+        state.pending_settlement_count = _validate_count(
+            data["aggregate_pending_settlement_count"],
+            "aggregate_pending_settlement_count",
+        )
+    state.portfolio_sha256 = data["book_state_root_sha256"]
+    state.pending_sells_sha256 = data["pending_sells_root_sha256"]
+    state.pending_sell_count = count
+    state.position_count = positions
     state.last_eod_record = record
-    if state.next_session_index == len(state.active_week.sessions) - 1:
+    if is_unwind:
+        state.unwind_session_count += 1
+        state.unwind_next_session_after = session
+        state.unwind_session = None
+        state.last_open_record = None
+        if state.position_count == 0 and state.pending_sell_count == 0 and state.pending_settlement_count == 0:
+            state.phase = "UNWIND_COMPLETE_PENDING_REPLAY"
+        else:
+            state.phase = "UNWIND_AWAIT_SESSION_OPEN"
+    elif state.next_session_index == len(state.active_week.sessions) - 1:
         state.phase = "FINAL_EOD"
     else:
         state.next_session_index += 1
@@ -1235,12 +2023,14 @@ def _apply_weekly_close(state: _ReplayState, record: LedgerRecord) -> None:
         raise LedgerValidationError("weekly_close statistics engine differs from genesis")
     if data["eod_record_sha256"] != state.last_eod_record.record_hash:
         raise LedgerValidationError("weekly_close does not reference the final EOD valuation")
-    if data["portfolio_state_sha256"] != state.portfolio_sha256:
+    if data["book_state_root_sha256"] != state.portfolio_sha256:
         raise LedgerValidationError("weekly_close portfolio state differs from chain state")
-    if data["pending_sells_sha256"] != state.pending_sells_sha256:
+    if data["pending_sells_root_sha256"] != state.pending_sells_sha256:
         raise LedgerValidationError("weekly_close pending-sell digest differs from chain state")
     if _validate_count(data["pending_sell_count"], "pending_sell_count") != state.pending_sell_count:
         raise LedgerValidationError("weekly_close pending-sell count differs from chain state")
+    if _validate_count(data["aggregate_position_count"], "aggregate_position_count") != state.position_count:
+        raise LedgerValidationError("weekly_close position count differs from chain state")
     earliest = state.last_eod_record.recorded_at_utc
     _validate_snapshot(
         data["snapshot_cutoff_utc"],
@@ -1248,6 +2038,7 @@ def _apply_weekly_close(state: _ReplayState, record: LedgerRecord) -> None:
         earliest=earliest,
         recorded_at=record.recorded_at_utc,
     )
+    decision_data = state.decision_record.data["payload"]["data"]
     state.completed_weeks.append(
         {
             "week_id": state.active_week.week_id,
@@ -1258,15 +2049,24 @@ def _apply_weekly_close(state: _ReplayState, record: LedgerRecord) -> None:
             "sessions": [item.isoformat() for item in state.active_week.sessions],
             "calendar_state_sha256": state.active_week.calendar_state_sha256,
             "decision_record_sha256": state.decision_record.record_hash,
+            "data_manifest_sha256": decision_data["data_manifest_sha256"],
+            "data_chain_head_sha256": decision_data["data_chain_head_sha256"],
+            "data_validation_report_sha256": decision_data["data_validation_report_sha256"],
             "weekly_close_record_sha256": record.record_hash,
             "weekly_close_sequence": record.sequence,
         }
     )
+    completed_window = len(state.completed_weeks) == MIN_COMPLETE_WEEKS
     state.active_week = None
-    state.phase = "IDLE"
+    state.phase = "WINDOW_COMPLETE" if completed_window else "IDLE"
     state.decision_record = None
     state.last_open_record = None
-    state.last_eod_record = None
+    if not completed_window:
+        state.last_eod_record = None
+    else:
+        state.unwind_next_session_after = _normalise_date(
+            state.completed_weeks[-1]["close_dt"], "confirmation close date"
+        )
     state.next_session_index = 0
 
 
@@ -1285,10 +2085,91 @@ def _apply_terminal(state: _ReplayState, record: LedgerRecord, deadline_failure:
     state.terminal = record
 
 
+def _apply_final_evaluation(state: _ReplayState, record: LedgerRecord) -> None:
+    if len(state.completed_weeks) != MIN_COMPLETE_WEEKS:
+        raise LedgerValidationError("final_evaluation requires exactly 52 completed confirmatory cycles")
+    if state.phase != "UNWIND_COMPLETE_PENDING_REPLAY":
+        raise LedgerValidationError("final_evaluation requires the irreversible all-book unwind-completion phase")
+    if state.unwind_evidence_root_sha256 is None or state.decision_record is None:
+        raise LedgerValidationError("final_evaluation requires the explicit POST_WINDOW_UNWIND decision")
+    data = _exact_mapping(record.data["payload"], _FINAL_EVALUATION_KEYS, "final_evaluation payload")
+    if data["schema"] != FINAL_EVALUATION_SCHEMA:
+        raise LedgerValidationError(f"final_evaluation.schema must be {FINAL_EVALUATION_SCHEMA!r}")
+    window = _confirmation_window(state)
+    if window is None or data["confirmation_window_identity_sha256"] != window["identity_sha256"]:
+        raise LedgerValidationError("final_evaluation does not bind the frozen 52-cycle window")
+    for key in (
+        "confirmation_window_identity_sha256",
+        "statistics_result_sha256",
+        "semantic_replay_evidence_sha256",
+        "unwind_completion_book_state_root_sha256",
+        "unwind_completion_pending_sells_root_sha256",
+        "unwind_evidence_sha256",
+        "final_evaluation_artifact_sha256",
+    ):
+        _require_sha256(data[key], f"final_evaluation.{key}")
+    if data["evaluation_status"] not in FORMAL_EVALUATION_STATUSES:
+        raise LedgerValidationError("final_evaluation.evaluation_status is not a registered formal status")
+    if data["post_window_unwind_completed"] is not True:
+        raise LedgerValidationError("post-window real unwind must complete before final_evaluation")
+    if (
+        _validate_count(data["post_window_unwind_session_count"], "post_window_unwind_session_count")
+        != state.unwind_session_count
+    ):
+        raise LedgerValidationError("final_evaluation unwind session count differs from ledger state")
+    cost = data["post_window_unwind_cost_cny"]
+    if type(cost) not in {int, float} or not math.isfinite(float(cost)) or float(cost) < 0:
+        raise LedgerValidationError("post_window_unwind_cost_cny must be a finite non-negative number")
+    remaining_positions = _validate_count(data["remaining_position_count"], "remaining_position_count")
+    if remaining_positions != state.position_count or remaining_positions != 0:
+        raise LedgerValidationError("final_evaluation requires zero remaining positions")
+    remaining_pending = _validate_count(data["remaining_pending_sell_count"], "remaining_pending_sell_count")
+    if remaining_pending != 0 or remaining_pending != state.pending_sell_count:
+        raise LedgerValidationError("final_evaluation requires zero remaining pending sells")
+    remaining_settlements = _validate_count(
+        data["remaining_pending_settlement_count"], "remaining_pending_settlement_count"
+    )
+    if remaining_settlements != 0 or remaining_settlements != state.pending_settlement_count:
+        raise LedgerValidationError("final_evaluation requires zero remaining pending settlements")
+    if data["unwind_completion_book_state_root_sha256"] != state.portfolio_sha256:
+        raise LedgerValidationError("final_evaluation all-book completion root differs from ledger state")
+    if data["unwind_completion_pending_sells_root_sha256"] != state.pending_sells_sha256:
+        raise LedgerValidationError("final_evaluation pending completion root differs from ledger state")
+    if data["unwind_completion_pending_settlements_root_sha256"] != state.pending_settlements_sha256:
+        raise LedgerValidationError("final_evaluation pending-settlement completion root differs from ledger state")
+    expected_unwind_evidence = _object_sha256(
+        {
+            "decision_unwind_evidence_root_sha256": state.unwind_evidence_root_sha256,
+            "completion_book_state_root_sha256": state.portfolio_sha256,
+            "completion_pending_sells_root_sha256": state.pending_sells_sha256,
+            "remaining_position_count": state.position_count,
+            "remaining_pending_sell_count": state.pending_sell_count,
+            "remaining_pending_settlement_count": state.pending_settlement_count,
+            "completion_pending_settlements_root_sha256": state.pending_settlements_sha256,
+            "unwind_session_count": state.unwind_session_count,
+            "post_window_unwind_cost_cny": float(cost),
+        }
+    )
+    if data["unwind_evidence_sha256"] != expected_unwind_evidence:
+        raise LedgerValidationError("final_evaluation unwind evidence is not derived from ledger execution state")
+    if state.last_eod_record is None:
+        raise LedgerValidationError("final_evaluation requires a completed post-window unwind EOD")
+    earliest = state.last_eod_record.recorded_at_utc
+    _validate_snapshot(
+        data["snapshot_cutoff_utc"],
+        "final_evaluation.snapshot_cutoff_utc",
+        earliest=earliest,
+        recorded_at=record.recorded_at_utc,
+    )
+    state.final_evaluation = record
+    state.phase = "FINALIZED"
+
+
 def _validate_genesis_record(
     record: LedgerRecord,
     *,
     receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None = None,
 ) -> _ReplayState:
     if record.sequence != 0 or record.record_type != "genesis" or record.data["previous_record_hash"] != ZERO_HASH:
         raise LedgerValidationError("sequence 000000 must be the zero-linked genesis record")
@@ -1300,7 +2181,12 @@ def _validate_genesis_record(
             "primary_chain_id",
             "genesis_commitment_sha256",
             "anchor_verifier_identity",
+            "registry_verifier_identity",
+            "primary_registry_claim_commitment_sha256",
+            "primary_registry_external_anchor",
+            "primary_registry_external_anchor_receipt_sha256",
             "external_anchor",
+            "external_anchor_receipt_sha256",
         },
         "genesis payload",
     )
@@ -1314,11 +2200,64 @@ def _validate_genesis_record(
     if identity["algorithm"] != ANCHOR_ALGORITHM:
         raise LedgerValidationError("genesis anchor algorithm is unsupported")
     _require_sha256(identity["public_key_sha256"], "anchor_verifier_identity.public_key_sha256")
-    core = {
-        "schema": "xs_chan_v2_1_genesis_commitment_v1",
+    registry_identity = _exact_mapping(
+        payload["registry_verifier_identity"], _ANCHOR_IDENTITY_KEYS, "registry_verifier_identity"
+    )
+    if registry_identity["algorithm"] != ANCHOR_ALGORITHM:
+        raise LedgerValidationError("Genesis registry anchor algorithm is unsupported")
+    _require_sha256(registry_identity["public_key_sha256"], "registry_verifier_identity.public_key_sha256")
+    if _object_sha256(registry_identity) != config["trial_registry_authority_sha256"]:
+        raise ReceiptVerificationError("Genesis registry identity differs from the frozen registry authority")
+    genesis_core = {
+        "schema": "xs_chan_v2_1_genesis_core_v1",
         "config": config,
         "primary_chain_id": chain_id,
         "anchor_verifier_identity": identity,
+    }
+    registry_claim_core = {
+        "schema": REGISTRY_CLAIM_SCHEMA,
+        "registry_operation": "ATOMIC_REGISTER_PRIMARY_IF_ABSENT",
+        "claim_result": "REGISTERED_AS_FIRST_PRIMARY",
+        "uniqueness_scope_sha256": _object_sha256(
+            {
+                "trial_registry_namespace": config["trial_registry_namespace"],
+                "trial_id": config["trial_id"],
+                "chain_role": "PRIMARY",
+            }
+        ),
+        "trial_registry_namespace": config["trial_registry_namespace"],
+        "trial_registry_authority_sha256": config["trial_registry_authority_sha256"],
+        "protocol_id": config["protocol_id"],
+        "protocol_sha256": config["protocol_sha256"],
+        "trial_id": config["trial_id"],
+        "chain_role": "PRIMARY",
+        "primary_chain_id": chain_id,
+        "genesis_core_sha256": _sha256_bytes(_canonical_bytes(genesis_core)),
+        "registry_verifier_identity": registry_identity,
+    }
+    registry_claim_commitment = _sha256_bytes(_canonical_bytes(registry_claim_core))
+    if payload["primary_registry_claim_commitment_sha256"] != registry_claim_commitment:
+        raise LedgerValidationError("Genesis primary registry claim commitment mismatch")
+    registry_receipt = _validate_receipt_shape(payload["primary_registry_external_anchor"])
+    if (
+        registry_receipt["provider"] != registry_identity["provider"]
+        or registry_receipt["key_id"] != registry_identity["key_id"]
+    ):
+        raise ReceiptVerificationError("primary registry receipt signer differs from its authority identity")
+    if registry_receipt["subject_sha256"] != registry_claim_commitment:
+        raise ReceiptVerificationError("primary registry receipt subject differs from its immutable claim")
+    registry_receipt_sha256 = _sha256_bytes(_canonical_bytes(registry_receipt))
+    if payload["primary_registry_external_anchor_receipt_sha256"] != registry_receipt_sha256:
+        raise ReceiptVerificationError("primary registry receipt digest mismatch")
+    core = {
+        "schema": "xs_chan_v2_1_genesis_commitment_v2",
+        "config": config,
+        "primary_chain_id": chain_id,
+        "anchor_verifier_identity": identity,
+        "registry_verifier_identity": registry_identity,
+        "primary_registry_claim_commitment_sha256": registry_claim_commitment,
+        "primary_registry_external_anchor": registry_receipt,
+        "primary_registry_external_anchor_receipt_sha256": registry_receipt_sha256,
     }
     commitment = _sha256_bytes(_canonical_bytes(core))
     if payload["genesis_commitment_sha256"] != commitment:
@@ -1328,29 +2267,82 @@ def _validate_genesis_record(
     if record.recorded_at_utc >= start_boundary:
         raise LedgerTimingError("genesis must be recorded before oos_start_date begins")
     receipt = _validate_receipt_shape(payload["external_anchor"])
+    receipt_sha256 = _sha256_bytes(_canonical_bytes(receipt))
+    if payload["external_anchor_receipt_sha256"] != receipt_sha256:
+        raise ReceiptVerificationError("genesis external anchor receipt digest mismatch")
     if receipt["provider"] != identity["provider"] or receipt["key_id"] != identity["key_id"]:
         raise ReceiptVerificationError("genesis receipt signer differs from its anchor identity")
     if receipt["subject_sha256"] != commitment:
         raise ReceiptVerificationError("genesis receipt subject differs from its commitment")
     claimed_issued_at = _canonical_utc(receipt["issued_at_utc"], "receipt.issued_at_utc")
-    if claimed_issued_at > record.recorded_at_utc or claimed_issued_at >= start_boundary:
+    registry_issued_at = _canonical_utc(registry_receipt["issued_at_utc"], "registry receipt.issued_at_utc")
+    segment = config["genesis_calendar_segment"]
+    published = _canonical_utc(segment["source_published_at_utc"], "genesis calendar published_at")
+    retrieved = _canonical_utc(segment["source_retrieved_at_utc"], "genesis calendar retrieved_at")
+    eligibility_cutoff = _canonical_utc(
+        config["formal_start_eligibility"]["eligibility_cutoff_utc"],
+        "formal-start eligibility cutoff",
+    )
+    if retrieved > record.recorded_at_utc:
+        raise LedgerTimingError("genesis calendar retrieval exceeds the Genesis record timestamp")
+    if record.recorded_at_utc < eligibility_cutoff:
+        raise LedgerTimingError("Genesis predates the formal-start eligibility cutoff")
+    if registry_issued_at < max(published, retrieved, eligibility_cutoff) or registry_issued_at >= start_boundary:
+        raise ReceiptVerificationError("primary registry receipt is outside the Genesis eligibility interval")
+    if (
+        claimed_issued_at < max(published, retrieved, eligibility_cutoff, registry_issued_at)
+        or claimed_issued_at > record.recorded_at_utc
+        or claimed_issued_at >= start_boundary
+    ):
         raise ReceiptVerificationError("genesis receipt is outside its registered append interval")
     receipts_verified = False
     if receipt_verifier is not None:
         if receipt_verifier.identity != identity:
             raise ReceiptVerificationError("provided verifier differs from the genesis trust root")
         verified = receipt_verifier.verify(receipt, expected_subject_sha256=commitment)
-        _verify_receipt_timing(verified, recorded_at_utc=record.recorded_at_utc, latest_utc=start_boundary)
+        _verify_receipt_timing(
+            verified,
+            recorded_at_utc=record.recorded_at_utc,
+            earliest_utc=max(published, retrieved, eligibility_cutoff, registry_issued_at),
+            latest_utc=start_boundary,
+        )
         receipts_verified = True
+    registry_receipt_verified = False
+    if registry_receipt_verifier is not None:
+        if registry_receipt_verifier.identity != registry_identity:
+            raise ReceiptVerificationError("provided registry verifier differs from the Genesis registry trust root")
+        registry_verified = registry_receipt_verifier.verify(
+            registry_receipt,
+            expected_subject_sha256=registry_claim_commitment,
+        )
+        _verify_receipt_timing(
+            registry_verified,
+            recorded_at_utc=record.recorded_at_utc,
+            earliest_utc=max(published, retrieved, eligibility_cutoff),
+            latest_utc=start_boundary,
+        )
+        registry_receipt_verified = True
+    segment_commitment = calendar_segment_commitment_sha256(chain_id, segment)
+    segment_entry = {
+        "segment_index": 0,
+        "segment": segment,
+        "commitment_sha256": segment_commitment,
+        "record_hash": record.record_hash,
+        "record_sequence": record.sequence,
+    }
     return _ReplayState(
         records=[record],
         genesis=record,
         config=config,
         anchor_identity=identity,
         receipts_verified=receipts_verified,
-        portfolio_sha256=config["initial_portfolio_state_sha256"],
-        pending_sells_sha256=_object_sha256({}),
+        registry_receipt_verified=registry_receipt_verified,
+        segments=[segment_entry],
+        sessions=[_normalise_date(item, "genesis calendar session") for item in segment["sessions"]],
+        portfolio_sha256=config["initial_state_root_sha256"],
+        pending_sells_sha256=canonical_initial_pending_sells_root_sha256(),
         pending_sell_count=0,
+        data_chain_head_sha256=config["genesis_data_chain_head_sha256"],
     )
 
 
@@ -1401,14 +2393,19 @@ def _validate_chain(
     root: Path,
     *,
     receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None = None,
 ) -> _ReplayState:
     records = _scan_records(root)
-    state = _validate_genesis_record(records[0], receipt_verifier=receipt_verifier)
+    state = _validate_genesis_record(
+        records[0],
+        receipt_verifier=receipt_verifier,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
     for record in records[1:]:
         if state.terminal is not None:
             raise LedgerValidationError("no record may follow an ABORTED or FAILED terminal record")
-        if len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
-            raise LedgerValidationError("no record may follow the frozen 52-week structural window")
+        if state.final_evaluation is not None:
+            raise LedgerValidationError("no record may follow final_evaluation")
         expired = _deadline_failure(state, record.recorded_at_utc)
         if record.record_type != "chain_abort" and expired is not None:
             raise LedgerValidationError(f"chain irreversibly failed before this record: {expired}")
@@ -1432,14 +2429,12 @@ def _validate_chain(
             _apply_weekly_close(state, event_record)
         elif record.record_type == "chain_abort":
             _apply_terminal(state, event_record, expired)
+        elif record.record_type == "final_evaluation":
+            _apply_final_evaluation(state, event_record)
         else:
             raise LedgerValidationError(f"unsupported record_type: {record.record_type!r}")
         state.records.append(record)
     return state
-
-
-def _root_identity(root: Path) -> str:
-    return _sha256_bytes(_canonical_bytes({"resolved_ledger_root": str(root.resolve())}))
 
 
 def _claim_path(registry_root: Path, config: Mapping[str, Any]) -> Path:
@@ -1448,27 +2443,32 @@ def _claim_path(registry_root: Path, config: Mapping[str, Any]) -> Path:
     return registry_root / "primary" / f"{config['protocol_sha256']}.json"
 
 
-def _build_registry_claim(
-    root: Path, genesis: Mapping[str, Any], config: Mapping[str, Any]
-) -> tuple[dict[str, Any], bytes]:
-    body = {
-        "schema": REGISTRY_CLAIM_SCHEMA,
-        "trial_registry_namespace": config["trial_registry_namespace"],
-        "trial_registry_authority_sha256": config["trial_registry_authority_sha256"],
+def _build_registry_claim(genesis: Mapping[str, Any], config: Mapping[str, Any]) -> tuple[dict[str, Any], bytes]:
+    payload = genesis["payload"]
+    document = {
+        "schema": REGISTRY_DOCUMENT_SCHEMA,
         "protocol_id": config["protocol_id"],
         "protocol_sha256": config["protocol_sha256"],
         "trial_id": config["trial_id"],
-        "chain_role": "PRIMARY",
-        "primary_chain_id": genesis["payload"]["primary_chain_id"],
-        "ledger_root_identity_sha256": _root_identity(root),
-        "genesis_commitment_sha256": genesis["payload"]["genesis_commitment_sha256"],
-        "genesis_record_sha256": genesis["record_hash"],
+        "primary_chain_id": payload["primary_chain_id"],
+        "primary_registry_claim_commitment_sha256": payload["primary_registry_claim_commitment_sha256"],
+        "registry_verifier_identity": payload["registry_verifier_identity"],
+        "primary_registry_external_anchor": payload["primary_registry_external_anchor"],
+        "primary_registry_external_anchor_receipt_sha256": payload["primary_registry_external_anchor_receipt_sha256"],
     }
-    claim = {**body, "claim_sha256": _sha256_bytes(_canonical_bytes(body))}
-    return claim, _canonical_bytes(claim)
+    return document, _canonical_bytes(document)
 
 
-def _validate_registry_claim(registry_root: Path, root: Path, state: _ReplayState) -> None:
+def _validate_registry_claim(
+    registry_root: Path,
+    root: Path,
+    state: _ReplayState,
+    *,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None,
+) -> None:
+    del root  # The external primary identity is portable and cannot depend on a local path.
+    if not isinstance(registry_receipt_verifier, RsaPkcs1v15Sha256ReceiptVerifier):
+        raise ReceiptVerificationError("external registry authority verifier is required")
     path = _claim_path(registry_root, state.config)
     if not path.is_file():
         raise LedgerValidationError("primary-chain registry claim is missing")
@@ -1477,31 +2477,144 @@ def _validate_registry_claim(registry_root: Path, root: Path, state: _ReplayStat
         claim = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LedgerValidationError("primary-chain registry claim is invalid JSON") from exc
-    expected, expected_raw = _build_registry_claim(root, state.genesis.data, state.config)
+    expected, expected_raw = _build_registry_claim(state.genesis.data, state.config)
     if raw != expected_raw or claim != expected:
-        raise LedgerValidationError("primary-chain registry claim differs from genesis or ledger root")
+        raise LedgerValidationError("local primary-chain registry mirror differs from Genesis")
+    identity = state.genesis.data["payload"]["registry_verifier_identity"]
+    if registry_receipt_verifier.identity != identity:
+        raise ReceiptVerificationError("registry verifier differs from the Genesis authority identity")
+    verified = registry_receipt_verifier.verify(
+        expected["primary_registry_external_anchor"],
+        expected_subject_sha256=expected["primary_registry_claim_commitment_sha256"],
+    )
+    if verified.receipt_sha256 != expected["primary_registry_external_anchor_receipt_sha256"]:
+        raise ReceiptVerificationError("registry receipt digest differs from the local immutable mirror")
+    if verified.issued_at_utc > state.genesis.recorded_at_utc:
+        raise ReceiptVerificationError("registry receipt was issued after Genesis")
+
+
+def _verify_pre_candidate_readiness(
+    config: Mapping[str, Any],
+    *,
+    readiness_report: Mapping[str, Any],
+    readiness_external_anchor: Mapping[str, Any],
+    receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+) -> VerifiedReceipt:
+    """Reject an unanchored or post-candidate readiness claim before Genesis."""
+
+    report = _exact_mapping(
+        readiness_report,
+        _READINESS_COMMITMENT_KEYS,
+        "pre-candidate readiness commitment",
+    )
+    if report["schema"] != READINESS_COMMITMENT_SCHEMA:
+        raise LedgerValidationError("pre-candidate readiness commitment has the wrong schema")
+    expected = {
+        "protocol_id": config["protocol_id"],
+        "protocol_sha256": config["protocol_sha256"],
+        "trial_id": config["trial_id"],
+        "data_contract_identity_sha256": config["data_contract_identity_sha256"],
+        "dependency_sha256": config["dependency_sha256"],
+        "engineering_gates": config["readiness_gates"],
+    }
+    for key, value in expected.items():
+        if _canonical_bytes(report[key]) != _canonical_bytes(value):
+            raise LedgerValidationError(f"pre-candidate readiness {key} differs from Genesis")
+    report_sha = _require_sha256(report["report_sha256"], "readiness report_sha256")
+    body = dict(report)
+    body.pop("report_sha256")
+    if report_sha != _object_sha256(body):
+        raise LedgerValidationError("pre-candidate readiness self-digest differs")
+    if report_sha != config["readiness_report_sha256"]:
+        raise LedgerValidationError("pre-candidate readiness report differs from Genesis")
+    eligibility = config["formal_start_eligibility"]
+    if report_sha != eligibility["readiness_report_sha256"]:
+        raise LedgerValidationError("formal-start evidence names a different readiness report")
+    verified = receipt_verifier.verify(
+        readiness_external_anchor,
+        expected_subject_sha256=report_sha,
+    )
+    if verified.receipt_sha256 != eligibility["readiness_anchor_receipt_sha256"]:
+        raise ReceiptVerificationError("formal-start evidence names a different readiness receipt")
+    created = _canonical_utc(report["created_at_utc"], "readiness.created_at_utc")
+    completed = _canonical_utc(
+        eligibility["readiness_completed_at_utc"],
+        "formal-start readiness_completed_at_utc",
+    )
+    cutoff = _canonical_utc(
+        eligibility["eligibility_cutoff_utc"],
+        "formal-start eligibility_cutoff_utc",
+    )
+    if not created <= verified.issued_at_utc == completed < cutoff:
+        raise LedgerTimingError("pre-candidate readiness timestamps violate creation <= anchor == completion < cutoff")
+    return verified
 
 
 def init_ledger(
     root: str | Path,
     *,
     genesis_config: Mapping[str, Any],
+    readiness_report: Mapping[str, Any],
+    readiness_external_anchor: Mapping[str, Any],
     trial_registry_root: str | Path,
+    registry_external_anchor: Mapping[str, Any],
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
     external_anchor: Mapping[str, Any],
     receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
 ) -> Path:
     """Create the one externally anchored primary chain for this protocol."""
     if not isinstance(receipt_verifier, RsaPkcs1v15Sha256ReceiptVerifier):
         raise ReceiptVerificationError("init_ledger requires a concrete RSA receipt verifier")
+    if not isinstance(registry_receipt_verifier, RsaPkcs1v15Sha256ReceiptVerifier):
+        raise ReceiptVerificationError("init_ledger requires an external registry authority verifier")
     root_path = Path(root)
     registry_root = Path(trial_registry_root)
     config = _validate_genesis_config(genesis_config)
-    commitment = genesis_commitment_sha256(config, receipt_verifier=receipt_verifier)
+    _verify_pre_candidate_readiness(
+        config,
+        readiness_report=readiness_report,
+        readiness_external_anchor=readiness_external_anchor,
+        receipt_verifier=receipt_verifier,
+    )
+    registry_claim_commitment = primary_registry_claim_commitment_sha256(
+        config,
+        receipt_verifier=receipt_verifier,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
+    verified_registry = registry_receipt_verifier.verify(
+        registry_external_anchor,
+        expected_subject_sha256=registry_claim_commitment,
+    )
+    commitment = genesis_commitment_sha256(
+        config,
+        receipt_verifier=receipt_verifier,
+        registry_external_anchor=registry_external_anchor,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
     recorded_at = _normalise_utc(_utc_now(), "clock")
     verified = receipt_verifier.verify(external_anchor, expected_subject_sha256=commitment)
     start = _normalise_date(config["oos_start_date"], "oos_start_date")
     start_boundary = _local_boundary(start, "00:00:00", config["exchange_timezone"])
-    _verify_receipt_timing(verified, recorded_at_utc=recorded_at, latest_utc=start_boundary)
+    retrieved = _canonical_utc(
+        config["genesis_calendar_segment"]["source_retrieved_at_utc"],
+        "genesis calendar retrieved_at",
+    )
+    eligibility_cutoff = _canonical_utc(
+        config["formal_start_eligibility"]["eligibility_cutoff_utc"],
+        "formal-start eligibility cutoff",
+    )
+    _verify_receipt_timing(
+        verified_registry,
+        recorded_at_utc=recorded_at,
+        earliest_utc=max(retrieved, eligibility_cutoff),
+        latest_utc=start_boundary,
+    )
+    _verify_receipt_timing(
+        verified,
+        recorded_at_utc=recorded_at,
+        earliest_utc=max(retrieved, eligibility_cutoff, verified_registry.issued_at_utc),
+        latest_utc=start_boundary,
+    )
     if recorded_at >= start_boundary:
         raise LedgerTimingError("genesis must be recorded before oos_start_date begins")
     payload = {
@@ -1510,11 +2623,16 @@ def init_ledger(
         "primary_chain_id": _primary_chain_id(config),
         "genesis_commitment_sha256": commitment,
         "anchor_verifier_identity": receipt_verifier.identity,
+        "registry_verifier_identity": registry_receipt_verifier.identity,
+        "primary_registry_claim_commitment_sha256": registry_claim_commitment,
+        "primary_registry_external_anchor": dict(registry_external_anchor),
+        "primary_registry_external_anchor_receipt_sha256": verified_registry.receipt_sha256,
         "external_anchor": dict(external_anchor),
+        "external_anchor_receipt_sha256": verified.receipt_sha256,
     }
     record, raw = _build_record(0, "genesis", recorded_at, ZERO_HASH, payload)
     path = _record_path(root_path, 0, record["record_hash"])
-    claim, claim_raw = _build_registry_claim(root_path, record, config)
+    _, claim_raw = _build_registry_claim(record, config)
     claim_path = _claim_path(registry_root, config)
     claim_path.parent.mkdir(parents=True, exist_ok=True)
     with (
@@ -1524,9 +2642,18 @@ def init_ledger(
         json_files = list(root_path.glob("*.json"))
         if claim_path.exists() or json_files:
             if claim_path.is_file() and len(json_files) == 1:
-                existing = _validate_chain(root_path, receipt_verifier=receipt_verifier)
-                _validate_registry_claim(registry_root, root_path, existing)
-                if existing.genesis.raw == raw and claim_path.read_bytes() == claim_raw:
+                existing = _validate_chain(
+                    root_path,
+                    receipt_verifier=receipt_verifier,
+                    registry_receipt_verifier=registry_receipt_verifier,
+                )
+                _validate_registry_claim(
+                    registry_root,
+                    root_path,
+                    existing,
+                    registry_receipt_verifier=registry_receipt_verifier,
+                )
+                if existing.genesis.data["payload"] == payload and claim_path.read_bytes() == claim_raw:
                     return existing.genesis.path
             raise LedgerConflictError("protocol already has a primary chain or ledger root is initialized")
         _exclusive_write(claim_path, claim_raw)
@@ -1554,8 +2681,8 @@ def _append_record(
         state = _validate_chain(root, receipt_verifier=receipt_verifier)
         if state.terminal is not None:
             raise LedgerValidationError("chain is terminal and cannot be extended")
-        if len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
-            raise LedgerValidationError("the frozen 52-week window is complete and cannot be extended")
+        if state.final_evaluation is not None:
+            raise LedgerValidationError("chain has a final evaluation and cannot be extended")
         expired = _deadline_failure(state, recorded_at)
         if record_type != "chain_abort" and expired is not None:
             raise LedgerValidationError(f"chain is irreversibly failed: {expired}")
@@ -1650,6 +2777,13 @@ def prepare_calendar_extension(root: str | Path, *, segment: Mapping[str, Any]) 
     root_path = Path(root)
     state = _validate_chain(root_path, receipt_verifier=None)
     segment_value = _validate_segment(segment)
+    if segment_value["segment_index"] != len(state.segments):
+        raise LedgerValidationError("calendar extension index is not the next contiguous index")
+    if segment_value["previous_calendar_head_sha256"] != _calendar_state_sha256(state.segments):
+        raise LedgerValidationError("calendar extension previous head differs from the current calendar head")
+    previous_end = _normalise_date(state.segments[-1]["segment"]["coverage_end"], "coverage_end")
+    if _normalise_date(segment_value["coverage_start"], "coverage_start") != previous_end + timedelta(days=1):
+        raise LedgerValidationError("calendar coverage segments must be contiguous without overlap or gaps")
     event = {
         "segment_index": segment_value["segment_index"],
         "segment": segment_value,
@@ -1660,12 +2794,54 @@ def prepare_calendar_extension(root: str | Path, *, segment: Mapping[str, Any]) 
 
 def _event_payload(root: Path, week_id: str, kind: str, data: Mapping[str, Any]) -> dict[str, Any]:
     state = _validate_chain(root, receipt_verifier=None)
+    if len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
+        if week_id != UNWIND_WEEK_ID:
+            raise LedgerValidationError("post-window records must use the frozen unwind identity")
+        origin_hash = state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["weekly_close_record_sha256"]
+        if kind == "decision":
+            session = _next_unwind_session(state)
+            if session is None:
+                raise LedgerValidationError("no covered post-window session is available")
+            return {
+                "week_id": UNWIND_WEEK_ID,
+                "decision_kind": "POST_WINDOW_UNWIND",
+                "decision_dt": state.completed_weeks[MIN_COMPLETE_WEEKS - 1]["close_dt"],
+                "execution_dt": session.isoformat(),
+                "data": dict(data),
+            }
+        if state.decision_record is None or state.phase not in {
+            "UNWIND_DECIDED",
+            "UNWIND_AWAIT_SESSION_OPEN",
+            "UNWIND_OPENED",
+        }:
+            raise LedgerValidationError("post-window open/EOD requires the frozen unwind decision")
+        origin_hash = state.decision_record.record_hash
+        if kind == "session_open_execution":
+            session = _next_unwind_session(state)
+            if session is None:
+                raise LedgerValidationError("no covered post-window session is available")
+            return {
+                "week_id": UNWIND_WEEK_ID,
+                "session_dt": session.isoformat(),
+                "decision_hash": origin_hash,
+                "data": dict(data),
+            }
+        if kind == "session_eod_valuation":
+            if state.unwind_session is None:
+                raise LedgerValidationError("post-window EOD requires its same-session unwind open")
+            return {
+                "week_id": UNWIND_WEEK_ID,
+                "session_dt": state.unwind_session.isoformat(),
+                "data": dict(data),
+            }
+        raise LedgerValidationError("a new decision or cycle_close is forbidden after the 52nd cycle")
     week = state.active_week if state.active_week is not None else _expected_week(state)
     if week is None or not isinstance(week_id, str) or _WEEK_ID.fullmatch(week_id) is None or week.week_id != week_id:
         raise LedgerValidationError("week_id does not identify the currently expected week")
     if kind == "decision":
         return {
             "week_id": week.week_id,
+            "decision_kind": "CONFIRMATORY_CYCLE",
             "decision_dt": week.decision_dt.isoformat(),
             "execution_dt": week.execution_dt.isoformat(),
             "close_dt": week.close_dt.isoformat(),
@@ -1709,6 +2885,7 @@ def prepare_record_commitment(
         "session_eod_valuation",
         "cycle_close",
         "chain_abort",
+        "final_evaluation",
     }:
         raise LedgerValidationError(f"unsupported formal record_type: {record_type!r}")
     previous = state.records[-1].record_hash
@@ -1743,6 +2920,15 @@ def prepare_cycle_event(
         raise LedgerValidationError("record_type is not a cycle event")
     event = _event_payload(Path(root), week_id, record_type, data)
     return prepare_record_commitment(root, record_type=record_type, event_payload=event)
+
+
+def prepare_final_evaluation(root: str | Path, *, data: Mapping[str, Any]) -> dict[str, Any]:
+    """Prepare the one externally anchored final evaluation record."""
+    state = _validate_chain(Path(root), receipt_verifier=None)
+    if state.final_evaluation is not None or state.terminal is not None:
+        raise LedgerValidationError("chain is already terminal")
+    event = _exact_mapping(data, _FINAL_EVALUATION_KEYS, "final_evaluation payload")
+    return prepare_record_commitment(root, record_type="final_evaluation", event_payload=event)
 
 
 def append_decision(
@@ -1857,6 +3043,25 @@ def append_terminal(
     )
 
 
+def append_final_evaluation(
+    root: str | Path,
+    *,
+    data: Mapping[str, Any],
+    external_anchor: Mapping[str, Any],
+    receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier,
+) -> Path:
+    """Append the sole evaluation after the fixed window and real unwind complete."""
+    payload = _exact_mapping(data, _FINAL_EVALUATION_KEYS, "final_evaluation payload")
+    return _append_record(
+        Path(root),
+        record_type="final_evaluation",
+        payload=payload,
+        external_anchor=external_anchor,
+        receipt_verifier=receipt_verifier,
+        apply=lambda state, record, _: _apply_final_evaluation(state, record),
+    )
+
+
 def read_ledger_records(root: str | Path) -> tuple[dict[str, Any], ...]:
     """Return freshly decoded hash-verified records for a semantic replay engine."""
     return tuple(json.loads(record.raw) for record in _scan_records(Path(root)))
@@ -1872,12 +3077,23 @@ def _confirmation_window(state: _ReplayState) -> dict[str, Any] | None:
         "schema": CONFIRMATION_IDENTITY_SCHEMA,
         "primary_chain_id": _primary_chain_id(state.config),
         "protocol_sha256": state.config["protocol_sha256"],
+        "predecessor_protocol_sha256": state.config["predecessor_protocol_sha256"],
         "data_bundle_sha256": state.config["data_bundle_sha256"],
+        "data_contract_identity_sha256": state.config["data_contract_identity_sha256"],
+        "genesis_data_chain_head_sha256": state.config["genesis_data_chain_head_sha256"],
+        "genesis_data_validation_report_sha256": state.config["genesis_data_validation_report_sha256"],
+        "confirmation_data_chain_head_sha256": week_rows[-1]["data_chain_head_sha256"],
         "dependency_sha256": state.config["dependency_sha256"],
+        "readiness_report_sha256": state.config["readiness_report_sha256"],
         "readiness_gates": state.config["readiness_gates"],
+        "initial_state_root_sha256": state.config["initial_state_root_sha256"],
+        "rng_identity": state.config["rng_identity"],
+        "formal_start_eligibility": state.config["formal_start_eligibility"],
         "trial_id": state.config["trial_id"],
         "weeks": [{key: value for key, value in row.items() if key != "weekly_close_sequence"} for row in week_rows],
-        "calendar_segment_commitment_sha256": [item["commitment_sha256"] for item in state.segments],
+        "calendar_segment_commitment_sha256": [
+            item["commitment_sha256"] for item in state.segments if item["record_sequence"] <= head_sequence
+        ],
         "record_hashes_through_52nd_close": [record.record_hash for record in records],
         "confirmation_head_sha256": records[-1].record_hash,
     }
@@ -1889,49 +3105,145 @@ def verify_ledger(
     *,
     receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None = None,
     trial_registry_root: str | Path | None = None,
+    registry_receipt_verifier: RsaPkcs1v15Sha256ReceiptVerifier | None = None,
 ) -> dict[str, Any]:
     """Verify structure and receipts while remaining closed on semantic claims."""
     root_path = Path(root)
-    state = _validate_chain(root_path, receipt_verifier=receipt_verifier)
+    state = _validate_chain(
+        root_path,
+        receipt_verifier=receipt_verifier,
+        registry_receipt_verifier=registry_receipt_verifier,
+    )
     registry_verified = False
-    if trial_registry_root is not None:
-        _validate_registry_claim(Path(trial_registry_root), root_path, state)
+    if trial_registry_root is not None and registry_receipt_verifier is not None:
+        _validate_registry_claim(
+            Path(trial_registry_root),
+            root_path,
+            state,
+            registry_receipt_verifier=registry_receipt_verifier,
+        )
         registry_verified = True
     receipts_verified = receipt_verifier is not None and state.receipts_verified
     expired = None if state.terminal is not None else _deadline_failure(state, _normalise_utc(_utc_now(), "clock"))
-    if state.terminal is not None:
-        operational_status = state.terminal.data["payload"]["outcome"]
+    if state.terminal is not None or expired is not None:
+        lifecycle_status = "PRIMARY_CHAIN_TERMINATED_INVALID"
     elif len(state.completed_weeks) >= MIN_COMPLETE_WEEKS:
-        operational_status = "STRUCTURAL_WINDOW_COMPLETE"
-    elif expired is not None:
-        operational_status = "FAILED_BY_DEADLINE"
+        lifecycle_status = "PRIMARY_WINDOW_COMPLETE_PENDING_REPLAY"
     else:
-        operational_status = "ACTIVE"
+        lifecycle_status = "PRIMARY_FORWARD_COLLECTION_ACTIVE"
+    if lifecycle_status not in FORMAL_LIFECYCLE_STATES:
+        raise LedgerValidationError("derived lifecycle status is outside the formal registry")
     structural_window_complete = len(state.completed_weeks) >= MIN_COMPLETE_WEEKS
+    window = _confirmation_window(state)
+    event_window = _event_window(state)
+    genesis_payload = state.genesis.data["payload"]
+    final_payload = dict(state.final_evaluation.data["payload"]) if state.final_evaluation is not None else None
+    record_identities: list[dict[str, Any]] = []
+    for record in state.records:
+        if record.sequence == 0:
+            commitment_sha256 = genesis_payload["genesis_commitment_sha256"]
+            receipt_sha256 = genesis_payload["external_anchor_receipt_sha256"]
+        else:
+            wrapper = record.data["payload"]
+            commitment_sha256 = wrapper["record_commitment_sha256"]
+            receipt_sha256 = _sha256_bytes(_canonical_bytes(wrapper["external_anchor"]))
+        record_identities.append(
+            {
+                "sequence": record.sequence,
+                "record_type": record.record_type,
+                "recorded_at_utc": record.data["recorded_at_utc"],
+                "previous_record_hash": record.data["previous_record_hash"],
+                "record_hash": record.record_hash,
+                "record_commitment_sha256": commitment_sha256,
+                "external_anchor_receipt_sha256": receipt_sha256,
+            }
+        )
+    unwind_summary = {
+        "session_count": state.unwind_session_count,
+        "last_completed_session": state.unwind_next_session_after.isoformat()
+        if state.unwind_session_count and state.unwind_next_session_after is not None
+        else None,
+        "book_state_root_sha256": state.portfolio_sha256,
+        "pending_sells_root_sha256": state.pending_sells_sha256,
+        "remaining_pending_sell_count": state.pending_sell_count,
+        "pending_settlements_root_sha256": state.pending_settlements_sha256,
+        "remaining_pending_settlement_count": state.pending_settlement_count,
+        "execution_completed": state.phase in {"UNWIND_COMPLETE_PENDING_REPLAY", "FINALIZED"},
+        "completed": bool(final_payload and final_payload["post_window_unwind_completed"]),
+        "cost_cny": final_payload["post_window_unwind_cost_cny"] if final_payload else None,
+        "evidence_sha256": final_payload["unwind_evidence_sha256"] if final_payload else None,
+    }
     return {
-        "valid": receipts_verified and registry_verified,
+        "valid": receipts_verified and registry_verified and lifecycle_status != "PRIMARY_CHAIN_TERMINATED_INVALID",
         "structurally_valid": True,
         "schema_version": SCHEMA_VERSION,
         "protocol_id": state.config["protocol_id"],
         "protocol_sha256": state.config["protocol_sha256"],
+        "predecessor_protocol_sha256": state.config["predecessor_protocol_sha256"],
         "data_bundle_sha256": state.config["data_bundle_sha256"],
+        "data_contract_identity_sha256": state.config["data_contract_identity_sha256"],
+        "genesis_data_chain_head_sha256": state.config["genesis_data_chain_head_sha256"],
+        "current_data_chain_head_sha256": state.data_chain_head_sha256,
+        "genesis_config": state.config,
+        "genesis_config_sha256": _sha256_bytes(_canonical_bytes(state.config)),
+        "dependency_sha256": state.config["dependency_sha256"],
+        "dependency_closure_sha256": _object_sha256(state.config["dependency_sha256"]),
+        "readiness_report_sha256": state.config["readiness_report_sha256"],
+        "readiness_gates": state.config["readiness_gates"],
+        "readiness_gate_evidence_root_sha256": _object_sha256(state.config["readiness_gates"]),
+        "initial_state_sha256_by_book_scenario": state.config["initial_state_sha256_by_book_scenario"],
+        "initial_state_root_sha256": state.config["initial_state_root_sha256"],
+        "rng_identity": state.config["rng_identity"],
+        "formal_start_eligibility": state.config["formal_start_eligibility"],
+        "genesis_calendar_head_sha256": state.config["genesis_calendar_head_sha256"],
+        "genesis_record_sha256": state.genesis.record_hash,
+        "genesis_commitment_sha256": genesis_payload["genesis_commitment_sha256"],
+        "genesis_external_anchor_receipt_sha256": genesis_payload["external_anchor_receipt_sha256"],
+        "primary_registry_claim_commitment_sha256": genesis_payload["primary_registry_claim_commitment_sha256"],
+        "primary_registry_external_anchor_receipt_sha256": genesis_payload[
+            "primary_registry_external_anchor_receipt_sha256"
+        ],
+        "anchor_verifier_identity": genesis_payload["anchor_verifier_identity"],
+        "registry_verifier_identity": genesis_payload["registry_verifier_identity"],
         "primary_chain_id": _primary_chain_id(state.config),
         "trial_id": state.config["trial_id"],
         "record_count": len(state.records),
+        "record_identities": record_identities,
         "calendar_segment_count": len(state.segments),
+        "calendar_segment_identities": [
+            {
+                "segment_index": item["segment_index"],
+                "commitment_sha256": item["commitment_sha256"],
+                "previous_calendar_head_sha256": item["segment"]["previous_calendar_head_sha256"],
+                "new_calendar_head_sha256": item["segment"]["new_calendar_head_sha256"],
+                "source_sha256": item["segment"]["source_sha256"],
+                "record_hash": item["record_hash"],
+            }
+            for item in state.segments
+        ],
         "calendar_state_sha256": _calendar_state_sha256(state.segments),
+        "calendar_source_semantics_verified": False,
         "completed_weeks": len(state.completed_weeks),
         "min_complete_weeks": MIN_COMPLETE_WEEKS,
-        "operational_status": operational_status,
+        "lifecycle_status": lifecycle_status,
+        "declared_lifecycle_status": "EVALUATED" if state.final_evaluation is not None else lifecycle_status,
+        "operational_status": lifecycle_status,
         "deadline_failure": expired,
         "external_receipts_verified": receipts_verified,
         "primary_registry_verified": registry_verified,
         "structural_window_complete": structural_window_complete,
         "semantic_replay_verified": False,
+        "final_evaluation_recorded": state.final_evaluation is not None,
+        "final_evaluation_verified": False,
         "confirmatory_oos": False,
-        "next_required_event": _event_window(state)[0] if _event_window(state) is not None else None,
+        "next_required_event": event_window[0] if event_window is not None else None,
         "chain_head_sha256": state.records[-1].record_hash,
-        "confirmation_window": _confirmation_window(state),
+        "confirmation_head_sha256": window["confirmation_head_sha256"] if window is not None else None,
+        "confirmation_window": window,
+        "book_state_root_sha256": state.portfolio_sha256,
+        "pending_sells_root_sha256": state.pending_sells_sha256,
+        "unwind_summary": unwind_summary,
+        "final_evaluation": final_payload,
     }
 
 
@@ -1961,7 +3273,11 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("root", type=Path)
     init.add_argument("--config", type=Path, required=True)
+    init.add_argument("--readiness-report", type=Path, required=True)
+    init.add_argument("--readiness-external-anchor", type=Path, required=True)
     init.add_argument("--trial-registry", type=Path, required=True)
+    init.add_argument("--registry-external-anchor", type=Path, required=True)
+    init.add_argument("--registry-public-key", type=Path, required=True)
     init.add_argument("--external-anchor", type=Path, required=True)
     init.add_argument("--anchor-public-key", type=Path, required=True)
 
@@ -1976,11 +3292,16 @@ def build_parser() -> argparse.ArgumentParser:
     terminal.add_argument("root", type=Path)
     terminal.add_argument("--payload", type=Path, required=True)
     terminal.add_argument("--anchor-public-key", type=Path, required=True)
+    final = append_types.add_parser("final-evaluation")
+    final.add_argument("root", type=Path)
+    final.add_argument("--payload", type=Path, required=True)
+    final.add_argument("--anchor-public-key", type=Path, required=True)
 
     verify = commands.add_parser("verify")
     verify.add_argument("root", type=Path)
     verify.add_argument("--trial-registry", type=Path)
     verify.add_argument("--anchor-public-key", type=Path)
+    verify.add_argument("--registry-public-key", type=Path)
     return parser
 
 
@@ -1989,20 +3310,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
         verifier = _load_verifier(args.anchor_public_key)
+        registry_verifier = _load_verifier(args.registry_public_key)
         path = init_ledger(
             args.root,
             genesis_config=_load_json(args.config),
+            readiness_report=_load_json(args.readiness_report),
+            readiness_external_anchor=_load_json(args.readiness_external_anchor),
             trial_registry_root=args.trial_registry,
+            registry_external_anchor=_load_json(args.registry_external_anchor),
+            registry_receipt_verifier=registry_verifier,
             external_anchor=_load_json(args.external_anchor),
             receipt_verifier=verifier,
         )
         output = {"path": str(path), "record_hash": json.loads(path.read_bytes())["record_hash"]}
     elif args.command == "verify":
         verifier = _load_verifier(args.anchor_public_key) if args.anchor_public_key is not None else None
+        registry_verifier = _load_verifier(args.registry_public_key) if args.registry_public_key is not None else None
         output = verify_ledger(
             args.root,
             receipt_verifier=verifier,
             trial_registry_root=args.trial_registry,
+            registry_receipt_verifier=registry_verifier,
         )
     else:
         verifier = _load_verifier(args.anchor_public_key)
@@ -2021,6 +3349,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             external_anchor = value.pop("external_anchor")
             value["external_anchor"] = external_anchor
             path = append_terminal(args.root, receipt_verifier=verifier, **value)
+        elif args.append_type == "final-evaluation":
+            value = _exact_mapping(payload, {"data", "external_anchor"}, "final-evaluation CLI payload")
+            path = append_final_evaluation(
+                args.root,
+                data=value["data"],
+                external_anchor=value["external_anchor"],
+                receipt_verifier=verifier,
+            )
         else:
             value = _exact_mapping(payload, {"week_id", "data", "external_anchor"}, "event CLI payload")
             function = {

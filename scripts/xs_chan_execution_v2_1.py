@@ -28,11 +28,15 @@ EXECUTION_INPUT_SCHEMA = "xs_chan_execution_input_v2_1"
 EXECUTION_RESULT_SCHEMA = "xs_chan_execution_result_v2_1"
 SCENARIO_RESULT_SCHEMA = "xs_chan_execution_scenarios_v2_1"
 PORTFOLIO_STATE_SCHEMA = "xs_chan_portfolio_state_v2_1"
+PENDING_SETTLEMENT_SCHEMA = "xs_chan_pending_settlements_v2_1"
 
 DEFAULT_LOT_SIZE = 100
 TRADING_STATUSES = frozenset({"trading"})
 NON_TRADING_STATUSES = frozenset({"suspended", "delisted", "not_listed"})
 TERMINAL_ACTION_TYPES = frozenset({"delist_cash", "delist_share", "delist_writeoff"})
+SINGLE_ARM_IDS = frozenset({"F", "FC", "FMA"})
+SEEDED_ARM_IDS = frozenset({"R_match", "FGR", "FMGR"})
+FROZEN_RANDOM_SEEDS = frozenset(range(20260720, 20260740))
 
 
 class ExecutionReplayError(ValueError):
@@ -165,18 +169,138 @@ class PositionV21:
 
 
 @dataclass
+class CashEntitlementLotV21:
+    """Record-date lot snapshot for a later cash-entitlement confirmation."""
+
+    parent_lot_id: str
+    acquisition_settlement_session: str
+    record_shares: int
+    record_cost_basis_cny: float
+    record_deferred_dividend_gross_cny: float
+    gross_cash_cny: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "parent_lot_id": self.parent_lot_id,
+            "acquisition_settlement_session": self.acquisition_settlement_session,
+            "record_shares": int(self.record_shares),
+            "record_cost_basis_cny": float(self.record_cost_basis_cny),
+            "record_deferred_dividend_gross_cny": float(self.record_deferred_dividend_gross_cny),
+            "gross_cash_cny": float(self.gross_cash_cny),
+        }
+
+
+@dataclass
 class CashReceivableV21:
     action_id: str
     symbol: str
+    action_type: str
+    record_session: str
+    effective_session: str
     payment_session: str
     gross_cash_cny: float
+    status: str
+    lots: list[CashEntitlementLotV21]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "symbol": self.symbol,
+            "action_type": self.action_type,
+            "record_session": self.record_session,
+            "effective_session": self.effective_session,
             "payment_session": self.payment_session,
             "gross_cash_cny": float(self.gross_cash_cny),
+            "status": self.status,
+            "lots": [lot.as_dict() for lot in self.lots],
+        }
+
+
+@dataclass
+class ShareEntitlementLotV21:
+    """Record-date lot snapshot used for a later official share credit."""
+
+    parent_lot_id: str
+    acquisition_settlement_session: str
+    pre_action_shares: int
+    pre_action_cost_basis_cny: float
+    pre_action_deferred_dividend_gross_cny: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "parent_lot_id": self.parent_lot_id,
+            "acquisition_settlement_session": self.acquisition_settlement_session,
+            "pre_action_shares": int(self.pre_action_shares),
+            "pre_action_cost_basis_cny": float(self.pre_action_cost_basis_cny),
+            "pre_action_deferred_dividend_gross_cny": float(self.pre_action_deferred_dividend_gross_cny),
+        }
+
+
+@dataclass
+class ShareEntitlementV21:
+    """A record-date entitlement waiting for its official registration date."""
+
+    action_id: str
+    symbol: str
+    record_session: str
+    registration_session: str
+    action_subtype: str
+    post_to_pre_ratio: float
+    fractional_cash_price: float
+    taxable_dividend_per_pre_action_share: float
+    source_row_sha256: str
+    lots: list[ShareEntitlementLotV21]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "symbol": self.symbol,
+            "record_session": self.record_session,
+            "registration_session": self.registration_session,
+            "action_subtype": self.action_subtype,
+            "post_to_pre_ratio": float(self.post_to_pre_ratio),
+            "fractional_cash_price": float(self.fractional_cash_price),
+            "taxable_dividend_per_pre_action_share": float(self.taxable_dividend_per_pre_action_share),
+            "source_row_sha256": self.source_row_sha256,
+            "lots": [lot.as_dict() for lot in self.lots],
+        }
+
+
+@dataclass
+class TerminalConsiderationV21:
+    """Official terminal consideration waiting for its disposal settlement date."""
+
+    action_id: str
+    source_symbol: str
+    settlement_session: str
+    cash_cny: float
+    target_symbol: str | None
+    target_shares: int
+    target_cost_basis_cny: float
+    deferred_dividend_tax_cny: float
+    pending_sell_originating_decision_session: str | None
+
+    def asset_dict(self) -> dict[str, Any]:
+        return {
+            "asset_type": "terminal_consideration",
+            "action_id": self.action_id,
+            "source_symbol": self.source_symbol,
+            "settlement_session": self.settlement_session,
+            "cash_cny": float(self.cash_cny),
+            "target_symbol": self.target_symbol,
+            "target_shares": int(self.target_shares),
+            "target_cost_basis_cny": float(self.target_cost_basis_cny),
+            "pending_sell_originating_decision_session": self.pending_sell_originating_decision_session,
+        }
+
+    def liability_dict(self) -> dict[str, Any] | None:
+        if self.deferred_dividend_tax_cny <= 0:
+            return None
+        return {
+            "liability_type": "terminal_deferred_dividend_tax",
+            "action_id": self.action_id,
+            "settlement_session": self.settlement_session,
+            "amount_cny": float(self.deferred_dividend_tax_cny),
         }
 
 
@@ -201,6 +325,9 @@ class PortfolioStateV21:
     pending_sells: dict[str, PendingSellV21] = field(default_factory=dict)
     last_close: dict[str, float] = field(default_factory=dict)
     cash_receivables: dict[str, CashReceivableV21] = field(default_factory=dict)
+    share_entitlements: dict[str, ShareEntitlementV21] = field(default_factory=dict)
+    terminal_considerations: dict[str, TerminalConsiderationV21] = field(default_factory=dict)
+    processed_action_ids: set[str] = field(default_factory=set)
     dividend_tax_liabilities: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -213,13 +340,72 @@ class PortfolioStateV21:
             "cash_receivables": {
                 action_id: self.cash_receivables[action_id].as_dict() for action_id in sorted(self.cash_receivables)
             },
+            "share_entitlements": {
+                action_id: self.share_entitlements[action_id].as_dict() for action_id in sorted(self.share_entitlements)
+            },
+            "processed_action_ids": sorted(self.processed_action_ids),
             "dividend_tax_liabilities": {
                 lot_id: float(self.dividend_tax_liabilities[lot_id]) for lot_id in sorted(self.dividend_tax_liabilities)
             },
-            "other_assets": [],
-            "other_liabilities": [],
+            "other_assets": [
+                self.terminal_considerations[action_id].asset_dict()
+                for action_id in sorted(self.terminal_considerations)
+            ],
+            "other_liabilities": [
+                liability
+                for action_id in sorted(self.terminal_considerations)
+                if (liability := self.terminal_considerations[action_id].liability_dict()) is not None
+            ],
             "borrowed_cash_cny": 0.0,
         }
+
+
+def pending_settlements_summary(state: PortfolioStateV21) -> dict[str, Any]:
+    """Return the complete canonical pending-settlement state.
+
+    Ordinary cash and positions are excluded.  The summary binds every
+    unsettled asset, share entitlement, terminal consideration, and lot-level
+    dividend-tax obligation that can survive after positions reach zero.
+    """
+
+    if not isinstance(state, PortfolioStateV21):
+        raise ExecutionReplayError("pending settlement summary requires a V2.1 portfolio state")
+    cash_receivables = {
+        action_id: state.cash_receivables[action_id].as_dict() for action_id in sorted(state.cash_receivables)
+    }
+    share_entitlements = {
+        action_id: state.share_entitlements[action_id].as_dict() for action_id in sorted(state.share_entitlements)
+    }
+    terminal_considerations = {
+        action_id: {
+            "action_id": consideration.action_id,
+            "source_symbol": consideration.source_symbol,
+            "settlement_session": consideration.settlement_session,
+            "cash_cny": float(consideration.cash_cny),
+            "target_symbol": consideration.target_symbol,
+            "target_shares": int(consideration.target_shares),
+            "target_cost_basis_cny": float(consideration.target_cost_basis_cny),
+            "deferred_dividend_tax_cny": float(consideration.deferred_dividend_tax_cny),
+            "pending_sell_originating_decision_session": (consideration.pending_sell_originating_decision_session),
+        }
+        for action_id, consideration in sorted(state.terminal_considerations.items())
+    }
+    dividend_tax_liabilities = {
+        lot_id: float(state.dividend_tax_liabilities[lot_id]) for lot_id in sorted(state.dividend_tax_liabilities)
+    }
+    return {
+        "schema": PENDING_SETTLEMENT_SCHEMA,
+        "cash_receivables": cash_receivables,
+        "share_entitlements": share_entitlements,
+        "terminal_considerations": terminal_considerations,
+        "dividend_tax_liabilities": dividend_tax_liabilities,
+        "pending_settlement_count": (
+            len(cash_receivables)
+            + len(share_entitlements)
+            + len(terminal_considerations)
+            + len(dividend_tax_liabilities)
+        ),
+    }
 
 
 def empty_portfolio(initial_capital_cny: float) -> PortfolioStateV21:
@@ -263,6 +449,8 @@ def _normalise_open_rows(rows: Any, session: str) -> dict[str, dict[str, Any]]:
             raw["open_auction_turnover_cny"], f"{session}.{symbol}.open_auction_turnover_cny", minimum=0.0
         )
         lot_size = _positive_int(raw["lot_size"], f"{session}.{symbol}.lot_size")
+        if lot_size != DEFAULT_LOT_SIZE:
+            raise ExecutionReplayError(f"V2.1 freezes board-lot size at {DEFAULT_LOT_SIZE} shares")
         _require_sha256(raw["source_row_sha256"], f"{session}.{symbol}.source_row_sha256")
         if status == "trading":
             if min(open_px, pre_close, limit_up, limit_down) <= 0:
@@ -342,6 +530,7 @@ def _normalise_decision(value: Any, execution_session: str) -> dict[str, Any] | 
         or any(not isinstance(symbol, str) or not symbol for symbol in new_entries)
         or len(new_entries) != len(set(new_entries))
         or any(symbol not in symbols for symbol in new_entries)
+        or new_entries != [symbol for symbol in symbols if symbol in set(new_entries)]
     ):
         raise ExecutionReplayError("decision.new_entry_symbols must be a unique ordered-symbol subset")
     opportunities = value["gate_eligible_new_entry_opportunities"]
@@ -404,12 +593,12 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
     for index, raw in enumerate(value):
         if not isinstance(raw, Mapping) or not common.issubset(raw):
             raise ExecutionReplayError(f"corporate_actions[{index}] for {session} is malformed")
-        if _session(raw["effective_session"], "corporate_action.effective_session") != session:
-            raise ExecutionReplayError("corporate action effective_session does not match enclosing session")
         action_type = str(raw["action_type"])
+        effective_session = _session(raw["effective_session"], "corporate_action.effective_session")
         expected = set(common)
         if action_type == "share_change":
             expected |= {
+                "record_session",
                 "post_to_pre_ratio",
                 "fractional_cash_price",
                 "action_subtype",
@@ -417,9 +606,9 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
                 "new_share_registration_session",
             }
         elif action_type == "cash_dividend":
-            expected |= {"gross_cash_per_share", "payment_session"}
+            expected |= {"record_session", "gross_cash_per_share", "payment_session"}
         elif action_type == "rights_issue":
-            expected |= {"official_disposal_proceeds_per_entitled_share", "payment_session"}
+            expected |= {"record_session", "official_disposal_proceeds_per_entitled_share", "payment_session"}
         elif action_type == "delist_cash":
             expected |= {"cash_per_share", "terminal_reason", "disposal_settlement_session"}
         elif action_type == "delist_share":
@@ -445,6 +634,16 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
         item["symbol"] = symbol
         item["action_id"] = action_id
         item["action_type"] = action_type
+        item["effective_session"] = effective_session
+        if action_type in {"share_change", "cash_dividend", "rights_issue"}:
+            record_session = _session(raw["record_session"], "corporate_action.record_session")
+            if record_session != session:
+                raise ExecutionReplayError("entitlement action record_session must match its enclosing session")
+            if effective_session < record_session:
+                raise ExecutionReplayError("corporate action effective_session cannot precede its record_session")
+            item["record_session"] = record_session
+        elif effective_session != session:
+            raise ExecutionReplayError("terminal action effective_session must match its enclosing session")
         if action_type == "share_change":
             multiplier = _finite_number(raw["post_to_pre_ratio"], "corporate_action.post_to_pre_ratio", minimum=0.0)
             fractional_cash = _finite_number(
@@ -467,8 +666,10 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
             registration_session = _session(
                 raw["new_share_registration_session"], "corporate_action.new_share_registration_session"
             )
-            if subtype in {"stock_dividend", "capital_reserve_conversion"} and registration_session != session:
-                raise ExecutionReplayError("additive share change must be applied on its official registration session")
+            if registration_session != effective_session:
+                raise ExecutionReplayError(
+                    "share-change registration session must equal its official effective session"
+                )
             item.update(
                 post_to_pre_ratio=multiplier,
                 fractional_cash_price=fractional_cash,
@@ -479,8 +680,8 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
         elif action_type == "cash_dividend":
             gross = _finite_number(raw["gross_cash_per_share"], "corporate_action.gross_cash_per_share", minimum=0.0)
             payment_session = _session(raw["payment_session"], "corporate_action.payment_session")
-            if payment_session <= session:
-                raise ExecutionReplayError("cash dividend payment_session must follow its entitlement date")
+            if payment_session < effective_session:
+                raise ExecutionReplayError("cash dividend payment_session cannot precede its effective session")
             item.update(gross_cash_per_share=gross, payment_session=payment_session)
         elif action_type == "rights_issue":
             proceeds = _finite_number(
@@ -489,8 +690,8 @@ def _normalise_actions(value: Any, session: str) -> list[dict[str, Any]]:
                 minimum=0.0,
             )
             payment_session = _session(raw["payment_session"], "corporate_action.payment_session")
-            if payment_session <= session:
-                raise ExecutionReplayError("rights proceeds payment must follow entitlement")
+            if payment_session < effective_session:
+                raise ExecutionReplayError("rights proceeds payment cannot precede the effective session")
             item.update(
                 official_disposal_proceeds_per_entitled_share=proceeds,
                 payment_session=payment_session,
@@ -692,6 +893,58 @@ def _remeasure_dividend_tax(state: PortfolioStateV21, session: str) -> float:
     return float(sum(liabilities.values()))
 
 
+def _confirm_due_receivables(state: PortfolioStateV21, session: str) -> list[dict[str, Any]]:
+    """Turn frozen record-date cash entitlements into assets on the official effective date."""
+
+    overdue = [
+        receivable.action_id
+        for receivable in state.cash_receivables.values()
+        if receivable.status == "frozen_entitlement" and receivable.effective_session < session
+    ]
+    if overdue:
+        raise ExecutionReplayError(f"cash entitlement missed its official effective session: {sorted(overdue)}")
+    events: list[dict[str, Any]] = []
+    for action_id in sorted(state.cash_receivables):
+        receivable = state.cash_receivables[action_id]
+        if receivable.status != "frozen_entitlement" or receivable.effective_session != session:
+            continue
+        if receivable.action_type == "cash_dividend" and receivable.lots:
+            position = state.positions.get(receivable.symbol)
+            if position is None:
+                raise ExecutionReplayError(
+                    "record-date cash-dividend lot disappeared before the official effective session"
+                )
+            current_by_id = {lot.lot_id: lot for lot in position.lots}
+            for recorded in receivable.lots:
+                current = current_by_id.get(recorded.parent_lot_id)
+                basis_tolerance = max(abs(recorded.record_cost_basis_cny), 1.0) * 1e-10
+                dividend_tolerance = max(abs(recorded.record_deferred_dividend_gross_cny), 1.0) * 1e-10
+                if (
+                    current is None
+                    or current.shares != recorded.record_shares
+                    or abs(current.cost_basis_cny - recorded.record_cost_basis_cny) > basis_tolerance
+                    or current.deferred_dividend_gross_cny + dividend_tolerance
+                    < recorded.record_deferred_dividend_gross_cny
+                ):
+                    raise ExecutionReplayError(
+                        "record-date cash-dividend lot changed before effective session; "
+                        "formal replay cannot infer intervening dividend-tax settlement"
+                    )
+                current.deferred_dividend_gross_cny += recorded.gross_cash_cny
+        receivable.status = "receivable"
+        events.append(
+            {
+                "event_type": "cash_receivable_confirmation",
+                "session": session,
+                "symbol": receivable.symbol,
+                "action_id": action_id,
+                "action_type": receivable.action_type,
+                "gross_cash_cny": receivable.gross_cash_cny,
+            }
+        )
+    return events
+
+
 def _settle_due_receivables(state: PortfolioStateV21, session: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     overdue = [
@@ -703,6 +956,8 @@ def _settle_due_receivables(state: PortfolioStateV21, session: str) -> list[dict
         receivable = state.cash_receivables[action_id]
         if receivable.payment_session != session:
             continue
+        if receivable.status != "receivable":
+            raise ExecutionReplayError("cash entitlement reached payment before official receivable confirmation")
         state.cash_cny += receivable.gross_cash_cny
         state.cash_receivables.pop(action_id)
         events.append(
@@ -751,15 +1006,197 @@ def _dispose_fifo_lots(position: PositionV21, shares: int, disposal_settlement_s
     return cost_basis, deferred_tax
 
 
+def _settle_due_share_entitlements(state: PortfolioStateV21, session: str) -> list[dict[str, Any]]:
+    """Apply record-date share entitlements only on the official registration session."""
+
+    overdue = [
+        action_id
+        for action_id, entitlement in state.share_entitlements.items()
+        if entitlement.registration_session < session
+    ]
+    if overdue:
+        raise ExecutionReplayError(f"share entitlement missed its official registration session: {sorted(overdue)}")
+    events: list[dict[str, Any]] = []
+    for action_id in sorted(state.share_entitlements):
+        entitlement = state.share_entitlements[action_id]
+        if entitlement.registration_session != session:
+            continue
+        position = state.positions.get(entitlement.symbol)
+        if position is None:
+            raise ExecutionReplayError("record-date share entitlement lost its source position before registration")
+        current_by_id = {lot.lot_id: lot for lot in position.lots}
+        recorded_ids = {lot.parent_lot_id for lot in entitlement.lots}
+        resulting_lots = [lot for lot in position.lots if lot.lot_id not in recorded_ids]
+        share_change = 0
+        cash_change = 0.0
+        additive = entitlement.action_subtype in {"stock_dividend", "capital_reserve_conversion"}
+        ratio = entitlement.post_to_pre_ratio
+        if additive and ratio < 1.0:
+            raise ExecutionReplayError("additive share-change ratio must be at least one")
+        for recorded in entitlement.lots:
+            current = current_by_id.get(recorded.parent_lot_id)
+            tolerance = max(abs(recorded.pre_action_cost_basis_cny), 1.0) * 1e-10
+            if (
+                current is None
+                or current.shares != recorded.pre_action_shares
+                or abs(current.cost_basis_cny - recorded.pre_action_cost_basis_cny) > tolerance
+                or abs(current.deferred_dividend_gross_cny - recorded.pre_action_deferred_dividend_gross_cny)
+                > tolerance
+            ):
+                raise ExecutionReplayError(
+                    "record-date share lot changed before registration; formal replay cannot infer entitlement netting"
+                )
+            pre_shares = recorded.pre_action_shares
+            exact_post_shares = pre_shares * ratio
+            exact_changed_shares = pre_shares * (ratio - 1.0) if additive else exact_post_shares
+            whole_changed_shares = math.floor(exact_changed_shares + 1e-12)
+            fractional = exact_changed_shares - whole_changed_shares
+            if not additive and whole_changed_shares <= 0:
+                raise ExecutionReplayError(
+                    "official share change eliminates an entire held lot without terminal action"
+                )
+            per_post_share_basis = recorded.pre_action_cost_basis_cny / exact_post_shares
+            removed_basis = fractional * per_post_share_basis
+            if fractional > 1e-12 and entitlement.fractional_cash_price <= 0:
+                raise ExecutionReplayError("fractional share requires official positive cash-in-lieu evidence")
+            cash_change += fractional * entitlement.fractional_cash_price
+            taxable_dividend = pre_shares * entitlement.taxable_dividend_per_pre_action_share
+            if additive:
+                resulting_lots.append(
+                    TaxLotV21(
+                        lot_id=recorded.parent_lot_id,
+                        acquisition_settlement_session=recorded.acquisition_settlement_session,
+                        shares=pre_shares,
+                        cost_basis_cny=pre_shares * per_post_share_basis,
+                        deferred_dividend_gross_cny=(
+                            recorded.pre_action_deferred_dividend_gross_cny + taxable_dividend
+                        ),
+                    )
+                )
+                if whole_changed_shares > 0:
+                    resulting_lots.append(
+                        TaxLotV21(
+                            lot_id=f"{recorded.parent_lot_id}:{action_id}",
+                            acquisition_settlement_session=entitlement.registration_session,
+                            shares=whole_changed_shares,
+                            cost_basis_cny=whole_changed_shares * per_post_share_basis,
+                            deferred_dividend_gross_cny=0.0,
+                        )
+                    )
+                share_change += whole_changed_shares
+            else:
+                resulting_lots.append(
+                    TaxLotV21(
+                        lot_id=f"{recorded.parent_lot_id}:{action_id}",
+                        acquisition_settlement_session=recorded.acquisition_settlement_session,
+                        shares=whole_changed_shares,
+                        cost_basis_cny=recorded.pre_action_cost_basis_cny - removed_basis,
+                        deferred_dividend_gross_cny=recorded.pre_action_deferred_dividend_gross_cny,
+                    )
+                )
+                share_change += whole_changed_shares - pre_shares
+        position.lots = resulting_lots
+        pending = state.pending_sells.get(entitlement.symbol)
+        if pending is not None and pending.target_shares != 0:
+            pending.target_shares = math.floor(pending.target_shares * ratio + 1e-12)
+        state.cash_cny += cash_change
+        if state.cash_cny < -1e-9:
+            raise ExecutionReplayError("share-change cash-in-lieu would make cash negative")
+        state.share_entitlements.pop(action_id)
+        events.append(
+            {
+                "event_type": "corporate_action",
+                "session": session,
+                "symbol": entitlement.symbol,
+                "action_id": action_id,
+                "action_type": "share_change",
+                "status": "registered",
+                "cash_change_cny": cash_change,
+                "share_change": share_change,
+                "deferred_tax_settled_cny": 0.0,
+            }
+        )
+    return events
+
+
+def _settle_due_terminal_considerations(
+    state: PortfolioStateV21,
+    open_rows: Mapping[str, Mapping[str, Any]],
+    session: str,
+) -> list[dict[str, Any]]:
+    """Settle official cash/share terminal consideration on its registered date."""
+
+    overdue = [
+        action_id
+        for action_id, consideration in state.terminal_considerations.items()
+        if consideration.settlement_session < session
+    ]
+    if overdue:
+        raise ExecutionReplayError(f"terminal consideration missed its official settlement session: {sorted(overdue)}")
+    events: list[dict[str, Any]] = []
+    for action_id in sorted(state.terminal_considerations):
+        consideration = state.terminal_considerations[action_id]
+        if consideration.settlement_session != session:
+            continue
+        if consideration.target_symbol is not None and consideration.target_shares > 0:
+            row = open_rows.get(consideration.target_symbol)
+            if row is None or row["status"] in {"delisted", "not_listed"}:
+                raise ExecutionReplayError("terminal share consideration target is unavailable on settlement")
+            target_position = state.positions.setdefault(consideration.target_symbol, PositionV21())
+            target_shares_before_receipt = target_position.shares
+            target_position.lots.append(
+                TaxLotV21(
+                    lot_id=f"delist:{action_id}:{consideration.source_symbol}",
+                    acquisition_settlement_session=consideration.settlement_session,
+                    shares=consideration.target_shares,
+                    cost_basis_cny=consideration.target_cost_basis_cny,
+                )
+            )
+            if consideration.pending_sell_originating_decision_session is not None:
+                existing = state.pending_sells.get(consideration.target_symbol)
+                originating_session = consideration.pending_sell_originating_decision_session
+                if existing is not None:
+                    originating_session = min(originating_session, existing.originating_decision_session)
+                state.pending_sells[consideration.target_symbol] = PendingSellV21(
+                    target_shares=(target_shares_before_receipt if existing is None else existing.target_shares),
+                    originating_decision_session=originating_session,
+                )
+        cash_change = consideration.cash_cny - consideration.deferred_dividend_tax_cny
+        state.cash_cny += cash_change
+        if state.cash_cny < -1e-9:
+            raise ExecutionReplayError("terminal settlement and deferred dividend tax would make cash negative")
+        state.terminal_considerations.pop(action_id)
+        events.append(
+            {
+                "event_type": "terminal_consideration_settlement",
+                "session": session,
+                "symbol": consideration.source_symbol,
+                "action_id": action_id,
+                "cash_change_cny": cash_change,
+                "target_symbol": consideration.target_symbol,
+                "target_shares": consideration.target_shares,
+                "deferred_tax_settled_cny": consideration.deferred_dividend_tax_cny,
+            }
+        )
+    return events
+
+
 def _apply_corporate_actions(
     state: PortfolioStateV21,
     actions: Sequence[Mapping[str, Any]],
     open_rows: Mapping[str, Mapping[str, Any]],
     session: str,
 ) -> list[dict[str, Any]]:
-    events = _settle_due_receivables(state, session)
+    events = _confirm_due_receivables(state, session)
+    events.extend(_settle_due_receivables(state, session))
+    events.extend(_settle_due_share_entitlements(state, session))
+    events.extend(_settle_due_terminal_considerations(state, open_rows, session))
     for action in actions:
         symbol = str(action["symbol"])
+        action_id = str(action["action_id"])
+        if action_id in state.processed_action_ids:
+            raise ExecutionReplayError(f"corporate action_id was already processed: {action_id}")
+        state.processed_action_ids.add(action_id)
         position = state.positions.get(symbol)
         if position is None:
             events.append(
@@ -782,65 +1219,34 @@ def _apply_corporate_actions(
         deferred_tax_settled = 0.0
         action_type = str(action["action_type"])
         if action_type == "share_change":
-            resulting_lots: list[TaxLotV21] = []
-            subtype = str(action["action_subtype"])
-            ratio = float(action["post_to_pre_ratio"])
-            additive = subtype in {"stock_dividend", "capital_reserve_conversion"}
-            if additive and ratio < 1.0:
-                raise ExecutionReplayError("additive share-change ratio must be at least one")
-            for lot in sorted(position.lots, key=lambda item: (item.acquisition_settlement_session, item.lot_id)):
-                pre_shares = lot.shares
-                exact_post_shares = pre_shares * ratio
-                exact_changed_shares = pre_shares * (ratio - 1.0) if additive else exact_post_shares
-                whole_changed_shares = math.floor(exact_changed_shares + 1e-12)
-                fractional = exact_changed_shares - whole_changed_shares
-                if not additive and whole_changed_shares <= 0:
-                    raise ExecutionReplayError(
-                        "official share change eliminates an entire held lot without terminal action"
+            if action_id in state.share_entitlements:
+                raise ExecutionReplayError("share entitlement action_id is already pending")
+            eligible_lots = [
+                lot
+                for lot in sorted(position.lots, key=lambda item: (item.acquisition_settlement_session, item.lot_id))
+                if lot.acquisition_settlement_session <= session
+            ]
+            state.share_entitlements[action_id] = ShareEntitlementV21(
+                action_id=action_id,
+                symbol=symbol,
+                record_session=str(action["record_session"]),
+                registration_session=str(action["new_share_registration_session"]),
+                action_subtype=str(action["action_subtype"]),
+                post_to_pre_ratio=float(action["post_to_pre_ratio"]),
+                fractional_cash_price=float(action["fractional_cash_price"]),
+                taxable_dividend_per_pre_action_share=float(action["taxable_dividend_per_pre_action_share"]),
+                source_row_sha256=str(action["source_row_sha256"]),
+                lots=[
+                    ShareEntitlementLotV21(
+                        parent_lot_id=lot.lot_id,
+                        acquisition_settlement_session=lot.acquisition_settlement_session,
+                        pre_action_shares=lot.shares,
+                        pre_action_cost_basis_cny=lot.cost_basis_cny,
+                        pre_action_deferred_dividend_gross_cny=lot.deferred_dividend_gross_cny,
                     )
-                per_post_share_basis = lot.cost_basis_cny / exact_post_shares
-                removed_basis = fractional * per_post_share_basis
-                cash_in_lieu = fractional * float(action["fractional_cash_price"])
-                if fractional > 1e-12 and float(action["fractional_cash_price"]) <= 0:
-                    raise ExecutionReplayError("fractional share requires official positive cash-in-lieu evidence")
-                cash_change += cash_in_lieu
-                taxable_dividend = pre_shares * float(action["taxable_dividend_per_pre_action_share"])
-                if additive:
-                    # Original quantity/date remain; the additional shares are
-                    # a distinct newer FIFO lot.  Existing and stock-dividend
-                    # entitlements remain attached to the record-date parent.
-                    parent_basis = pre_shares * per_post_share_basis
-                    resulting_lots.append(
-                        TaxLotV21(
-                            lot_id=lot.lot_id,
-                            acquisition_settlement_session=lot.acquisition_settlement_session,
-                            shares=pre_shares,
-                            cost_basis_cny=parent_basis,
-                            deferred_dividend_gross_cny=lot.deferred_dividend_gross_cny + taxable_dividend,
-                        )
-                    )
-                    if whole_changed_shares > 0:
-                        resulting_lots.append(
-                            TaxLotV21(
-                                lot_id=f"{lot.lot_id}:{action['action_id']}",
-                                acquisition_settlement_session=str(action["new_share_registration_session"]),
-                                shares=whole_changed_shares,
-                                cost_basis_cny=whole_changed_shares * per_post_share_basis,
-                                deferred_dividend_gross_cny=0.0,
-                            )
-                        )
-                else:
-                    resulting_lots.append(
-                        TaxLotV21(
-                            lot_id=f"{lot.lot_id}:{action['action_id']}",
-                            acquisition_settlement_session=lot.acquisition_settlement_session,
-                            shares=whole_changed_shares,
-                            cost_basis_cny=lot.cost_basis_cny - removed_basis,
-                            deferred_dividend_gross_cny=lot.deferred_dividend_gross_cny,
-                        )
-                    )
-            position.lots = resulting_lots
-            share_change = position.shares - shares_before
+                    for lot in eligible_lots
+                ],
+            )
         elif action_type in {"cash_dividend", "rights_issue"}:
             if str(action["action_id"]) in state.cash_receivables:
                 raise ExecutionReplayError("cash entitlement action_id already exists as a receivable")
@@ -851,30 +1257,51 @@ def _apply_corporate_actions(
                     else "official_disposal_proceeds_per_entitled_share"
                 ]
             )
-            gross_total = 0.0
-            for lot in position.lots:
-                if lot.acquisition_settlement_session > session:
-                    continue
-                entitlement = lot.shares * gross_per_share
-                if action_type == "cash_dividend":
-                    lot.deferred_dividend_gross_cny += entitlement
-                gross_total += entitlement
+            eligible_lots = [
+                lot
+                for lot in sorted(position.lots, key=lambda item: (item.acquisition_settlement_session, item.lot_id))
+                if lot.acquisition_settlement_session <= session
+            ]
+            entitlement_lots = [
+                CashEntitlementLotV21(
+                    parent_lot_id=lot.lot_id,
+                    acquisition_settlement_session=lot.acquisition_settlement_session,
+                    record_shares=lot.shares,
+                    record_cost_basis_cny=lot.cost_basis_cny,
+                    record_deferred_dividend_gross_cny=lot.deferred_dividend_gross_cny,
+                    gross_cash_cny=lot.shares * gross_per_share,
+                )
+                for lot in eligible_lots
+            ]
+            gross_total = float(sum(lot.gross_cash_cny for lot in entitlement_lots))
             state.cash_receivables[str(action["action_id"])] = CashReceivableV21(
-                action_id=str(action["action_id"]),
+                action_id=action_id,
                 symbol=symbol,
+                action_type=action_type,
+                record_session=str(action["record_session"]),
+                effective_session=str(action["effective_session"]),
                 payment_session=str(action["payment_session"]),
                 gross_cash_cny=gross_total,
+                status="frozen_entitlement",
+                lots=entitlement_lots,
             )
         elif action_type in TERMINAL_ACTION_TYPES:
             row = open_rows.get(symbol)
             if row is None or row["status"] != "delisted":
                 raise ExecutionReplayError(f"terminal action for {symbol} lacks a same-day delisted status")
+            pending_sell = state.pending_sells.get(symbol)
+            pending_sell_originating_session = (
+                None if pending_sell is None else pending_sell.originating_decision_session
+            )
             source_basis, deferred_tax_settled = _dispose_fifo_lots(
                 position, shares_before, str(action["disposal_settlement_session"])
             )
-            cash_change -= deferred_tax_settled
+            consideration_cash = 0.0
+            target_symbol: str | None = None
+            target_shares = 0
+            target_basis = 0.0
             if action_type == "delist_cash":
-                cash_change += shares_before * float(action["cash_per_share"])
+                consideration_cash = shares_before * float(action["cash_per_share"])
             elif action_type == "delist_share":
                 target_symbol = str(action["target_symbol"])
                 target_row = open_rows.get(target_symbol)
@@ -885,17 +1312,21 @@ def _apply_corporate_actions(
                 fractional = exact_target_shares - target_shares
                 if fractional > 1e-12 and float(action["fractional_cash_price"]) <= 0:
                     raise ExecutionReplayError("delist share fractional consideration lacks official cash evidence")
-                cash_change += fractional * float(action["fractional_cash_price"])
-                if target_shares > 0:
-                    target_position = state.positions.setdefault(target_symbol, PositionV21())
-                    target_position.lots.append(
-                        TaxLotV21(
-                            lot_id=f"delist:{action['action_id']}:{symbol}",
-                            acquisition_settlement_session=str(action["disposal_settlement_session"]),
-                            shares=target_shares,
-                            cost_basis_cny=source_basis,
-                        )
-                    )
+                consideration_cash = fractional * float(action["fractional_cash_price"])
+                target_basis = source_basis
+            state.terminal_considerations[action_id] = TerminalConsiderationV21(
+                action_id=action_id,
+                source_symbol=symbol,
+                settlement_session=str(action["disposal_settlement_session"]),
+                cash_cny=consideration_cash,
+                target_symbol=target_symbol,
+                target_shares=target_shares,
+                target_cost_basis_cny=target_basis,
+                deferred_dividend_tax_cny=deferred_tax_settled,
+                pending_sell_originating_decision_session=(
+                    pending_sell_originating_session if action_type == "delist_share" else None
+                ),
+            )
             share_change = -shares_before
             state.positions.pop(symbol)
             state.pending_sells.pop(symbol, None)
@@ -910,14 +1341,24 @@ def _apply_corporate_actions(
                 "event_type": "corporate_action",
                 "session": session,
                 "symbol": symbol,
-                "action_id": action["action_id"],
+                "action_id": action_id,
                 "action_type": action_type,
-                "status": "applied",
+                "status": (
+                    "entitlement_recorded"
+                    if action_type in {"share_change", "cash_dividend", "rights_issue"}
+                    else "consideration_recorded"
+                    if action_type in TERMINAL_ACTION_TYPES
+                    else "applied"
+                ),
                 "cash_change_cny": cash_change,
                 "share_change": share_change,
-                "deferred_tax_settled_cny": deferred_tax_settled,
+                "deferred_tax_settled_cny": 0.0 if action_type in TERMINAL_ACTION_TYPES else deferred_tax_settled,
             }
         )
+    events.extend(_confirm_due_receivables(state, session))
+    events.extend(_settle_due_receivables(state, session))
+    events.extend(_settle_due_share_entitlements(state, session))
+    events.extend(_settle_due_terminal_considerations(state, open_rows, session))
     return events
 
 
@@ -930,6 +1371,7 @@ def _record_blocked_order(
     side: str,
     requested: int,
     status: str,
+    row: Mapping[str, Any],
 ) -> None:
     events.append(
         {
@@ -941,6 +1383,13 @@ def _record_blocked_order(
             "status": status,
             "requested_shares": requested,
             "filled_shares": 0,
+            "fill_notional_cny": 0.0,
+            "commission_cny": 0.0,
+            "transfer_fee_cny": 0.0,
+            "stamp_duty_cny": 0.0,
+            "slippage_cost_cny": 0.0,
+            "adv20_cny_asof_decision": float(row["adv20_cny_asof_decision"]),
+            "open_auction_turnover_cny": float(row["open_auction_turnover_cny"]),
         }
     )
 
@@ -972,6 +1421,7 @@ def _sell(
             side="sell",
             requested=requested,
             status=status,
+            row=row,
         )
         return
     fill_shares = _capacity_fill_shares(requested, side="sell", row=row, cost=cost, session=session)
@@ -984,6 +1434,7 @@ def _sell(
             side="sell",
             requested=requested,
             status="dual_capacity_cap",
+            row=row,
         )
         return
     terms = _execution_terms(
@@ -1012,6 +1463,8 @@ def _sell(
             "fifo_cost_basis_released_cny": cost_reduction,
             "deferred_dividend_tax_settled_cny": deferred_tax,
             "settlement_session": settlement_session,
+            "adv20_cny_asof_decision": float(row["adv20_cny_asof_decision"]),
+            "open_auction_turnover_cny": float(row["open_auction_turnover_cny"]),
             **terms,
         }
     )
@@ -1040,6 +1493,7 @@ def _buy(
             side="buy",
             requested=requested,
             status="maximum_actual_positions",
+            row=row,
         )
         return
     status = _fill_status(row, "buy")
@@ -1052,6 +1506,7 @@ def _buy(
             side="buy",
             requested=requested,
             status=status,
+            row=row,
         )
         return
     lot = int(row["lot_size"])
@@ -1065,6 +1520,7 @@ def _buy(
             side="buy",
             requested=requested,
             status="dual_capacity_cap",
+            row=row,
         )
         return
     while fill_shares > 0:
@@ -1083,6 +1539,7 @@ def _buy(
             side="buy",
             requested=requested,
             status="insufficient_cash",
+            row=row,
         )
         return
     terms = _execution_terms(
@@ -1119,6 +1576,8 @@ def _buy(
             "requested_shares": requested,
             "filled_shares": fill_shares,
             "settlement_session": settlement_session,
+            "adv20_cny_asof_decision": float(row["adv20_cny_asof_decision"]),
+            "open_auction_turnover_cny": float(row["open_auction_turnover_cny"]),
             **terms,
         }
     )
@@ -1156,9 +1615,39 @@ def _mark_eod(
         value = position.shares * price
         position_value += value
         holdings.append({"symbol": symbol, "shares": position.shares, "close": price, "value_cny": value})
-    receivable_value = float(sum(item.gross_cash_cny for item in state.cash_receivables.values()))
+    receivable_value = float(
+        sum(item.gross_cash_cny for item in state.cash_receivables.values() if item.status == "receivable")
+    )
+    terminal_asset_value = 0.0
+    terminal_liability_value = 0.0
+    for consideration in state.terminal_considerations.values():
+        terminal_asset_value += consideration.cash_cny
+        terminal_liability_value += consideration.deferred_dividend_tax_cny
+        if consideration.target_symbol is not None and consideration.target_shares > 0:
+            row = eod_rows.get(consideration.target_symbol)
+            if row is None:
+                raise ExecutionReplayError(
+                    f"terminal consideration target {consideration.target_symbol} is missing from EOD snapshot on {session}"
+                )
+            if row["status"] == "trading":
+                target_price = float(row["close"])
+                state.last_close[consideration.target_symbol] = target_price
+            else:
+                target_price = state.last_close.get(consideration.target_symbol, math.nan)
+            if not math.isfinite(target_price) or target_price <= 0:
+                raise ExecutionReplayError("terminal share consideration has no valid official target mark")
+            terminal_asset_value += consideration.target_shares * target_price
     tax_liability = _remeasure_dividend_tax(state, session)
-    nav = state.cash_cny + position_value + receivable_value - tax_liability
+    pending_settlements = pending_settlements_summary(state)
+    pending_settlements_root = object_sha256(pending_settlements)
+    nav = (
+        state.cash_cny
+        + position_value
+        + receivable_value
+        + terminal_asset_value
+        - tax_liability
+        - terminal_liability_value
+    )
     if state.cash_cny < -1e-6 or not math.isfinite(nav) or nav <= 0:
         raise ExecutionReplayError(f"portfolio conservation failed on {session}: cash={state.cash_cny}, nav={nav}")
     daily_return = 0.0 if prior_nav is None else nav / prior_nav - 1.0
@@ -1170,13 +1659,66 @@ def _mark_eod(
         "cash_yield_cny": cash_yield,
         "position_value_cny": position_value,
         "cash_receivable_value_cny": receivable_value,
+        "other_asset_value_cny": terminal_asset_value,
+        "other_liability_value_cny": terminal_liability_value,
         "dividend_tax_liability_cny": tax_liability,
         "gross_exposure": position_value / nav,
         "holding_count": len(state.positions),
         "pending_sell_count": len(state.pending_sells),
+        "pending_sell_symbols": sorted(state.pending_sells),
+        "pending_settlements_root_sha256": pending_settlements_root,
+        "pending_settlement_count": int(pending_settlements["pending_settlement_count"]),
+        "contingent_slot_symbols": sorted(
+            {
+                consideration.target_symbol
+                for consideration in state.terminal_considerations.values()
+                if consideration.target_symbol is not None and consideration.target_shares > 0
+            }
+        ),
         "holdings": holdings,
         "state_sha256": object_sha256(state.as_dict()),
     }
+
+
+def _pretrade_nav(state: PortfolioStateV21, open_rows: Mapping[str, Mapping[str, Any]], session: str) -> float:
+    """Value the post-action/pre-order book at official raw opening prices."""
+
+    position_value = 0.0
+    for symbol, position in state.positions.items():
+        row = open_rows.get(symbol)
+        if row is None:
+            raise ExecutionReplayError(f"pretrade position {symbol} is missing from opening snapshot on {session}")
+        if row["status"] == "trading":
+            price = float(row["open"])
+        else:
+            price = state.last_close.get(symbol)
+            if price is None or price <= 0:
+                raise ExecutionReplayError(f"pretrade position {symbol} lacks a last official close on {session}")
+        position_value += position.shares * price
+    receivables = sum(item.gross_cash_cny for item in state.cash_receivables.values() if item.status == "receivable")
+    terminal_assets = 0.0
+    terminal_liabilities = 0.0
+    for consideration in state.terminal_considerations.values():
+        terminal_assets += consideration.cash_cny
+        terminal_liabilities += consideration.deferred_dividend_tax_cny
+        if consideration.target_symbol is not None and consideration.target_shares > 0:
+            row = open_rows.get(consideration.target_symbol)
+            if row is None:
+                raise ExecutionReplayError(
+                    f"terminal consideration target {consideration.target_symbol} is missing from opening snapshot on {session}"
+                )
+            if row["status"] == "trading":
+                target_price = float(row["open"])
+            else:
+                target_price = state.last_close.get(consideration.target_symbol, float(row["pre_close"]))
+            if not math.isfinite(target_price) or target_price <= 0:
+                raise ExecutionReplayError("terminal share consideration has no valid official opening mark")
+            terminal_assets += consideration.target_shares * target_price
+    liabilities = sum(state.dividend_tax_liabilities.values()) + terminal_liabilities
+    nav = state.cash_cny + position_value + receivables + terminal_assets - liabilities
+    if not math.isfinite(nav) or nav <= 0:
+        raise ExecutionReplayError(f"pretrade NAV is invalid on {session}")
+    return float(nav)
 
 
 def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1193,6 +1735,7 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
         "data_snapshot_sha256",
         "trial_id",
         "arm_id",
+        "seed_id",
         "scenario_id",
         "initial_capital_cny",
         "annual_cash_yield",
@@ -1208,6 +1751,16 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
     _require_sha256(value["data_snapshot_sha256"], "data_snapshot_sha256")
     if not str(value["trial_id"]) or not str(value["arm_id"]) or not str(value["scenario_id"]):
         raise ExecutionReplayError("trial_id, arm_id, and scenario_id must be non-empty")
+    arm_id = str(value["arm_id"])
+    seed_id = value["seed_id"]
+    if arm_id in SINGLE_ARM_IDS:
+        if seed_id is not None:
+            raise ExecutionReplayError(f"single arm {arm_id} must have seed_id=null")
+    elif arm_id in SEEDED_ARM_IDS:
+        if isinstance(seed_id, bool) or not isinstance(seed_id, int) or seed_id not in FROZEN_RANDOM_SEEDS:
+            raise ExecutionReplayError(f"seeded arm {arm_id} must use one frozen seed 20260720..20260739")
+    else:
+        raise ExecutionReplayError(f"unknown V2.1 arm_id {arm_id!r}")
     annual_cash_yield = _finite_number(value["annual_cash_yield"], "annual_cash_yield", minimum=0.0)
     if annual_cash_yield != 0.0:
         raise ExecutionReplayError("V2.1 freezes cash interest at zero")
@@ -1256,13 +1809,46 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
             raise ExecutionReplayError(f"opening and EOD symbol domains differ on {session}")
         actions = _normalise_actions(raw_session["corporate_actions"], session)
         decision = _normalise_decision(raw_session["decision"], session)
+        opening_actions = [action for action in actions if action["action_type"] in TERMINAL_ACTION_TYPES]
+        record_close_actions = [action for action in actions if action["action_type"] not in TERMINAL_ACTION_TYPES]
 
         state_before_open = state.as_dict()
         event_start = len(all_events)
-        all_events.extend(_apply_corporate_actions(state, actions, open_rows, session))
+        # Effective-date confirmations, payments, registrations, terminal
+        # settlements and terminal actions happen before the opening auction.
+        # Entitlement actions are keyed by official record date, however, and
+        # therefore freeze the settled EOD lot book only after this session's
+        # fills have been netted.
+        all_events.extend(_apply_corporate_actions(state, opening_actions, open_rows, session))
+        pretrade_nav = _pretrade_nav(state, open_rows, session)
 
         desired_shares: dict[str, int] = {}
         if decision is not None:
+            selected = set(decision["ordered_symbols"])
+            # ``new_entry_symbols`` is frozen from the protocol's 10m/1x
+            # reference book and must remain identical across gross/1x/2x and
+            # capacity replays.  Local holdings may diverge after different
+            # fills and costs, so non-reference scenarios must not rederive or
+            # relabel that registered intervention identity.
+            blocked_before = {symbol for symbol in state_before_open["pending_sells"] if symbol not in selected}
+            blocked_before.update(
+                str(asset["target_symbol"])
+                for asset in state_before_open["other_assets"]
+                if asset.get("asset_type") == "terminal_consideration"
+                and asset.get("target_symbol") is not None
+                and str(asset["target_symbol"]) not in selected
+            )
+            if len(decision["ordered_symbols"]) + len(blocked_before) > int(decision["slots"]):
+                raise ExecutionReplayError(
+                    "blocked exits and selected targets exceed the frozen 50 actual-position slots"
+                )
+            for consideration in state.terminal_considerations.values():
+                if consideration.target_symbol is None or consideration.target_shares <= 0:
+                    continue
+                if consideration.target_symbol in selected:
+                    consideration.pending_sell_originating_decision_session = None
+                elif consideration.pending_sell_originating_decision_session is None:
+                    consideration.pending_sell_originating_decision_session = str(decision["decision_session"])
             selection_hashes.append(str(decision["selection_identity_sha256"]))
             decision_evidence.append(
                 {
@@ -1274,6 +1860,13 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                     "decision_artifact_sha256": object_sha256(decision),
                     "portfolio_before_sha256": object_sha256(state_before_open),
                     "pending_sells_before_sha256": object_sha256(state_before_open["pending_sells"]),
+                    "actual_holdings_before": sorted(state_before_open["positions"]),
+                    "actual_shares_before": {
+                        symbol: int(state_before_open["positions"][symbol]["shares"])
+                        for symbol in sorted(state_before_open["positions"])
+                    },
+                    "pending_sell_symbols_before": sorted(state_before_open["pending_sells"]),
+                    "pretrade_nav_cny": pretrade_nav,
                 }
             )
             # The sizing NAV is the already-recorded decision-close NAV.  Using
@@ -1290,7 +1883,6 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                 * (1.0 - float(decision["cash_buffer_fraction"]))
                 / int(decision["slots"])
             )
-            selected = set(decision["ordered_symbols"])
             for symbol in decision["ordered_symbols"]:
                 row = open_rows.get(symbol)
                 if row is None:
@@ -1306,9 +1898,14 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                     desired_shares[symbol] = 0
             for symbol in list(state.positions):
                 if symbol not in selected:
-                    state.pending_sells[symbol] = PendingSellV21(
-                        target_shares=0,
-                        originating_decision_session=str(decision["decision_session"]),
+                    # Never reset an older blocked exit's origin.  The frozen
+                    # order priority is oldest pending full exit first.
+                    state.pending_sells.setdefault(
+                        symbol,
+                        PendingSellV21(
+                            target_shares=0,
+                            originating_decision_session=str(decision["decision_session"]),
+                        ),
                     )
                 else:
                     state.pending_sells.pop(symbol, None)
@@ -1317,6 +1914,42 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
             for symbol in selected:
                 if symbol in state.pending_sells and state.positions[symbol].shares <= desired_shares[symbol]:
                     state.pending_sells.pop(symbol, None)
+            # Ledger decisions happen after the prior close and before the
+            # execution session opens.  Build that causal state from the
+            # prior-close snapshot; same-session corporate actions and fills
+            # belong to the later open record.
+            post_decision_state = dict(state_before_open)
+            post_decision_pending = {symbol: dict(item) for symbol, item in state_before_open["pending_sells"].items()}
+            for symbol in state_before_open["positions"]:
+                if symbol not in selected:
+                    post_decision_pending.setdefault(
+                        symbol,
+                        {
+                            "target_shares": 0,
+                            "originating_decision_session": str(decision["decision_session"]),
+                        },
+                    )
+            for symbol in selected:
+                post_decision_pending.pop(symbol, None)
+            post_decision_state["pending_sells"] = post_decision_pending
+            post_decision_assets: list[dict[str, Any]] = []
+            for raw_asset in state_before_open["other_assets"]:
+                asset = dict(raw_asset)
+                target_symbol = asset.get("target_symbol")
+                if asset.get("asset_type") == "terminal_consideration" and target_symbol is not None:
+                    if str(target_symbol) in selected:
+                        asset["pending_sell_originating_decision_session"] = None
+                    elif asset.get("pending_sell_originating_decision_session") is None:
+                        asset["pending_sell_originating_decision_session"] = str(decision["decision_session"])
+                post_decision_assets.append(asset)
+            post_decision_state["other_assets"] = post_decision_assets
+            decision_evidence[-1].update(
+                {
+                    "portfolio_after_decision_sha256": object_sha256(post_decision_state),
+                    "pending_sells_after_decision_sha256": object_sha256(post_decision_state["pending_sells"]),
+                    "pending_sell_symbols_after_decision": sorted(post_decision_state["pending_sells"]),
+                }
+            )
 
         # Daily retry, including sessions without a new rebalance.  The current
         # session's auction snapshot supplies the independently observed caps.
@@ -1354,8 +1987,21 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                 )
 
         open_state = state.as_dict()
+        all_events.extend(_apply_corporate_actions(state, record_close_actions, open_rows, session))
         session_events = all_events[event_start:]
         order_events = [event for event in session_events if event["event_type"] == "order"]
+        terminal_share_receipts = [
+            {
+                "action_id": str(event["action_id"]),
+                "source_symbol": str(event["symbol"]),
+                "target_symbol": str(event["target_symbol"]),
+                "target_shares": int(event["target_shares"]),
+            }
+            for event in session_events
+            if event.get("event_type") == "terminal_consideration_settlement"
+            and event.get("target_symbol") is not None
+            and int(event.get("target_shares", 0)) > 0
+        ]
         requested_orders = [
             {
                 key: event[key]
@@ -1408,6 +2054,7 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
             prior_nav=prior_nav,
             annual_cash_yield=annual_cash_yield,
         )
+        eod_pending_sells = state.as_dict()["pending_sells"]
         daily.append(eod)
         session_evidence.append(
             {
@@ -1429,6 +2076,8 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                     ]
                 ),
                 "corporate_actions_sha256": object_sha256(actions),
+                "terminal_share_receipts_sha256": object_sha256(terminal_share_receipts),
+                "terminal_share_receipt_count": len(terminal_share_receipts),
                 "requested_orders_sha256": object_sha256(requested_orders),
                 "fills_sha256": object_sha256(fills),
                 "fees_sha256": object_sha256(fees),
@@ -1438,8 +2087,13 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
                 "pending_sells_after_open_sha256": object_sha256(open_state["pending_sells"]),
                 "pending_sell_count_before": len(state_before_open["pending_sells"]),
                 "pending_sell_count_after": len(open_state["pending_sells"]),
+                "eod_pending_sells_sha256": object_sha256(eod_pending_sells),
+                "eod_pending_sell_count": len(eod_pending_sells),
+                "pretrade_nav_cny": pretrade_nav,
                 "raw_close_snapshot_sha256": object_sha256(raw_session["eod_snapshot"]),
                 "eod_portfolio_state_sha256": eod["state_sha256"],
+                "pending_settlements_root_sha256": eod["pending_settlements_root_sha256"],
+                "pending_settlement_count": eod["pending_settlement_count"],
                 "nav_artifact_sha256": object_sha256({key: item for key, item in eod.items() if key != "state_sha256"}),
             }
         )
@@ -1452,7 +2106,8 @@ def replay_execution(value: Mapping[str, Any]) -> dict[str, Any]:
         "protocol_sha256": value["protocol_sha256"],
         "data_snapshot_sha256": value["data_snapshot_sha256"],
         "trial_id": str(value["trial_id"]),
-        "arm_id": str(value["arm_id"]),
+        "arm_id": arm_id,
+        "seed_id": seed_id,
         "scenario_id": str(value["scenario_id"]),
         "input_sha256": object_sha256(value),
         "initial_state": initial_state,
@@ -1497,6 +2152,7 @@ def replay_cost_scenarios(scenario_inputs: Mapping[str, Mapping[str, Any]]) -> d
     expected_decision_identity: str | None = None
     trial_id: str | None = None
     arm_id: str | None = None
+    seed_id: int | None = None
     for scenario_id in sorted(scenario_inputs):
         execution_input = dict(scenario_inputs[scenario_id])
         if execution_input.get("scenario_id") != str(scenario_id):
@@ -1519,17 +2175,19 @@ def replay_cost_scenarios(scenario_inputs: Mapping[str, Mapping[str, Any]]) -> d
             expected_decision_identity = decision_identity
             trial_id = str(result["trial_id"])
             arm_id = str(result["arm_id"])
+            seed_id = result["seed_id"]
         elif identity != expected_identity:
             raise ExecutionReplayError("selection identities differ across cost scenarios")
         elif decision_identity != expected_decision_identity:
             raise ExecutionReplayError("new-entry identities differ across cost scenarios")
-        elif str(result["trial_id"]) != trial_id or str(result["arm_id"]) != arm_id:
-            raise ExecutionReplayError("trial or arm identity differs across cost scenarios")
+        elif str(result["trial_id"]) != trial_id or str(result["arm_id"]) != arm_id or result["seed_id"] != seed_id:
+            raise ExecutionReplayError("trial, arm, or seed identity differs across cost scenarios")
         results[str(scenario_id)] = result
     output = {
         "schema": SCENARIO_RESULT_SCHEMA,
         "trial_id": trial_id,
         "arm_id": arm_id,
+        "seed_id": seed_id,
         "selection_identity_sequence_sha256": expected_identity,
         "decision_identity_sequence_sha256": expected_decision_identity,
         "scenarios": results,
@@ -1557,7 +2215,12 @@ def event_notional_and_costs(result: Mapping[str, Any]) -> dict[str, float]:
     }
 
 
-def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def build_weekly_path_component(
+    result: Mapping[str, Any],
+    cycles: Sequence[Mapping[str, Any]],
+    *,
+    state_gate_observations: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Derive formal decision-close weekly returns from a replay result.
 
     The caller supplies the ledger-registered 52 consecutive endpoint pairs.
@@ -1574,6 +2237,37 @@ def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapp
     by_session = {str(row.get("session")): row for row in daily_rows}
     if len(by_session) != len(daily_rows):
         raise ExecutionReplayError("execution result contains duplicate daily sessions")
+    evidence_rows = result.get("session_evidence")
+    if not isinstance(evidence_rows, list):
+        raise ExecutionReplayError("execution result session evidence is missing")
+    evidence_by_session = {str(row.get("session")): row for row in evidence_rows if isinstance(row, Mapping)}
+    if len(evidence_by_session) != len(evidence_rows) or set(evidence_by_session) != set(by_session):
+        raise ExecutionReplayError("execution daily rows and session evidence have different session domains")
+    for session, row in by_session.items():
+        state_root = _require_sha256(row.get("state_sha256"), f"daily[{session}].state_sha256")
+        pending_root = _require_sha256(
+            row.get("pending_settlements_root_sha256"), f"daily[{session}].pending_settlements_root_sha256"
+        )
+        pending_count = row.get("pending_settlement_count")
+        pending_sell_count = row.get("pending_sell_count")
+        evidence = evidence_by_session[session]
+        if isinstance(pending_count, bool) or not isinstance(pending_count, int) or pending_count < 0:
+            raise ExecutionReplayError(f"daily[{session}].pending_settlement_count is invalid")
+        if isinstance(pending_sell_count, bool) or not isinstance(pending_sell_count, int) or pending_sell_count < 0:
+            raise ExecutionReplayError(f"daily[{session}].pending_sell_count is invalid")
+        _require_sha256(
+            evidence.get("eod_pending_sells_sha256"), f"session_evidence[{session}].eod_pending_sells_sha256"
+        )
+        if (
+            evidence.get("eod_portfolio_state_sha256") != state_root
+            or evidence.get("eod_pending_sell_count") != pending_sell_count
+        ):
+            raise ExecutionReplayError(f"daily/session EOD state evidence differs on {session}")
+        if (
+            evidence.get("pending_settlements_root_sha256") != pending_root
+            or evidence.get("pending_settlement_count") != pending_count
+        ):
+            raise ExecutionReplayError(f"daily/session pending-settlement evidence differs on {session}")
     decision_rows = {str(row.get("decision_session")): row for row in result.get("decision_evidence", [])}
     events = result.get("events")
     if not isinstance(events, list):
@@ -1582,6 +2276,8 @@ def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapp
     week_labels: list[str] = []
     weekly_returns: list[float] = []
     weekly_turnover: list[float] = []
+    weekly_pretrade_nav: list[float] = []
+    weekly_explicit_costs: list[dict[str, float]] = []
     new_entry_sets: list[list[str]] = []
     opportunities: list[int] = []
     previous_end: str | None = None
@@ -1613,7 +2309,25 @@ def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapp
         )
         week_labels.append(end)
         weekly_returns.append(end_nav / start_nav - 1.0)
-        weekly_turnover.append(filled_notional / (2.0 * start_nav))
+        pretrade_nav = _finite_number(decision.get("pretrade_nav_cny"), f"{start}.pretrade_nav_cny", minimum=0.0)
+        if pretrade_nav <= 0:
+            raise ExecutionReplayError("weekly pretrade NAV must be positive")
+        weekly_turnover.append(filled_notional / (2.0 * pretrade_nav))
+        weekly_pretrade_nav.append(pretrade_nav)
+        weekly_events = [
+            event for event in events if event.get("event_type") == "order" and start < str(event.get("session")) <= end
+        ]
+        weekly_explicit_costs.append(
+            {
+                component: float(sum(float(event.get(component, 0.0)) for event in weekly_events))
+                for component in (
+                    "commission_cny",
+                    "transfer_fee_cny",
+                    "stamp_duty_cny",
+                    "slippage_cost_cny",
+                )
+            }
+        )
         new_entry_sets.append(list(decision["new_entry_symbols"]))
         opportunities.append(int(decision["gate_eligible_new_entry_opportunities"]))
         previous_end = end
@@ -1625,6 +2339,319 @@ def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapp
     daily_labels = [str(row["session"]) for row in daily_window]
     if daily_labels != sorted(set(daily_labels)):
         raise ExecutionReplayError("daily exposure window is not strictly increasing and unique")
+    confirmation_orders = [
+        {
+            "session": str(event["session"]),
+            "symbol": str(event["symbol"]),
+            "side": str(event["side"]),
+            "requested_shares": int(event["requested_shares"]),
+            "filled_shares": int(event["filled_shares"]),
+            "fill_notional_cny": float(event.get("fill_notional_cny", 0.0)),
+            "adv20_cny_asof_decision": float(event["adv20_cny_asof_decision"]),
+            "open_auction_turnover_cny": float(event["open_auction_turnover_cny"]),
+        }
+        for event in events
+        if event.get("event_type") == "order" and first_start < str(event.get("session")) <= final_end
+    ]
+    confirmation_orders.sort(key=lambda item: (item["session"], item["symbol"], item["side"]))
+
+    final_row = by_session[final_end]
+    starting_positions = [
+        {"symbol": str(item["symbol"]), "shares": int(item["shares"])} for item in final_row["holdings"]
+    ]
+    starting_positions.sort(key=lambda item: item["symbol"])
+    positions = {item["symbol"]: item["shares"] for item in starting_positions}
+    starting_pending_settlements_root = str(final_row["pending_settlements_root_sha256"])
+    starting_pending_settlement_count = int(final_row["pending_settlement_count"])
+
+    indexed_events = list(enumerate(events))
+    pending_conversions: dict[str, str] = {}
+    for _, event in indexed_events:
+        event_session = str(event.get("session", ""))
+        if event_session > final_end:
+            continue
+        if (
+            event.get("event_type") == "corporate_action"
+            and event.get("action_type") == "delist_share"
+            and int(event.get("share_change", 0)) < 0
+        ):
+            pending_conversions[str(event["action_id"])] = str(event["symbol"])
+        elif event.get("event_type") == "terminal_consideration_settlement" and event.get("target_symbol") is not None:
+            pending_conversions.pop(str(event["action_id"]), None)
+    starting_pending_conversions = [
+        {"action_id": action_id, "source_symbol": pending_conversions[action_id]}
+        for action_id in sorted(pending_conversions)
+    ]
+
+    post_window_events = [
+        (event_index, event) for event_index, event in indexed_events if str(event.get("session", "")) > final_end
+    ]
+    if any(event.get("event_type") == "order" and event.get("side") == "buy" for _, event in post_window_events):
+        raise ExecutionReplayError("post-window unwind cannot contain a new buy order")
+
+    unwind_rows = [row for row in daily_rows if str(row["session"]) > final_end]
+    unwind_labels = [str(row["session"]) for row in unwind_rows]
+    if unwind_labels != sorted(unwind_labels):
+        raise ExecutionReplayError("post-window EOD sessions must be strictly increasing")
+    unwind_session_labels = {str(row["session"]) for row in unwind_rows}
+    orphan_post_window_events = [
+        event for _, event in post_window_events if str(event.get("session", "")) not in unwind_session_labels
+    ]
+    if orphan_post_window_events:
+        raise ExecutionReplayError("post-window event has no matching EOD session")
+
+    economic_state_fields = (
+        "nav_cny",
+        "cash_cny",
+        "cash_yield_cny",
+        "position_value_cny",
+        "cash_receivable_value_cny",
+        "other_asset_value_cny",
+        "other_liability_value_cny",
+        "dividend_tax_liability_cny",
+        "gross_exposure",
+        "holding_count",
+        "pending_sell_count",
+        "pending_sell_symbols",
+        "pending_settlements_root_sha256",
+        "pending_settlement_count",
+        "contingent_slot_symbols",
+        "holdings",
+    )
+
+    def economic_state(row: Mapping[str, Any]) -> dict[str, Any]:
+        session = str(row["session"])
+        return {
+            **{field: row[field] for field in economic_state_fields},
+            "pending_sells_sha256": evidence_by_session[session]["eod_pending_sells_sha256"],
+        }
+
+    unwind_sessions: list[dict[str, Any]] = []
+    post_completion_heartbeats: list[dict[str, Any]] = []
+    completion_session: str | None = (
+        final_end
+        if (
+            not positions
+            and not pending_conversions
+            and starting_pending_settlement_count == 0
+            and int(final_row["pending_sell_count"]) == 0
+        )
+        else None
+    )
+    completion_economic_state: dict[str, Any] | None = (
+        economic_state(final_row) if completion_session is not None else None
+    )
+    completion_economic_state_sha256: str | None = (
+        object_sha256(completion_economic_state) if completion_economic_state is not None else None
+    )
+    completion_state_sha256: str | None = (
+        _require_sha256(final_row["state_sha256"], f"daily[{final_end}].state_sha256")
+        if completion_session is not None
+        else None
+    )
+    prior_heartbeat_state_sha256 = completion_state_sha256
+    for row in unwind_rows:
+        session = str(row["session"])
+        session_events = [(index, event) for index, event in post_window_events if str(event.get("session")) == session]
+        if completion_session is not None:
+            administrative_events: list[dict[str, Any]] = []
+            expected_event_fields = {
+                "event_type",
+                "session",
+                "symbol",
+                "action_id",
+                "action_type",
+                "status",
+                "cash_change_cny",
+                "share_change",
+                "deferred_tax_settled_cny",
+            }
+            for event_index, event in session_events:
+                zero_impact_no_position = (
+                    set(event) == expected_event_fields
+                    and event.get("event_type") == "corporate_action"
+                    and event.get("status") == "no_position"
+                    and event.get("session") == session
+                    and isinstance(event.get("symbol"), str)
+                    and bool(event.get("symbol"))
+                    and isinstance(event.get("action_id"), str)
+                    and bool(event.get("action_id"))
+                    and event.get("action_type")
+                    in {"share_change", "cash_dividend", "rights_issue", *TERMINAL_ACTION_TYPES}
+                    and not isinstance(event.get("cash_change_cny"), bool)
+                    and event.get("cash_change_cny") == 0
+                    and not isinstance(event.get("share_change"), bool)
+                    and event.get("share_change") == 0
+                    and not isinstance(event.get("deferred_tax_settled_cny"), bool)
+                    and event.get("deferred_tax_settled_cny") == 0
+                )
+                if not zero_impact_no_position:
+                    raise ExecutionReplayError(
+                        "post-window replay contains an event after unwind completion that is not a "
+                        "zero-impact no-position corporate action"
+                    )
+                administrative_events.append({"event_index": event_index, "event": dict(event)})
+            heartbeat_state = economic_state(row)
+            heartbeat_state_sha256 = object_sha256(heartbeat_state)
+            if (
+                heartbeat_state != completion_economic_state
+                or heartbeat_state_sha256 != completion_economic_state_sha256
+            ):
+                raise ExecutionReplayError("post-window replay economic state changes after unwind completion")
+            state_sha256 = _require_sha256(row["state_sha256"], f"daily[{session}].state_sha256")
+            if administrative_events:
+                if state_sha256 == prior_heartbeat_state_sha256:
+                    raise ExecutionReplayError(
+                        "post-window administrative actions after unwind completion must advance the state hash"
+                    )
+            elif state_sha256 != prior_heartbeat_state_sha256:
+                raise ExecutionReplayError(
+                    "post-window replay state hash changes after unwind completion without an administrative action"
+                )
+            post_completion_heartbeats.append(
+                {
+                    "session": session,
+                    "state_sha256": state_sha256,
+                    **heartbeat_state,
+                    "economic_state_sha256": heartbeat_state_sha256,
+                    "administrative_events": administrative_events,
+                    "session_events_root_sha256": object_sha256(administrative_events),
+                    "session_event_count": len(administrative_events),
+                }
+            )
+            prior_heartbeat_state_sha256 = state_sha256
+            continue
+        terminal_dispositions: list[dict[str, Any]] = []
+        terminal_share_receipts: list[dict[str, Any]] = []
+        for event_index, event in session_events:
+            if (
+                event.get("event_type") == "corporate_action"
+                and event.get("action_type") in TERMINAL_ACTION_TYPES
+                and int(event.get("share_change", 0)) < 0
+            ):
+                symbol = str(event["symbol"])
+                action_id = str(event["action_id"])
+                action_type = str(event["action_type"])
+                disposed = -int(event["share_change"])
+                available = positions.get(symbol, 0)
+                if available == 0 or disposed != available:
+                    raise ExecutionReplayError("terminal unwind disposition must consume one complete symbol position")
+                positions.pop(symbol)
+                if action_type == "delist_share":
+                    if action_id in pending_conversions:
+                        raise ExecutionReplayError("terminal unwind action_id duplicates a pending share conversion")
+                    pending_conversions[action_id] = symbol
+                terminal_dispositions.append(
+                    {
+                        "event_index": event_index,
+                        "action_id": action_id,
+                        "action_type": action_type,
+                        "symbol": symbol,
+                        "disposed_shares": disposed,
+                    }
+                )
+            elif (
+                event.get("event_type") == "terminal_consideration_settlement"
+                and event.get("target_symbol") is not None
+            ):
+                action_id = str(event["action_id"])
+                source_symbol = str(event["symbol"])
+                target_symbol = str(event["target_symbol"])
+                received = int(event["target_shares"])
+                if pending_conversions.get(action_id) != source_symbol:
+                    raise ExecutionReplayError("terminal share receipt has no matching pending source conversion")
+                if received > 0:
+                    positions[target_symbol] = positions.get(target_symbol, 0) + received
+                pending_conversions.pop(action_id)
+                terminal_share_receipts.append(
+                    {
+                        "event_index": event_index,
+                        "action_id": action_id,
+                        "source_symbol": source_symbol,
+                        "target_symbol": target_symbol,
+                        "received_shares": received,
+                    }
+                )
+
+        session_orders = [
+            event for _, event in session_events if event.get("event_type") == "order" and event.get("side") == "sell"
+        ]
+        sell_orders: list[dict[str, Any]] = []
+        seen_sell_symbols: set[str] = set()
+        for event in sorted(session_orders, key=lambda item: str(item["symbol"])):
+            symbol = str(event["symbol"])
+            requested = int(event["requested_shares"])
+            filled = int(event["filled_shares"])
+            if symbol in seen_sell_symbols:
+                raise ExecutionReplayError("post-window unwind has duplicate sell attempts for one symbol/session")
+            if positions.get(symbol, 0) != requested or filled > requested:
+                raise ExecutionReplayError("post-window unwind must request each symbol's complete current position")
+            seen_sell_symbols.add(symbol)
+            positions[symbol] -= filled
+            if positions[symbol] == 0:
+                positions.pop(symbol)
+            sell_orders.append({"symbol": symbol, "requested_shares": requested, "filled_shares": filled})
+
+        remaining_positions = [{"symbol": symbol, "shares": positions[symbol]} for symbol in sorted(positions)]
+        replayed_remaining = [
+            {"symbol": str(item["symbol"]), "shares": int(item["shares"])} for item in row["holdings"]
+        ]
+        replayed_remaining.sort(key=lambda item: item["symbol"])
+        if remaining_positions != replayed_remaining:
+            raise ExecutionReplayError("post-window symbol positions do not conserve through actions and fills")
+
+        filled_shares = sum(item["filled_shares"] for item in sell_orders)
+        fill_notional = float(sum(float(event.get("fill_notional_cny", 0.0)) for event in session_orders))
+        if (filled_shares == 0) != (fill_notional == 0):
+            raise ExecutionReplayError("post-window filled shares and fill notional are inconsistent")
+        pending_settlements_root = str(row["pending_settlements_root_sha256"])
+        pending_settlement_count = int(row["pending_settlement_count"])
+        unwind_sessions.append(
+            {
+                "session": session,
+                "sell_orders": sell_orders,
+                "terminal_dispositions": terminal_dispositions,
+                "terminal_share_receipts": terminal_share_receipts,
+                "remaining_positions": remaining_positions,
+                "pending_settlements_root_sha256": pending_settlements_root,
+                "pending_settlement_count": pending_settlement_count,
+                "session_events_root_sha256": object_sha256(
+                    [{"event_index": index, "event": dict(event)} for index, event in session_events]
+                ),
+                "session_event_count": len(session_events),
+                "fill_notional_cny": fill_notional,
+                **{
+                    component: float(sum(float(event.get(component, 0.0)) for event in session_orders))
+                    for component in (
+                        "commission_cny",
+                        "transfer_fee_cny",
+                        "stamp_duty_cny",
+                        "slippage_cost_cny",
+                    )
+                },
+            }
+        )
+        if (
+            not positions
+            and not pending_conversions
+            and pending_settlement_count == 0
+            and int(row["pending_sell_count"]) == 0
+        ):
+            completion_session = session
+            completion_economic_state = economic_state(row)
+            completion_economic_state_sha256 = object_sha256(completion_economic_state)
+            completion_state_sha256 = _require_sha256(row["state_sha256"], f"daily[{session}].state_sha256")
+            prior_heartbeat_state_sha256 = completion_state_sha256
+
+    if (
+        completion_session is None
+        or completion_economic_state is None
+        or completion_economic_state_sha256 is None
+        or completion_state_sha256 is None
+    ):
+        raise ExecutionReplayError(
+            "post-window unwind must clear positions, pending share conversions, and pending settlements"
+        )
     component = {
         "week_labels": week_labels,
         "daily_labels": daily_labels,
@@ -1634,6 +2661,23 @@ def build_weekly_path_component(result: Mapping[str, Any], cycles: Sequence[Mapp
             "weekly_one_way_turnover": weekly_turnover,
             "weekly_new_entry_identity_sets": new_entry_sets,
             "weekly_gate_eligible_new_entry_opportunities": opportunities,
+            "weekly_pretrade_nav_cny": weekly_pretrade_nav,
+            "weekly_explicit_costs_cny": weekly_explicit_costs,
+            "order_attempts": confirmation_orders,
+            "state_gate_observations": [dict(item) for item in (state_gate_observations or [])],
+            "post_window_unwind": {
+                "confirmation_end_session": final_end,
+                "completion_session": completion_session,
+                "completion_economic_state": completion_economic_state,
+                "completion_economic_state_sha256": completion_economic_state_sha256,
+                "completion_state_sha256": completion_state_sha256,
+                "starting_positions": starting_positions,
+                "pending_share_conversions": starting_pending_conversions,
+                "starting_pending_settlements_root_sha256": starting_pending_settlements_root,
+                "starting_pending_settlement_count": starting_pending_settlement_count,
+                "sessions": unwind_sessions,
+                "post_completion_heartbeats": post_completion_heartbeats,
+            },
         },
     }
     component["component_sha256"] = object_sha256(component)
@@ -1646,6 +2690,7 @@ __all__ = [
     "EXECUTION_INPUT_SCHEMA",
     "EXECUTION_RESULT_SCHEMA",
     "ExecutionReplayError",
+    "PENDING_SETTLEMENT_SCHEMA",
     "PORTFOLIO_STATE_SCHEMA",
     "SCENARIO_RESULT_SCHEMA",
     "canonical_json_bytes",
@@ -1653,6 +2698,7 @@ __all__ = [
     "empty_portfolio",
     "event_notional_and_costs",
     "object_sha256",
+    "pending_settlements_summary",
     "replay_cost_scenarios",
     "replay_execution",
     "selection_identity",
