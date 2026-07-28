@@ -1,0 +1,21 @@
+{
+  "external_timestamp_or_signature": false,
+  "ledger_schema": "xs_chan_stage3_exploration_ledger_v1",
+  "local_record_path": "000000_3f206409bb83021141448c61c190288fab57a09afae0ad9e517ccb596ecc9a71.json",
+  "logical_event_key": "genesis:xs_chan_exploration_stage3_state3_forward_20260728",
+  "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "record_hash": "3f206409bb83021141448c61c190288fab57a09afae0ad9e517ccb596ecc9a71",
+  "record_type": "genesis",
+  "recorded_at_utc": "2026-07-28T07:01:12.928335Z",
+  "required_follow_up": "commit_and_push_this_unique_anchor_without_rewriting_prior_anchors",
+  "schema": "xs_chan_stage3_tracked_ledger_head_anchor_v1",
+  "sequence": 0,
+  "source_replay": {
+    "protocol_anchor_git_commit": "990c863769a48d46055271fd883a83011e8c7050",
+    "status": "PROTOCOL_SOURCE_REPLAYED"
+  },
+  "source_sha256": "4f4a97407973246083e9d08c31044f21a1c4ecafde15dd43e81445ef9ba475ea",
+  "spec_physical_sha256": "3f01620964300440ee1d02ea374e7a42ea16ae3a48379675cc2543a5f64862fa",
+  "study_id": "xs_chan_exploration_stage3_state3_forward_20260728",
+  "study_identity": "f0afe61d932fbdf68b5b5ee242b68c7eed75bc932e4f6cf785bd7c9af51fb607"
+}
