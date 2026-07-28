@@ -1,0 +1,15 @@
+{
+  "external_timestamp_or_signature": false,
+  "first_prospective_decision_date": "2026-07-31",
+  "frozen_at_utc": "2026-07-28T06:58:03Z",
+  "parent_git_commit": "836816716bfbe0dccc6766c7478ce79d8a8e781b",
+  "schema": "xs_chan_stage3_exploration_anchor_v1",
+  "source_path": "scripts/xs_chan_exploration_stage3.py",
+  "source_sha256": "4f4a97407973246083e9d08c31044f21a1c4ecafde15dd43e81445ef9ba475ea",
+  "spec_canonical_sha256": "67986741b1e5e4cf72f9c1592519d21708ceb3e9864e1ae67adeec411ad6a5da",
+  "spec_path": "scripts/xs_chan_exploration_stage3.json",
+  "spec_physical_sha256": "3f01620964300440ee1d02ea374e7a42ea16ae3a48379675cc2543a5f64862fa",
+  "study_id": "xs_chan_exploration_stage3_state3_forward_20260728",
+  "study_identity": "f0afe61d932fbdf68b5b5ee242b68c7eed75bc932e4f6cf785bd7c9af51fb607",
+  "validity_requirement": "commit_and_push_protocol_source_anchor_before_2026-07-31T15:00:00+08:00"
+}
