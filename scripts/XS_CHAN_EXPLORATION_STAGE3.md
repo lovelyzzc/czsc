@@ -73,6 +73,15 @@ SHA256 本身仍不是第三方时间戳或数字签名。
 4. 退出日收盘后运行 `complete-label`，随后同样导出、提交并推送 head anchor；
 5. 下一事件若看不到上一个 head 的已推送 anchor，collector 会拒绝追加。
 
+首个 2026-07-31 decision 由
+`scripts/xs_chan_stage3_first_week.py` 作为外部操作保护层执行。它不替换或修改冻结
+collector/spec，也不改变 study identity；它只把首周的数据准备、完整八日期
+preflight、锁内最终复核以及 decision head anchor 导出做成 fail-closed 编排。
+因此首周步骤 3 的 `freeze-decision` 与紧随其后的 `export-head-anchor` 由该操作器一次
+完成，但导出的 anchor 仍必须在 entry open 前提交并推送。
+首周不得直接调用冻结 collector 自带的 `freeze-decision` CLI；该旧入口仅因研究身份与
+重放兼容性而保留，绕过保护层属于操作违规。
+
 ## 样本门与盲态
 
 窗口固定为前 52 个连续官方周，不允许延长：

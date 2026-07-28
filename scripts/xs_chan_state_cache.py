@@ -836,6 +836,10 @@ def build_state_cache(
             raise StateCacheInputError(f"multiple source files resolve to the same symbol: {duplicate_symbols}")
 
         prefix_audit = run_prefix_audit(generated, selected_config, min(workers, len(tasks)))
+        if not prefix_audit["passed"]:
+            raise StateProjectionError(
+                "prefix/full causality audit failed; refusing to publish a content-addressed state cache"
+            )
         projection_path = temporary / "states.parquet"
         _merge_parts(generated, projection_path)
         audit_parquet_path = temporary / "state_audit.parquet"

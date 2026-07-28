@@ -175,6 +175,32 @@ def test_prefix_full_audit_detects_future_dependent_states():
     assert audit["field_mismatches"]["regime"] > 0
 
 
+def test_failed_prefix_audit_is_never_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    data_dir = tmp_path / "data"
+    output_root = tmp_path / "output"
+    data_dir.mkdir()
+    _write_source(data_dir, "000001.SZ", rows=126)
+    monkeypatch.setattr(
+        state_cache,
+        "run_prefix_audit",
+        lambda *_args, **_kwargs: {"passed": False, "mismatch_count": 1},
+    )
+
+    with pytest.raises(state_cache.StateProjectionError, match="refusing to publish"):
+        state_cache.build_state_cache(
+            data_dir,
+            output_root,
+            workers=1,
+            config=state_cache.StateCacheConfig(audit_symbols=1, audit_checkpoints=1),
+        )
+
+    assert not list(output_root.glob("CHAN_STATE_CACHE_*"))
+    assert not list(output_root.glob(".tmp_*"))
+
+
 def test_content_addressed_cache_manifest_audit_and_no_overwrite(tmp_path: Path):
     data_dir = tmp_path / "data"
     output_root = tmp_path / "output"

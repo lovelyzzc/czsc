@@ -30,6 +30,36 @@ Reference、projection、raw closure 和 label observation 都保存在研究身
 content-addressed 本地对象中。rehearsal bundle 还内嵌了 study identity、spec hash 和
 collector source hash，不能被其他源码身份冒用。
 
+## 首周操作保护层
+
+`scripts/xs_chan_stage3_first_week.py` 是冻结 collector 外部的 fail-closed
+操作保护层，不是新的研究协议，也不参与 study identity 计算。它没有修改
+`scripts/xs_chan_exploration_stage3.json` 或
+`scripts/xs_chan_exploration_stage3.py`；因此冻结值仍为：
+
+- spec SHA256：
+  `3f01620964300440ee1d02ea374e7a42ea16ae3a48379675cc2543a5f64862fa`
+- collector SHA256：
+  `4f4a97407973246083e9d08c31044f21a1c4ecafde15dd43e81445ef9ba475ea`
+- study identity：
+  `f0afe61d932fbdf68b5b5ee242b68c7eed75bc932e4f6cf785bd7c9af51fb607`
+
+保护层只编排首个 2026-07-31 decision：
+
+- `status`、`preflight-decision` 和不带 apply flag 的命令不写正式 ledger；
+- `prepare-decision --apply-data` 只更新 raw、state、八日期 reference，并生成
+  content-addressed preflight receipt；
+- `freeze-decision --apply-ledger` 必须同时给出 receipt 和 expected head；
+- receipt、冻结前重新生成的 bridge path 与最终 decision payload 的 path hash
+  必须完全一致；
+- 在 ledger append lock 内重新检查新鲜时间、两小时安全余量、raw closure、
+  reference manifest 和 expected head；
+- decision 追加成功后，在同一个 ledger lock 内立即导出唯一 head anchor。
+
+Preflight receipt 会绑定操作器当时的源码 SHA256；该 SHA 不冒充或替代冻结研究身份。
+冻结 collector 仍保留原始 `freeze-decision` 入口以维持源码身份和重放能力，但首周严禁
+直接调用它；直接调用会绕过上述外部保护层，应视为操作违规。
+
 ## 三周管线演练
 
 以下三周均为 `PRE_GENESIS_RETROSPECTIVE_PIPELINE_FIXTURE_NEVER_COUNTS`：
@@ -129,23 +159,82 @@ parquet 与 auxiliary 联合快照身份、journal/audit 的文件及目录 `fsy
 完整性控制：本地系统时钟、Git commit time 和数据供应方内容都不是受托第三方签名。
 标签为可重放而明文保存，所以“盲态”只约束正式输出，不能阻止操作者主动查看公开行情。
 
-## 首周前仍需完成
+首周操作器的回归还覆盖时间窗口边界、dry-run 账本字节不变、八日期 reference
+完整性、raw/state/reference 漂移、expected-head 竞争、append-lock 内最终时钟复核、
+preflight/decision path 绑定和 anchor 自动导出；state cache 的 prefix/full audit
+失败时禁止发布 cache。
 
-当前已安全覆盖到 2026-07-27。正式 ledger 仍只有 genesis 1 条；decision、label、
-状态 3 事件和 efficacy 输出全部为 0。首周只剩因时间尚未到达而不能提前完成的动作：
+## 首周操作状态与下一步
 
-1. 先确认当前 Git HEAD 干净且等于已推送 upstream；2026-07-31 收盘且日线发布后，
-   再次按相同事务流程将 raw 更新到 07-31，并新建 content-addressed state cache，
-   要求 audit v2 的 execution binding 完整且 100 × 20 audit pass；
-2. 显式传入新的 state manifest，为 06-12、06-18、06-26、07-03、07-10、07-17、
-   07-24、07-31 八个日期冻结最终 reference；不能把本页七日期 readiness reference
-   用作正式决策；用最终 reference 重跑一次永不计数的 rehearsal 作为 preflight；
-3. reference fetch 后禁止再修改 active raw，在 07-31 15:00 Asia/Shanghai 后、
-   下一交易日 09:30 前运行
-   `freeze-decision 2026-07-31 --reference-manifest <FINAL_REF>`；
-4. 立即运行 `export-head-anchor`，提交并推送该唯一 head anchor；
-5. 退出日收盘后，运行
-   `complete-label 2026-07-31 --state-manifest <EXIT_MANIFEST>`，再导出、提交并推送
-   新 head anchor。
+当前操作状态为 `WAIT_DECISION_DATE`：
 
-任何一个前置 anchor 未提交并推送，下一事件都会被 collector 拒绝。
+- active raw：5,743 个 parquet，最大交易日 `2026-07-27`；
+- 正式 ledger：1 条 genesis，head
+  `3f206409bb83021141448c61c190288fab57a09afae0ad9e517ccb596ecc9a71`；
+- decision / label / 状态 3 事件：全部为 0；
+- 已计数前瞻周：`0 / 52`；
+- efficacy 输出：未生成；
+- 首周 decision / entry / exit：
+  `2026-07-31` / `2026-08-03` / `2026-08-10`。
+
+现在只运行只读状态或 dry-run：
+
+```bash
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py status
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py prepare-decision
+```
+
+2026-07-31 18:00 Asia/Shanghai 日线发布后，且严格早于
+2026-08-03 07:30 Asia/Shanghai，运行数据准备：
+
+```bash
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
+  prepare-decision --apply-data
+```
+
+保存输出中的 `reference_manifest_path`、`state_manifest_path`、
+`preflight_report_path` 和 `expected_head`。最终 reference 必须精确覆盖
+06-12、06-18、06-26、07-03、07-10、07-17、07-24、07-31；本页七日期
+readiness reference 不能用于正式 decision。
+
+先做不写账本的完整验证：
+
+```bash
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
+  preflight-decision \
+  --reference-manifest <FINAL_REF> \
+  --state-manifest <STATE_MANIFEST>
+
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
+  freeze-decision \
+  --reference-manifest <FINAL_REF> \
+  --state-manifest <STATE_MANIFEST>
+```
+
+验证通过后，才显式追加首个 decision：
+
+```bash
+uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
+  freeze-decision \
+  --apply-ledger \
+  --reference-manifest <FINAL_REF> \
+  --state-manifest <STATE_MANIFEST> \
+  --preflight-report <PREFLIGHT_REPORT> \
+  --expected-head <EXPECTED_HEAD>
+```
+
+该命令已经自动导出 decision head anchor，不要再单独重复
+`export-head-anchor`。应立即只提交并推送该 anchor，并严格早于
+2026-08-03 09:30 Asia/Shanghai 完成。
+
+2026-08-10 退出日收盘后，label 仍由冻结 collector 完成：
+
+```bash
+uv run --no-sync python scripts/xs_chan_exploration_stage3.py \
+  complete-label 2026-07-31 --state-manifest <EXIT_MANIFEST>
+uv run --no-sync python scripts/xs_chan_exploration_stage3.py \
+  export-head-anchor
+```
+
+随后提交并推送新的 label head anchor。任何前置 anchor 未提交并推送，下一事件都会
+被拒绝。
