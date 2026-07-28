@@ -15,6 +15,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -25,8 +26,9 @@ TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJ
 ts.set_token(TOKEN)
 pro = ts.pro_api()
 
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DEFAULT_START_DATE = "20210101"
-DEFAULT_END_DATE = datetime.now().strftime("%Y%m%d")
+DEFAULT_END_DATE = datetime.now(MARKET_TIMEZONE).strftime("%Y%m%d")
 DEFAULT_SAVE_DIR = Path(os.getenv("TS_CACHE_PATH", os.path.expanduser("~/.ts_data_cache"))) / "a_stock_daily_qfq"
 DEFAULT_SLEEP_SECONDS = float(os.getenv("SYNC_A_STOCK_SLEEP_SECONDS", "0.3"))
 DAILY_BAR_READY_HOUR = int(os.getenv("SYNC_A_STOCK_DAILY_BAR_READY_HOUR", "18"))
@@ -78,7 +80,7 @@ def normalize_trade_date(value: object) -> str:
 def get_expected_end_date(end_date: str) -> str:
     """获取 end_date 当天或之前的最近一个已闭合 A 股日线交易日。"""
     try:
-        now = datetime.now()
+        now = datetime.now(MARKET_TIMEZONE)
         end_dt = datetime.strptime(end_date, "%Y%m%d")
         if end_dt.date() > now.date():
             end_dt = now
@@ -198,9 +200,8 @@ def merge_incremental_cache(path: Path, new_data: pd.DataFrame) -> pd.DataFrame:
     if old_data.empty:
         return new_data
     merged = pd.concat([old_data, new_data], ignore_index=True)
-    return (
-        merged.drop_duplicates(subset=["trade_date"], keep="last")
-        .sort_values("trade_date", ascending=True, ignore_index=True)
+    return merged.drop_duplicates(subset=["trade_date"], keep="last").sort_values(
+        "trade_date", ascending=True, ignore_index=True
     )
 
 
