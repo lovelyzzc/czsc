@@ -17,6 +17,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     czsc_core::python::register(py, m)?;
     czsc_utils::python::register(py, m)?;
     czsc_ta::python::register(py, m)?;
+    czsc_trend_regime::python::register(py, m)?;
 
     // czsc-signals 通过 `inventory::collect!` 贡献 `SignalDescriptor`
     // 条目。这里用一次哑迭代强制把该 crate 链入最终的 cdylib，

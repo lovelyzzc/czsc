@@ -190,7 +190,7 @@ def get_trend_regime() -> Any:
                     sys.modules.pop("czsc", None)
                 else:
                     sys.modules["czsc"] = previous
-        domain = {int(regime) for regime in module.Regime}
+        domain = {int(regime) for regime in module.ALL_REGIMES}
         if domain != VALID_REGIMES:
             raise StateProjectionError(f"trend_regime domain changed: {sorted(domain)}")
         if int(module.WARMUP_BARS) != WARMUP_BARS:

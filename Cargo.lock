@@ -729,6 +729,7 @@ dependencies = [
  "czsc-signals",
  "czsc-ta",
  "czsc-trader",
+ "czsc-trend-regime",
  "czsc-utils",
  "inventory",
  "md5",
@@ -805,6 +806,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "czsc-trend-regime"
+version = "1.0.0-rc.8"
+dependencies = [
+ "chrono",
+ "czsc-core",
+ "czsc-ta",
+ "pyo3",
+ "pyo3-stub-gen",
 ]
 
 [[package]]

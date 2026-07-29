@@ -86,12 +86,12 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     utils.add_class::<BarGenerator>()?;
     parent.add_submodule(&utils)?;
 
-    // 同时在顶层暴露一份，这样 `from czsc._native import *` 时
-    // 规范名称可以直接可见（按 design doc §3.1）。
+    // 同时在顶层暴露一份
     parent.add_function(wrap_pyfunction!(is_trading_time, parent)?)?;
     parent.add_function(wrap_pyfunction!(freq_end_time, parent)?)?;
     parent.add_function(wrap_pyfunction!(monotonicity, parent)?)?;
     parent.add_function(wrap_pyfunction!(resample_bars, parent)?)?;
     parent.add_class::<BarGenerator>()?;
+
     Ok(())
 }

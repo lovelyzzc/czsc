@@ -213,6 +213,25 @@ def _walk(states, regime_by_idx, ind, symbol, buy_set, mode):
     return holds_all, pairs_all
 
 
+def _build_backtest_indicators(df: "pd.DataFrame") -> dict:
+    """从 DataFrame 提取回测所需的数组（open/close/high/low/vol/dates + ATR/Wyckoff）。"""
+    close = df["close"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    n = len(close)
+    return {
+        "close": close,
+        "open": df["open"].to_numpy(dtype=float),
+        "high": high,
+        "low": low,
+        "vol": df["vol"].to_numpy(dtype=float) if "vol" in df else np.ones(n),
+        "dates": df["dt"].to_numpy(),
+        "atr": _compute_atr(high, low, close),
+        "wmult": _wyckoff_mult(close),
+        "n": n,
+    }
+
+
 def _process(parquet_path):
     """单只票：产出全部 (buy_set × mode) 组合的 holds/pairs。"""
     df = tr.load_stock(parquet_path)
@@ -222,9 +241,7 @@ def _process(parquet_path):
     if len(states) < 30:
         return None
 
-    ind = tr.compute_indicators(df)
-    ind["atr"] = _compute_atr(ind["high"], ind["low"], ind["close"])
-    ind["wmult"] = _wyckoff_mult(ind["close"])
+    ind = _build_backtest_indicators(df)
     regime_by_idx = {s.idx: s.regime for s in states}
     symbol = df["symbol"].iloc[0]
 

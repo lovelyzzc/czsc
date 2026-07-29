@@ -31,7 +31,7 @@ pyo3           = { workspace = true, optional = true, features = ["chrono"] }
 pyo3-stub-gen  = { version = "0.22", optional = true }
 
 [features]
-python = ["pyo3", "pyo3-stub-gen"]
+python = ["pyo3", "pyo3-stub-gen", "czsc-core/python"]
 
 [dev-dependencies]
 chrono = { workspace = true }

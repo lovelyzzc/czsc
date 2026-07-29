@@ -52,6 +52,7 @@ czsc-signals       = { path = "crates/czsc-signals",       version = "1.0.0-rc.8
 czsc-trader        = { path = "crates/czsc-trader",        version = "1.0.0-rc.8" }
 czsc-signal-macros = { path = "crates/czsc-signal-macros", version = "1.0.0-rc.8" }
 czsc-derive        = { path = "crates/czsc-derive",        version = "1.0.0-rc.8" }
+czsc-trend-regime  = { path = "crates/czsc-trend-regime" }
 
 [profile.release]
 lto           = true

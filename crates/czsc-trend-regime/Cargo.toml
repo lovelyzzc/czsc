@@ -1,0 +1,27 @@
+[package]
+name                    = "czsc-trend-regime"
+version.workspace       = true
+edition.workspace       = true
+license.workspace       = true
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+authors.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+publish                 = false
+description             = "11-state trend regime FSM for czsc (extension crate, not part of core library)."
+
+[lib]
+name = "czsc_trend_regime"
+path = "src/lib.rs"
+
+[dependencies]
+chrono         = { workspace = true }
+czsc-core      = { workspace = true }
+czsc-ta        = { workspace = true }
+pyo3           = { workspace = true, optional = true, features = ["chrono"] }
+pyo3-stub-gen  = { version = "0.22", optional = true }
+
+[features]
+python = ["pyo3", "pyo3-stub-gen", "czsc-core/python"]

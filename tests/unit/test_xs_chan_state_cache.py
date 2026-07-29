@@ -70,7 +70,7 @@ def test_shim_loads_all_eleven_regimes_without_importing_czsc_top_level():
     previous = sys.modules.get("czsc")
     trend_regime = state_cache.get_trend_regime()
 
-    assert {int(regime) for regime in trend_regime.Regime} == set(range(11))
+    assert {int(regime) for regime in trend_regime.ALL_REGIMES} == set(range(11))
     assert trend_regime.WARMUP_BARS == 120
     assert callable(trend_regime.format_standard_kline)
     assert sys.modules.get("czsc") is previous
