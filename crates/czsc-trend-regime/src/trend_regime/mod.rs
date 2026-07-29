@@ -202,12 +202,54 @@ impl StateSnapshot {
     }
 }
 
-// ─── iter_states 主入口 ─────────────────────────────────────────
+// ─── bi_list 变更检测缓存 ────────────────────────────────────────
 
 use czsc_core::analyze::CZSC;
 use czsc_core::objects::bar::RawBar;
 use czsc_core::objects::direction::Direction;
 use czsc_core::objects::freq::Freq;
+use czsc_core::objects::zs::ZS;
+
+/// 缓存 `extract_zs_list` 结果和 dn_last_low，仅当 bi_list 发生变更时重算。
+///
+/// 指纹 `(bi_count, last_bi_edt)` 可捕获 push / pop / drain 全部变更场景。
+struct BiCache {
+    bi_count: usize,
+    last_bi_edt: Option<DateTime<Utc>>,
+    zs_list: Vec<ZS>,
+    dn_last_low: f64,
+}
+
+impl BiCache {
+    fn new() -> Self {
+        Self {
+            bi_count: 0,
+            last_bi_edt: None,
+            zs_list: Vec::new(),
+            dn_last_low: f64::NAN,
+        }
+    }
+
+    #[inline]
+    fn needs_update(&self, bis: &[czsc_core::objects::bi::BI]) -> bool {
+        let count = bis.len();
+        let edt = bis.last().map(|b| b.end_dt());
+        count != self.bi_count || edt != self.last_bi_edt
+    }
+
+    fn update(&mut self, bis: &[czsc_core::objects::bi::BI]) {
+        self.bi_count = bis.len();
+        self.last_bi_edt = bis.last().map(|b| b.end_dt());
+        self.zs_list = extract_zs_list(bis);
+        self.dn_last_low = bis
+            .iter()
+            .rev()
+            .find(|b| b.direction == Direction::Down)
+            .map_or(f64::NAN, |b| b.get_low());
+    }
+}
+
+// ─── iter_states 主入口 ─────────────────────────────────────────
 
 /// 流式重放整只个股，返回每个 bar 的因果状态快照。
 ///
@@ -215,6 +257,10 @@ use czsc_core::objects::freq::Freq;
 /// - `tail`：仅暖机到 `n-tail`、流式分类最后 `tail` 根（选股快路径）；
 ///   `None` 则全程从 warmup 开始（回测用）。
 /// - `limit_pct`：涨跌停判定阈值。
+///
+/// 性能优化：
+/// 1. `BiCache` —— 仅当 bi_list 发生变化时重算中枢列表（跳过 ~80% 的 bar）
+/// 2. 单遍 up/dn 分区 —— 消除 `classify_fsm` + `compute_features` 的重复扫描
 pub fn iter_states(
     bars: &[RawBar],
     _freq: Freq,
@@ -239,6 +285,7 @@ pub fn iter_states(
     let mut out: Vec<StateSnapshot> = Vec::with_capacity(n - start);
     let mut prev = Regime::NotTradable;
     let mut seeded = false;
+    let mut cache = BiCache::new();
 
     for idx in start..n {
         czsc.update_bar(bars[idx].clone());
@@ -248,29 +295,35 @@ pub fn iter_states(
         let not_tradable =
             bis.len() < min_bis || pct.abs() >= limit_pct || ind.vol[idx] <= 0.0;
 
-        let (regime, zs_list, dn_last_low) = if not_tradable {
-            (Regime::NotTradable, Vec::new(), f64::NAN)
+        let (regime, dn_last_low, feats, snap_zg, snap_zd) = if not_tradable {
+            (Regime::NotTradable, f64::NAN, None, f64::NAN, f64::NAN)
         } else {
-            let zs_list = extract_zs_list(bis);
+            if cache.needs_update(bis) {
+                cache.update(bis);
+            }
+
+            let (up, dn): (Vec<&_>, Vec<&_>) =
+                bis.iter().partition(|b| b.direction == Direction::Up);
+            let last_bi = bis.last().unwrap();
+
             if !seeded {
-                prev = seed_regime(bis, &zs_list, &ind, idx);
+                prev = seed_regime(bis, &cache.zs_list, &ind, idx);
                 seeded = true;
             }
-            let regime = classify_fsm(prev, bis, &zs_list, &ind, idx);
-            let dn: Vec<_> = bis.iter().filter(|b| b.direction == Direction::Down).collect();
-            let sl = if dn.is_empty() {
-                f64::NAN
+            let regime = classify_fsm(prev, &up, &dn, last_bi, &cache.zs_list, &ind, idx);
+            let feats = if with_features {
+                Some(compute_features(&up, &dn, &cache.zs_list, &ind, idx))
             } else {
-                dn.last().unwrap().get_low()
+                None
             };
-            (regime, zs_list, sl)
-        };
-
-        let zs = zs_list.last();
-        let feats = if with_features && regime != Regime::NotTradable {
-            Some(compute_features(bis, &zs_list, &ind, idx))
-        } else {
-            None
+            let zs = cache.zs_list.last();
+            (
+                regime,
+                cache.dn_last_low,
+                feats,
+                zs.map_or(f64::NAN, |z| z.zg),
+                zs.map_or(f64::NAN, |z| z.zd),
+            )
         };
 
         out.push(StateSnapshot {
@@ -281,8 +334,8 @@ pub fn iter_states(
             close: ind.close[idx],
             next_open: if idx + 1 < n { ind.open[idx + 1] } else { f64::NAN },
             sl_ref: dn_last_low,
-            zg: zs.map_or(f64::NAN, |z| z.zg),
-            zd: zs.map_or(f64::NAN, |z| z.zd),
+            zg: snap_zg,
+            zd: snap_zd,
             feats,
         });
 

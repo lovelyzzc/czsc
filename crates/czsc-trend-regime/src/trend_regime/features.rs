@@ -1,7 +1,6 @@
 //! 因果结构特征提取。
 
 use czsc_core::objects::bi::BI;
-use czsc_core::objects::direction::Direction;
 use czsc_core::objects::zs::ZS;
 
 use super::indicators::TrendIndicators;
@@ -119,14 +118,15 @@ impl FeatureSnapshot {
 }
 
 /// 该 bar 的因果结构特征（全部仅用 ≤idx 数据）。
+///
+/// `up`/`dn` 由调用方一次性分区后传入，避免重复 O(n) 扫描。
 pub fn compute_features(
-    bis: &[BI],
+    up: &[&BI],
+    dn: &[&BI],
     zs_list: &[ZS],
     ind: &TrendIndicators,
     idx: usize,
 ) -> FeatureSnapshot {
-    let up: Vec<&BI> = bis.iter().filter(|b| b.direction == Direction::Up).collect();
-    let dn: Vec<&BI> = bis.iter().filter(|b| b.direction == Direction::Down).collect();
     let zs = zs_list.last();
     let ma5 = ind.ma5[idx];
     let ma20 = ind.ma20[idx];

@@ -39,7 +39,7 @@ MAX_HOLD_DAYS = 60
 TRAIL_STOP = 0.18
 TRAIN_END = pd.Timestamp("2023-12-31")
 SELL_SET = tr.SELL_REGIMES  # {9, 10}
-UPTREND_FAMILY = {Regime.UpwardDeparture, Regime.ThirdBuy, Regime.MainUptrend, Regime.Acceleration}
+UPTREND_FAMILY = {int(Regime.UpwardDeparture), int(Regime.ThirdBuy), int(Regime.MainUptrend), int(Regime.Acceleration)}
 
 
 def _is_candidate(prev: int, regime: int, prior: list[int], mode: str) -> bool:

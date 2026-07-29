@@ -73,11 +73,11 @@ REGIME_CN = {
     Regime.Breakdown: "结构破坏",
 }
 
-BUY_REGIMES_MAIN = frozenset({Regime.ThirdBuy})
-BUY_REGIMES_WIDE = frozenset({Regime.UpwardDeparture, Regime.ThirdBuy})
-SELL_REGIMES = frozenset({Regime.Divergence, Regime.Breakdown})
+BUY_REGIMES_MAIN = frozenset({int(Regime.ThirdBuy)})
+BUY_REGIMES_WIDE = frozenset({int(Regime.UpwardDeparture), int(Regime.ThirdBuy)})
+SELL_REGIMES = frozenset({int(Regime.Divergence), int(Regime.Breakdown)})
 UPTREND_FAMILY = frozenset(
-    {Regime.UpwardDeparture, Regime.ThirdBuy, Regime.MainUptrend, Regime.Acceleration, Regime.Divergence}
+    {int(Regime.UpwardDeparture), int(Regime.ThirdBuy), int(Regime.MainUptrend), int(Regime.Acceleration), int(Regime.Divergence)}
 )
 
 
@@ -205,8 +205,8 @@ def _self_check(symbol: str) -> int:
             prev_e = Regime.from_int(s.prev_regime)
             arrow = (
                 "★买"
-                if regime_e in BUY_REGIMES_WIDE
-                else ("☆卖" if regime_e in SELL_REGIMES else "  ")
+                if s.regime in BUY_REGIMES_WIDE
+                else ("☆卖" if s.regime in SELL_REGIMES else "  ")
             )
             print(
                 f"  {s.dt.date()}  {prev_e!r:>24} → "

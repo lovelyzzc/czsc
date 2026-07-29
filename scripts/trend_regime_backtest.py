@@ -56,8 +56,8 @@ TEST_START = pd.Timestamp("2024-01-01")
 
 # 买点集合
 BUY_SETS = {
-    "W56_离开+三买": frozenset({Regime.UpwardDeparture, Regime.ThirdBuy}),
-    "T6_仅三买": frozenset({Regime.ThirdBuy}),
+    "W56_离开+三买": frozenset({int(Regime.UpwardDeparture), int(Regime.ThirdBuy)}),
+    "T6_仅三买": frozenset({int(Regime.ThirdBuy)}),
 }
 SELL_SET = tr.SELL_REGIMES  # {9, 10}
 

@@ -117,7 +117,7 @@ def find_surges(states, ind):
     for k2, s in enumerate(states):
         if k2 in surge_prior_ks:
             continue
-        if s.regime in (Regime.UpwardDeparture, Regime.ThirdBuy, Regime.MainUptrend) and s.feats:
+        if s.regime in (int(Regime.UpwardDeparture), int(Regime.ThirdBuy), int(Regime.MainUptrend)) and s.feats:
             control.append({key: s.feats.get(key) for key in FEATURE_KEYS})
     return surges, control
 

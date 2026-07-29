@@ -9,30 +9,70 @@ use super::{ACCEL_RET20, ACCEL_SPREAD, Regime, ZS_MIN_BIS};
 
 // ─── 中枢提取 ───────────────────────────────────────────────────
 
+/// 零拷贝检测一组笔是否构成有效中枢，返回 `(zg, zd, gg, dd)`。
+/// 不分配任何内存，仅做标量运算。
+#[inline]
+fn probe_zs(bis: &[BI]) -> Option<(f64, f64, f64, f64)> {
+    if bis.len() < ZS_MIN_BIS {
+        return None;
+    }
+    let zg = bis
+        .iter()
+        .take(3)
+        .map(|b| b.get_high())
+        .fold(f64::INFINITY, f64::min);
+    let zd = bis
+        .iter()
+        .take(3)
+        .map(|b| b.get_low())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if zg < zd {
+        return None;
+    }
+    let valid = bis.iter().all(|bi| {
+        let h = bi.get_high();
+        let l = bi.get_low();
+        (h <= zg && h >= zd) || (l <= zg && l >= zd) || (h >= zg && l <= zd)
+    });
+    if !valid {
+        return None;
+    }
+    let gg = bis
+        .iter()
+        .map(|b| b.get_high())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let dd = bis
+        .iter()
+        .map(|b| b.get_low())
+        .fold(f64::INFINITY, f64::min);
+    Some((zg, zd, gg, dd))
+}
+
 /// 把笔列表切成非重叠中枢，按时间升序返回。
+///
+/// 使用零拷贝探测 (`probe_zs`) 避免 grow loop 中的重复 `.to_vec()` 克隆，
+/// 仅对最终确认有效的窗口做一次 `Vec<BI>` 分配。
 pub fn extract_zs_list(bis: &[BI]) -> Vec<ZS> {
     let mut zs_list = Vec::new();
     let n = bis.len();
     let mut i = 0;
     while i + ZS_MIN_BIS <= n {
-        let zs = ZS::new(bis[i..i + ZS_MIN_BIS].to_vec());
-        if !zs.is_valid() {
+        if probe_zs(&bis[i..i + ZS_MIN_BIS]).is_none() {
             i += 1;
             continue;
         }
+        let mut best_end = i + ZS_MIN_BIS - 1;
         let mut k = i + ZS_MIN_BIS;
-        let mut best_zs = zs;
         while k < n {
-            let grown = ZS::new(bis[i..=k].to_vec());
-            if grown.is_valid() {
-                best_zs = grown;
+            if probe_zs(&bis[i..=k]).is_some() {
+                best_end = k;
                 k += 1;
             } else {
                 break;
             }
         }
-        zs_list.push(best_zs);
-        i = k;
+        zs_list.push(ZS::new(bis[i..=best_end].to_vec()));
+        i = best_end + 1;
     }
     zs_list
 }
@@ -67,16 +107,18 @@ fn dif_extreme_over(
 // ─── FSM 主函数 ─────────────────────────────────────────────────
 
 /// 给定前一状态 + 截至 idx 的因果笔结构，返回当前走势类型。
+///
+/// `up`/`dn`/`last_bi` 由调用方一次性分区后传入，避免重复 O(n) 扫描。
 pub fn classify_fsm(
     prev: Regime,
-    bis: &[BI],
+    up: &[&BI],
+    dn: &[&BI],
+    last_bi: &BI,
     zs_list: &[ZS],
     ind: &TrendIndicators,
     idx: usize,
 ) -> Regime {
-    let up: Vec<&BI> = bis.iter().filter(|b| is_up(b)).collect();
-    let dn: Vec<&BI> = bis.iter().filter(|b| !is_up(b)).collect();
-    let last = &bis[bis.len() - 1];
+    let last = last_bi;
     let zs = zs_list.last();
 
     let c = ind.close[idx];
