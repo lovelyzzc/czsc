@@ -4,6 +4,11 @@ The primary research comparator is F (the same factor path without the Chan
 gate). FMA is a secondary comparator. Neither comparator is a market index, so
 the resulting active returns must not be described as market alpha.
 
+The module also supports market-benchmark comparisons (EW-All, CSI1000) when
+the ``xs_chan_market_benchmark`` module has pre-computed benchmark returns.
+These comparisons use a separate code path that does NOT require registered
+HAC statistics, and are clearly labeled as "市场超额" in the output.
+
 This module is deliberately separate from ``xs_chan_exploration_stage2.py``:
 the Stage 2 publication identity binds that source file, and a derived report
 must not mutate the frozen study or its confirmation governance.
@@ -32,6 +37,33 @@ REGISTERED_METRIC = "paired_net_return_40bps"
 WEEKS_PER_YEAR = 52.0
 TARGET_SLOTS = 50.0
 DERIVED_OUTPUT_FILES = {"excess_curve.csv", "excess_metrics.csv", "report.md"}
+
+MARKET_PAIR_SPECS: dict[str, dict[str, str]] = {
+    "FC_minus_EW": {
+        "strategy": "FC",
+        "benchmark": "ew_all_return",
+        "name": "FC − EW-All · 缠论策略相对全A等权",
+        "comparison_role": "MARKET_BENCHMARK",
+    },
+    "F_minus_EW": {
+        "strategy": "F",
+        "benchmark": "ew_all_return",
+        "name": "F − EW-All · 纯因子相对全A等权",
+        "comparison_role": "FACTOR_MARKET_ALPHA",
+    },
+    "FC_minus_CSI1000": {
+        "strategy": "FC",
+        "benchmark": "000852_return",
+        "name": "FC − CSI1000 · 缠论策略相对中证1000",
+        "comparison_role": "INDEX_REFERENCE",
+    },
+    "F_minus_CSI1000": {
+        "strategy": "F",
+        "benchmark": "000852_return",
+        "name": "F − CSI1000 · 纯因子相对中证1000",
+        "comparison_role": "INDEX_REFERENCE",
+    },
+}
 
 PAIR_SPECS: dict[str, dict[str, str]] = {
     "FC_minus_F": {
@@ -562,14 +594,288 @@ def verify_report(path: Path) -> dict[str, Any]:
     }
 
 
+def _market_segment_curve(
+    strategy_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    decision_dates: pd.DatetimeIndex,
+    pair: str,
+    segment: str,
+) -> pd.DataFrame:
+    """Build a segment curve for market benchmark comparison (no registered stats required)."""
+
+    lo, hi = SEGMENTS[segment]
+    mask = (decision_dates >= lo) & (decision_dates <= hi)
+    if not mask.any():
+        return pd.DataFrame()
+
+    s_ret = strategy_returns[mask].to_numpy(dtype=float)
+    b_ret = benchmark_returns[mask].to_numpy(dtype=float)
+    dates = decision_dates[mask]
+    spec = MARKET_PAIR_SPECS[pair]
+
+    active = s_ret - b_ret
+    s_nav = np.cumprod(1.0 + s_ret)
+    b_nav = np.cumprod(1.0 + b_ret)
+    relative_nav = s_nav / b_nav
+    relative_with_base = np.r_[1.0, relative_nav]
+    relative_dd = relative_nav / np.maximum.accumulate(relative_with_base)[1:] - 1.0
+
+    return pd.DataFrame(
+        {
+            "decision_dt": dates,
+            "segment": segment,
+            "pair": pair,
+            "pair_name": spec["name"],
+            "strategy_net_return": s_ret,
+            "benchmark_net_return": b_ret,
+            "active_return": active,
+            "strategy_nav": s_nav,
+            "benchmark_nav": b_nav,
+            "relative_nav": relative_nav,
+            "relative_drawdown": relative_dd,
+            "cumulative_return_gap": s_nav - b_nav,
+        }
+    )
+
+
+def _market_segment_metrics(curve: pd.DataFrame) -> dict[str, Any]:
+    """Compute metrics for a market benchmark segment (no HAC registration)."""
+
+    if curve.empty:
+        return {}
+
+    active = curve["active_return"].to_numpy(dtype=float)
+    active_std = float(np.std(active, ddof=1)) if len(active) > 1 else 0.0
+    n = len(curve)
+    relative_nav = curve["relative_nav"].to_numpy(dtype=float)
+
+    return {
+        "segment": curve["segment"].iloc[0],
+        "pair": curve["pair"].iloc[0],
+        "pair_name": curve["pair_name"].iloc[0],
+        "comparison_role": MARKET_PAIR_SPECS[curve["pair"].iloc[0]]["comparison_role"],
+        "start": curve["decision_dt"].min(),
+        "end": curve["decision_dt"].max(),
+        "weeks": n,
+        "strategy_cumulative_return": float(curve["strategy_nav"].iloc[-1] - 1.0),
+        "benchmark_cumulative_return": float(curve["benchmark_nav"].iloc[-1] - 1.0),
+        "cumulative_return_gap": float(curve["cumulative_return_gap"].iloc[-1]),
+        "relative_wealth_return": float(relative_nav[-1] - 1.0),
+        "annualized_relative_return": float(relative_nav[-1] ** (WEEKS_PER_YEAR / n) - 1.0),
+        "active_weekly_mean": float(np.mean(active)),
+        "annualized_active_mean": float(np.mean(active) * WEEKS_PER_YEAR),
+        "tracking_error": float(active_std * math.sqrt(WEEKS_PER_YEAR)) if active_std > 0 else 0.0,
+        "information_ratio": (
+            float(np.mean(active) / active_std * math.sqrt(WEEKS_PER_YEAR)) if active_std > 0 else None
+        ),
+        "active_max_drawdown": float(curve["relative_drawdown"].min()),
+        "active_hit_rate": float(np.mean(active > 0)),
+    }
+
+
+def build_market_excess_tables(
+    weekly: pd.DataFrame,
+    benchmark_weekly: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build market-benchmark excess tables from path_weekly and market benchmark data.
+
+    Parameters
+    ----------
+    weekly : path_weekly from Stage 2 (arms F, FC, FMA with net_return_40bps)
+    benchmark_weekly : from xs_chan_market_benchmark (decision_dt, ew_all_return, 000852_return, ...)
+    """
+
+    weekly = weekly.copy()
+    weekly["decision_dt"] = pd.to_datetime(weekly["decision_dt"])
+    benchmark_weekly = benchmark_weekly.copy()
+    benchmark_weekly["decision_dt"] = pd.to_datetime(benchmark_weekly["decision_dt"])
+
+    curve_frames: list[pd.DataFrame] = []
+    metric_rows: list[dict[str, Any]] = []
+
+    for pair, spec in MARKET_PAIR_SPECS.items():
+        arm_name = spec["strategy"]
+        bench_col = spec["benchmark"]
+
+        if bench_col not in benchmark_weekly.columns:
+            continue
+
+        arm_data = weekly[weekly["arm"].eq(arm_name)].sort_values("decision_dt").reset_index(drop=True)
+        merged = arm_data.merge(benchmark_weekly[["decision_dt", bench_col]], on="decision_dt", how="inner")
+
+        if merged.empty:
+            continue
+
+        strategy_returns = merged["net_return_40bps"].astype(float)
+        bench_returns = merged[bench_col].astype(float)
+        decision_dates = pd.DatetimeIndex(merged["decision_dt"])
+
+        valid = np.isfinite(strategy_returns) & np.isfinite(bench_returns)
+        strategy_returns = strategy_returns[valid].reset_index(drop=True)
+        bench_returns = bench_returns[valid].reset_index(drop=True)
+        decision_dates = decision_dates[valid]
+
+        for segment in SEGMENTS:
+            curve = _market_segment_curve(strategy_returns, bench_returns, decision_dates, pair, segment)
+            if curve.empty:
+                continue
+            metrics = _market_segment_metrics(curve)
+            if metrics:
+                curve_frames.append(curve)
+                metric_rows.append(metrics)
+
+    if not curve_frames:
+        return pd.DataFrame(), pd.DataFrame()
+    return pd.concat(curve_frames, ignore_index=True), pd.DataFrame(metric_rows)
+
+
+def _market_metrics_table(metrics: pd.DataFrame, segment: str) -> str:
+    """Render a markdown table for market benchmark metrics."""
+
+    rows = [
+        "| 比较 | 策略累计 | 基准累计 | 累计收益差 | 相对财富收益 | 年化超额 | IR | 主动最大回撤 | 主动胜率 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    scoped = metrics[metrics["segment"].eq(segment)]
+    for _, row in scoped.iterrows():
+        ir_str = _num(row["information_ratio"]) if row["information_ratio"] is not None else "N/A"
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    str(row["pair_name"]),
+                    _pct(row["strategy_cumulative_return"]),
+                    _pct(row["benchmark_cumulative_return"]),
+                    _pp(row["cumulative_return_gap"]),
+                    _pct(row["relative_wealth_return"]),
+                    _pct(row["annualized_relative_return"]),
+                    ir_str,
+                    _pct(row["active_max_drawdown"]),
+                    _pct(row["active_hit_rate"]),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(rows)
+
+
+def render_market_benchmark_section(market_metrics: pd.DataFrame) -> str:
+    """Render the market benchmark section for the report."""
+
+    if market_metrics.empty:
+        return "\n## 市场超额收益\n\n市场基准数据不可用。请先运行：\n```\nuv run --no-sync python scripts/xs_chan_market_benchmark.py generate\n```\n"
+
+    lines = [
+        "",
+        "## 市场超额收益",
+        "",
+        "以下使用外部市场基准衡量策略的绝对 alpha。「全A等权」是最公平的 null hypothesis：",
+        "如果等权随机持有全部可交易A股，收益如何。中证1000 是小盘市值加权参照。",
+        "",
+        "**注意**：「F − EW-All」衡量的是纯因子选股本身的市场超额；「FC − F」（上文）衡量",
+        "缠论门控在因子基础上的增量。三层归因：",
+        "",
+        "```",
+        "策略总收益 = 市场 beta + 因子 alpha + 门控增量",
+        "市场 beta  ≈ EW-All 收益",
+        "因子 alpha ≈ F − EW-All",
+        "门控增量   ≈ FC − F",
+        "```",
+        "",
+        "### Historical validation（2024-01-05 至 2026-06-05）",
+        "",
+    ]
+
+    if "HISTORICAL_VALIDATION" in market_metrics["segment"].values:
+        lines.append(_market_metrics_table(market_metrics, "HISTORICAL_VALIDATION"))
+    else:
+        lines.append("（验证段数据不可用）")
+
+    lines.extend(["", "### 全样本", ""])
+    if "FULL" in market_metrics["segment"].values:
+        lines.append(_market_metrics_table(market_metrics, "FULL"))
+    else:
+        lines.append("（全样本数据不可用）")
+
+    lines.extend(
+        [
+            "",
+            "### 口径说明",
+            "",
+            "- 全A等权(EW-All)：每周所有可交易A股（开盘价>1元、有成交）的等权 5-session open-to-open 收益均值",
+            "- 中证1000(CSI1000)：官方指数同窗口 close-to-close 收益",
+            "- 策略使用 net_return_40bps（含买 15bps + 卖 25bps 成本），基准为零成本",
+            "- 基准不扣除分红再投资，策略侧也无分红调整，二者口径一致",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def generate_market_report(
+    weekly: pd.DataFrame,
+    *,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Generate market benchmark excess report as a standalone addon.
+
+    Returns a dict with status and file paths. Designed to be called after
+    the main generate_report() or independently.
+    """
+
+    try:
+        import xs_chan_market_benchmark as mkt
+    except ImportError:
+        import importlib.util
+
+        spec_obj = importlib.util.spec_from_file_location(
+            "xs_chan_market_benchmark",
+            Path(__file__).resolve().parent / "xs_chan_market_benchmark.py",
+        )
+        if spec_obj is None or spec_obj.loader is None:
+            return {"status": "MARKET_BENCHMARK_MODULE_NOT_FOUND"}
+        mkt = importlib.util.module_from_spec(spec_obj)
+        spec_obj.loader.exec_module(mkt)
+
+    try:
+        benchmark_weekly = mkt.load_benchmark_weekly()
+    except FileNotFoundError:
+        return {"status": "MARKET_BENCHMARK_NOT_GENERATED"}
+
+    market_curves, market_metrics = build_market_excess_tables(weekly, benchmark_weekly)
+
+    if market_metrics.empty:
+        return {"status": "NO_OVERLAPPING_DATES"}
+
+    if output_dir is None:
+        output_dir = DEFAULT_OUTPUT_ROOT / "market_benchmark"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    market_curves.to_csv(output_dir / "market_excess_curve.csv", index=False)
+    market_metrics.to_csv(output_dir / "market_excess_metrics.csv", index=False)
+
+    report_text = render_market_benchmark_section(market_metrics)
+    (output_dir / "market_benchmark_report.md").write_text(report_text, encoding="utf-8")
+
+    return {
+        "status": "GENERATED",
+        "output_dir": str(output_dir),
+        "weeks_matched": int(market_metrics["weeks"].max()) if not market_metrics.empty else 0,
+        "pairs": list(market_metrics["pair"].unique()),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     generate = subparsers.add_parser("generate", help="Generate the current excess-return report")
     generate.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    generate.add_argument("--with-market", action="store_true", help="Also generate market benchmark section")
     verify = subparsers.add_parser("verify", help="Verify a generated excess-return report")
     verify.add_argument("--path", type=Path)
     verify.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    market = subparsers.add_parser("market", help="Generate market-benchmark-only report")
+    market.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     return parser
 
 
@@ -578,12 +884,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "generate":
         path = generate_report(output_root=args.output_root)
         result = verify_report(path)
+        if getattr(args, "with_market", False):
+            spec = stage2.load_and_validate_spec()
+            stage2_dir = stage2.output_path_for(spec)
+            weekly = pd.read_parquet(stage2_dir / "path_weekly.parquet")
+            market_result = generate_market_report(weekly, output_dir=path / "market_benchmark")
+            result["market_benchmark"] = market_result
+    elif args.command == "market":
+        spec = stage2.load_and_validate_spec()
+        stage2_dir = stage2.output_path_for(spec)
+        weekly = pd.read_parquet(stage2_dir / "path_weekly.parquet")
+        result = generate_market_report(weekly, output_dir=args.output_root / "market_benchmark")
     else:
         if args.path is None:
             spec = stage2.load_and_validate_spec()
             args.path = args.output_root / f"EXCESS_{stage2.study_identity(spec)}"
         result = verify_report(args.path)
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
     return 0
 
 
