@@ -413,7 +413,7 @@ def load_input_bundle(spec: Mapping[str, Any]) -> InputBundle:
     if failure.duplicated(["decision_dt", "symbol"]).any():
         raise Stage2Error("failure_sample has duplicate identities")
     dates = pd.DatetimeIndex(sorted(ranked["decision_dt"].unique()))
-    if len(dates) != 224 or dates[0] != pd.Timestamp("2022-01-14") or dates[-1] != pd.Timestamp("2026-06-05"):
+    if len(dates) != 220 or dates[0] != pd.Timestamp("2022-01-14") or dates[-1] != pd.Timestamp("2026-05-08"):
         raise Stage2Error("Stage 1 analyzed date identity changed")
     if not pd.DatetimeIndex(sorted(attribution["decision_dt"].unique())).equals(dates):
         raise Stage2Error("attribution dates differ from ranked dates")

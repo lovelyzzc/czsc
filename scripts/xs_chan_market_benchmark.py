@@ -239,7 +239,7 @@ def fetch_index_daily(
             print(f"[benchmark] Index {ts_code}: loaded {len(df)} rows from cache", flush=True)
             return df.sort_values("trade_date").reset_index(drop=True)
 
-    import tushare as ts
+    import tinyshare as ts
 
     token = _resolve_tushare_token()
     ts.set_token(token)

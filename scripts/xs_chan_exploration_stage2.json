@@ -65,37 +65,37 @@
     {
       "name": "stage1_data_manifest",
       "path": "scripts/_output/xs_chan_exploration_stage1/data_manifest.json",
-      "sha256": "0f17cfbafe7f8b5fc829d039948ff97eaf3ed5d8bbd9d3d93228d60ab0e7e1fc"
+      "sha256": "8b36683184a9da7263a1e095bd7ce410321c242eced54c58cb170e8c5082f886"
     },
     {
       "name": "stage1_next_hypotheses",
       "path": "scripts/_output/xs_chan_exploration_stage1/next_hypotheses.json",
-      "sha256": "4d49f8605aaa12dfa2a85a42ae844f6aeb19502cad0002024367363781c0d151"
+      "sha256": "f3c98d6339b844e7e1b957e9272159a165a4ec01117626436a4825b5cea2662a"
     },
     {
       "name": "ranked_surface",
       "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
-      "sha256": "9c8617d6db02424151a97f209d1d57168d6586e37c27c3f4740fc2cf358ddcf6"
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a"
     },
     {
       "name": "buffered_memberships",
       "path": "scripts/_output/xs_chan_exploration_stage1/buffered_memberships.parquet",
-      "sha256": "6a55d9a7ae125c2fe1e86d8c5793edfe5aa57d39eaea81d496e10ca9c7d3e12b"
+      "sha256": "b1af1b1691e9c557a8c6b2eeac73b3322b409269a7066a2ca2f8f6720d845c9a"
     },
     {
       "name": "gate_proposals",
       "path": "scripts/_output/xs_chan_exploration_stage1/gate_proposals.parquet",
-      "sha256": "38cd8a7c3b9cdd77941f13938049e66bd98bd45462c52cd51b3f5a6d58d4b948"
+      "sha256": "b7b47573ae2452cd1182d70b2df11e5ef11a9bc0c9a575e5270321cace9908fe"
     },
     {
       "name": "attribution_weekly",
       "path": "scripts/_output/xs_chan_exploration_stage1/attribution_weekly.parquet",
-      "sha256": "5fe52a925f01f76e4029aea4f65afde4e38f9e4db57483095fe752de74431ad5"
+      "sha256": "fbda3f422e2cbdad33159514db1019a92fd26b343e2394c29a974078a2d3f67e"
     },
     {
       "name": "failure_sample",
       "path": "scripts/_output/xs_chan_exploration_stage1/failure_sample.parquet",
-      "sha256": "93efbccbb2b45184eae77cf830cf4123a9d9addfb73e35ecf5a0ef7194c976d6"
+      "sha256": "1963d8b7b991c7bc9539f95f50c17d90cb536cf08b10983d0efa0bcdc3ffbf07"
     }
   ],
   "time_split": {
@@ -103,15 +103,15 @@
     "development_end": "2023-12-29",
     "expected_development_weeks": 99,
     "historical_validation_start": "2024-01-05",
-    "historical_validation_end": "2026-06-05",
-    "expected_historical_validation_weeks": 125,
+    "historical_validation_end": "2026-05-08",
+    "expected_historical_validation_weeks": 121,
     "validation_half_1_start": "2024-01-05",
     "validation_half_1_end": "2025-03-14",
     "expected_validation_half_1_weeks": 62,
     "validation_half_2_start": "2025-03-21",
-    "validation_half_2_end": "2026-06-05",
-    "expected_validation_half_2_weeks": 63,
-    "boundary_rule": "fixed_from_the_224_stage1_analyzed_decision_dates",
+    "validation_half_2_end": "2026-05-08",
+    "expected_validation_half_2_weeks": 59,
+    "boundary_rule": "fixed_from_the_220_stage1_analyzed_decision_dates",
     "week_weighting": "equal_weight_across_common_decision_weeks"
   },
   "statistics": {
