@@ -3157,6 +3157,42 @@ def status_snapshot(
             }
         return {**base, "state": "ABORTED_INVALID", "reason": str(exc)}
 
+    if not _decision_rows(records):
+        try:
+            decision_status = first_week.status_snapshot(
+                decision_date=decision_date_assertion,
+                data_dir=data_dir,
+                now=current,
+            )
+        except (
+            WeeklyOperationError,
+            first_week.FirstWeekOperationError,
+            stage3.Stage3Error,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return {**base, "state": "INVALID_LOCAL_EVIDENCE", "reason": str(exc)}
+        decision_state = decision_status.get("state")
+        if not isinstance(decision_state, str) or not decision_state:
+            return {
+                **base,
+                "state": "INVALID_LOCAL_EVIDENCE",
+                "reason": "bootstrap decision status did not provide a state",
+            }
+        return {
+            **base,
+            "state": decision_state,
+            "decision_date": decision_status.get("decision_date"),
+            "decision_status": decision_status,
+            "global_decision_priority": {
+                "status": "BOOTSTRAP_DECISION_STATUS_MIRRORED",
+                "decision_state": decision_state,
+                "decision_date": decision_status.get("decision_date"),
+            },
+        }
+
     try:
         priority = validate_no_missed_decision_window(
             spec,

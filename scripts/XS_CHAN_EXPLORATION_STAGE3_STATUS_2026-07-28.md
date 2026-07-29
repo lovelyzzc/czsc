@@ -246,7 +246,7 @@ uv run --no-sync python scripts/xs_chan_stage3_weekly.py status
 
 ```bash
 uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
-  --decision-date 2026-08-07 status
+  --decision-date 2026-07-31 status
 ```
 
 2026-07-31 18:00 Asia/Shanghai 日线发布后，且严格早于

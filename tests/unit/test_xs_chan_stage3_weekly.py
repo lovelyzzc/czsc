@@ -1745,9 +1745,20 @@ def test_status_aborts_current_decision_with_broken_successor_edge(
     assert "INVALID_DECISION_EVIDENCE_CHAIN" in result["reason"]
 
 
-def test_status_prior_chain_validation_is_explicitly_no_network(
+@pytest.mark.parametrize(
+    "decision_state",
+    [
+        "WAIT_DECISION_DATE",
+        "WAIT_DAILY_RELEASE",
+        "NEEDS_RAW_TARGET",
+        "MISSED_SAFE_APPLY_WINDOW",
+        "MISSED_DECISION_WINDOW",
+    ],
+)
+def test_genesis_status_mirrors_bootstrap_decision_without_network_or_writes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    decision_state: str,
 ) -> None:
     genesis = {
         "record_type": "genesis",
@@ -1776,20 +1787,60 @@ def test_status_prior_chain_validation_is_explicitly_no_network(
         "validate_stage3_operator_pair_chain",
         lambda *_a, verify_actual_remote, **_k: scopes.append(verify_actual_remote) or [],
     )
+    status_calls: list[tuple[str | None, Path, datetime]] = []
+
+    def decision_status(
+        *,
+        decision_date: str | None,
+        data_dir: Path,
+        now: datetime,
+    ) -> dict[str, Any]:
+        status_calls.append((decision_date, data_dir, now))
+        return {
+            "state": decision_state,
+            "decision_date": "2026-07-31",
+            "formal_ledger_mutated": False,
+        }
+
+    monkeypatch.setattr(
+        weekly.first_week,
+        "status_snapshot",
+        decision_status,
+    )
     monkeypatch.setattr(
         weekly,
         "validate_no_missed_decision_window",
-        lambda *_a, **_k: {"status": "NO_PENDING_DECISION_WINDOW"},
+        lambda *_a, **_k: pytest.fail("genesis status used post-D1 priority"),
     )
     monkeypatch.setattr(
         weekly,
         "derive_oldest_unlabeled_target",
-        lambda *_a, **_k: None,
+        lambda *_a, **_k: pytest.fail("genesis status tried to derive a label"),
     )
+    monkeypatch.setattr(
+        weekly.first_week,
+        "validate_actual_remote_branch",
+        lambda: pytest.fail("genesis status performed actual-remote I/O"),
+    )
+    monkeypatch.setattr(
+        stage3,
+        "_exclusive_write",
+        lambda *_a, **_k: pytest.fail("genesis status wrote formal evidence"),
+    )
+    clock = datetime(2026, 7, 31, 6, tzinfo=UTC)
     result = weekly.status_snapshot(
-        decision_date_assertion=None,
+        decision_date_assertion="2026-07-31",
         state_manifest_path=None,
         data_dir=data,
+        now=clock,
     )
-    assert result["state"] == "WAIT_NEXT_DECISION"
+    assert result["state"] == decision_state
+    assert result["decision_date"] == "2026-07-31"
+    assert result["decision_status"]["state"] == decision_state
+    assert result["global_decision_priority"] == {
+        "status": "BOOTSTRAP_DECISION_STATUS_MIRRORED",
+        "decision_state": decision_state,
+        "decision_date": "2026-07-31",
+    }
+    assert status_calls == [("2026-07-31", data, clock)]
     assert scopes == [False]
