@@ -78,9 +78,38 @@ SHA256 本身仍不是第三方时间戳或数字签名。
 collector/spec，也不改变 study identity；它只把首周的数据准备、完整八日期
 preflight、锁内最终复核以及 decision head anchor 导出做成 fail-closed 编排。
 因此首周步骤 3 的 `freeze-decision` 与紧随其后的 `export-head-anchor` 由该操作器一次
-完成，但导出的 anchor 仍必须在 entry open 前提交并推送。
+完成。操作器还会在 record 写入前持久化精确的 append authorization，并导出匹配的
+Git sidecar；anchor 与 sidecar 必须作为唯一两个变更、在同一个单父提交中提交并推送，
+该提交的父提交必须正是 authorization 绑定的远端 HEAD，且必须严格早于 entry open。
 首周不得直接调用冻结 collector 自带的 `freeze-decision` CLI；该旧入口仅因研究身份与
-重放兼容性而保留，绕过保护层属于操作违规。
+重放兼容性而保留。直接调用产生的 decision 没有 append-before-record authorization，
+状态会永久标记为 `UNAUTHORIZED_DECISION_PRESENT`，不能事后补造 authorization 洗白。
+
+首周保护层还固定以下与结果无关的完整性门：
+
+- 每个新增 raw session 的 daily 股票全集至少 4,000 个；
+- 相对上一个 active session 至少保留 95%，对称集合变化不超过 5%；
+- daily 中每个股票必须有同日 `adj_factor`；factor-only 股票允许存在，但必须计数并
+  哈希；
+- 八日期 `daily_basic` bridge 使用相同的 4,000 / 95% / 5% 门，正式目标日还必须
+  完整覆盖 raw daily 股票全集，额外股票不超过 raw 全集的 5%。
+
+这些证据被纳入 raw execution binding、audit、首周 preflight 和最终 authorization。
+正式发布在目录交换前还会从旧 raw snapshot 的实际 parquet 行以及内容寻址的
+calendar/daily/adj-factor CSV 独立重算整份报告，并要求与 binding 和 audit 顶层逐字节
+等价。正式 binding 固定当前研究分支、upstream、fetch/push URL 和真实远端 ref，并在
+交换紧前直接查询远端 SHA；active/candidate 在交换前后、audit commit 前和清理旧目录前
+都必须保持绑定的双侧闭包。snapshot root 不得位于 active raw 内，candidate、snapshot
+及 API/full-qfq 证据都拒绝 symlink/非普通文件，并在正式可见前同步文件和目录项。门是在
+恢复时只有固定 audit 根下、哈希文件名与 canonical JSON 相符且精确绑定
+data_dir/before/after/binding 的文件才是 commit marker。门是在 2026-07-31 数据获取前
+冻结的；旧 audit 不会被追溯性补写成已证明。
+
+若 record 已获预授权但进程在 sidecar 或 anchor 写出前后崩溃，恢复只允许当前
+authorization 所绑定的 Git HEAD、远端和原始数据闭包，并只容许这两个预期证据路径为
+dirty。合法 append 的记录时间仍必须在两小时安全截止前；恢复可持续到 entry open
+之前。若双文件提交已推送，重试只做幂等验证，不再要求旧 raw 闭包仍是当前 active
+数据。所有 collector 证据写入都经过 complete-or-absent 的同文件系统原子发布。
 
 ## 样本门与盲态
 

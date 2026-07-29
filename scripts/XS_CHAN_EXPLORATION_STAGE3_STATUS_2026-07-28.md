@@ -52,13 +52,31 @@ collector source hash，不能被其他源码身份冒用。
 - `freeze-decision --apply-ledger` 必须同时给出 receipt 和 expected head；
 - receipt、冻结前重新生成的 bridge path 与最终 decision payload 的 path hash
   必须完全一致；
-- 在 ledger append lock 内重新检查新鲜时间、两小时安全余量、raw closure、
-  reference manifest 和 expected head；
-- decision 追加成功后，在同一个 ledger lock 内立即导出唯一 head anchor。
+- 正式 raw sync 与八日期 `daily_basic` 都执行预先固定的 4,000 个股票绝对下限、
+  相邻 session 95% 保留率和 5% 对称变化门；
+- daily 股票必须全部具有同日 `adj_factor`，目标 `daily_basic` 必须完整覆盖 raw
+  daily 股票全集；
+- 在 ledger append lock 内重新检查固定分支、upstream、远端 URL、实际远端 HEAD、
+  新鲜时间、两小时安全余量、raw closure、reference manifest 和 expected head；
+- 在 record 出现前先写入精确 anticipated record hash 的 content-addressed
+  authorization；事后对已有 record 调用授权存储会被拒绝；
+- decision 追加成功后，在同一个 ledger lock 内以 complete-or-absent 原子写立即导出
+  唯一 head anchor 和 matching authorization sidecar。
 
 Preflight receipt 会绑定操作器当时的源码 SHA256；该 SHA 不冒充或替代冻结研究身份。
 冻结 collector 仍保留原始 `freeze-decision` 入口以维持源码身份和重放能力，但首周严禁
-直接调用它；直接调用会绕过上述外部保护层，应视为操作违规。
+直接调用它。没有 append-before-record authorization 的 decision 会被状态机永久标记为
+`UNAUTHORIZED_DECISION_PRESENT`，不能事后恢复或补造 sidecar。
+
+授权 sidecar 与 decision anchor 必须在一个只包含这两个路径的单父 Git commit 中提交；
+其父提交必须精确等于 authorization 绑定的 `mine/feat/surge-wave-strategy` HEAD，
+fetch/push URL 必须都是 `git@github.com:lovelyzzc/czsc.git`。历史 sidecar 使用该父
+提交中的 operator blob 验证，不会因未来 operator 合法升级而失效。
+
+崩溃恢复只允许缺失/未提交的 matching sidecar 与 anchor 为工作区变更，并重新核对原始
+raw/state/reference 证据。record 必须在两小时安全截止前已经合法获授权，但证据恢复可在
+安全截止后继续到 entry open；已提交并推送的双文件 pair 可在任何后续时间幂等验证，不会
+错误要求 active raw 回退到旧闭包。
 
 ## 三周管线演练
 
@@ -143,26 +161,33 @@ execution proof。内容寻址的 post-hoc attestation
 六月误计数、future outcome 字段、伪造 label return、任意 ledger identity、对象删除和
 terminal 后追加。
 
-另有 17 项 raw 同步/凭证回归覆盖全 inventory 扫描、闭包幂等、重叠日替换、任意复权因子变化
+另有 70 项 raw 同步/凭证回归覆盖全 inventory 扫描、闭包幂等、重叠日替换、任意复权因子变化
 触发全刷、首行引用空值边界、断点对象 hash 绑定、staging 接缝修复、新代码 fail-closed、
 parquet 与 auxiliary 联合快照身份、journal/audit 的文件及目录 `fsync`、无 journal
 候选拒删、execution binding 参数敏感性、源码漂移回滚，以及 post-hoc 凭证禁止越权声称
-原执行源码已证明。
+原执行源码已证明；还覆盖严重缩量、异常扩张、缺失 factor、正常小幅增删与 completeness
+binding 篡改、固定分支/upstream/URL/真实远端 SHA、snapshot 路径隔离、symlink 拒绝、
+文件级持久化、目录交换双侧闭包竞态，以及伪造 audit commit marker 拒绝。
 
-下一次 `--apply` 会要求干净且已推送的 Git HEAD，并在网络抓取前冻结 updater、
-下载器、接缝修复器、`uv.lock`、依赖版本和规范化运行参数；交换前与 audit 发布前
-再次验证 binding。journal 在目录交换前持久化，audit 只有在文件和目录项都
-`fsync` 后才成为 commit marker。
+下一次 `--apply` 会要求干净且已推送的固定研究分支，并绑定 upstream、fetch/push URL
+与直接 `ls-remote` 得到的真实远端 SHA；网络抓取前还会冻结 updater、下载器、接缝
+修复器、`uv.lock`、依赖版本和规范化运行参数。目录交换前会从 old v2 snapshot 的实际
+目标日 parquet 行重建 baseline，并从冻结的 calendar/daily/adj-factor CSV 重建完整
+session 链和 completeness report；重算结果必须同时等于 binding 与 audit 顶层报告。
+snapshot root 必须在 active raw 外，正式 payload 必须是 no-follow 普通文件并完成
+file/directory `fsync`。交换前后、audit commit 前和旧目录清理前均重核 active/candidate
+双侧闭包；journal 在交换前持久化，audit 才是 commit marker。
 
 `status` / `evaluate` 必须从磁盘重扫账本并重放对象。每个新 head 导出 Git anchor 前，
 还会用当时磁盘上的 raw/reference 闭包重新生成当前 decision 或 label。它仍是本地
 完整性控制：本地系统时钟、Git commit time 和数据供应方内容都不是受托第三方签名。
 标签为可重放而明文保存，所以“盲态”只约束正式输出，不能阻止操作者主动查看公开行情。
 
-首周操作器的回归还覆盖时间窗口边界、dry-run 账本字节不变、八日期 reference
+首周操作器的 50 项回归还覆盖时间窗口边界、dry-run 账本字节不变、八日期 reference
 完整性、raw/state/reference 漂移、expected-head 竞争、append-lock 内最终时钟复核、
-preflight/decision path 绑定和 anchor 自动导出；state cache 的 prefix/full audit
-失败时禁止发布 cache。
+preflight/decision path 绑定、append-before-record 授权、直接 CLI 绕过拒绝、双文件
+Git parent 绑定、崩溃恢复、已推送幂等重试和原子证据写；state cache 的 prefix/full
+audit 失败时禁止发布 cache。
 
 ## 首周操作状态与下一步
 
@@ -224,8 +249,19 @@ uv run --no-sync python scripts/xs_chan_stage3_first_week.py \
 ```
 
 该命令已经自动导出 decision head anchor，不要再单独重复
-`export-head-anchor`。应立即只提交并推送该 anchor，并严格早于
-2026-08-03 09:30 Asia/Shanghai 完成。
+`export-head-anchor`。应立即在同一个 commit 中只提交输出指定的 decision anchor 和
+matching authorization sidecar，然后推送；这个 commit 的父提交必须仍是命令绑定的
+远端 HEAD，并严格早于 2026-08-03 09:30 Asia/Shanghai 完成。
+
+## 第二周先于首周标签
+
+账本事件必须按 collector 冻结的周索引顺序推进。第二个 prospective decision 是
+`2026-08-07`，它必须在 `2026-08-10 09:30 Asia/Shanghai` 前冻结、导出 anchor、
+提交并推送；之后才能在 2026-08-10 收盘后完成首周 label。若先写首周 label，
+collector 的下一 decision 周索引会被跳过，链将无法按注册的连续 52 周恢复。
+
+当前 `xs_chan_stage3_first_week.py` 只保护 2026-07-31。因而在 2026-08-07 前还必须完成
+并审计通用周操作器；在它就绪前，不要把下面的 label 命令当作下一条立即可执行命令。
 
 2026-08-10 退出日收盘后，label 仍由冻结 collector 完成：
 

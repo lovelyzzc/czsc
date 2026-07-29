@@ -19,11 +19,17 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
+import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -43,6 +49,9 @@ from _sync_daily_data import (
     DEFAULT_SNAPSHOT_ROOT,
     MARKET_TIMEZONE,
     SNAPSHOT_MANIFEST_FILE_NAME,
+    SOURCE_SYMBOL_ABSOLUTE_MINIMUM,
+    SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE,
+    SOURCE_SYMBOL_MIN_PREVIOUS_SESSION_COVERAGE,
     DailySyncError,
     active_manifest_matches,
     assert_execution_binding_current,
@@ -75,7 +84,40 @@ FIRST_WEEK_EXIT_DATE = "2026-08-10"
 ANCHOR_PUSH_RESERVE = timedelta(hours=2)
 DEFAULT_STATE_OUTPUT_ROOT = Path.home() / ".ts_data_cache" / "xs_chan_state_cache_stage3"
 OPERATOR_LOCK_FILE = ".first_week_operator.lock"
+ATOMIC_STAGING_DIR = ".first_week_atomic_staging"
 PREFLIGHT_CATEGORY = "first_week_preflight"
+FINAL_PREFLIGHT_CATEGORY = "first_week_final_preflight"
+APPEND_AUTHORIZATION_CATEGORY = "first_week_append_authorization"
+AUTHORIZATION_SCHEMA = "xs_chan_stage3_first_week_append_authorization_v1"
+AUTHORIZATION_SIDECAR_SCHEMA = "xs_chan_stage3_first_week_operator_authorization_v1"
+AUTHORIZATION_SIDECAR_DIR_NAME = "xs_chan_exploration_stage3_operator_authorizations"
+REFERENCE_SYMBOL_ABSOLUTE_MINIMUM = SOURCE_SYMBOL_ABSOLUTE_MINIMUM
+REFERENCE_SYMBOL_MIN_PREVIOUS_COVERAGE = SOURCE_SYMBOL_MIN_PREVIOUS_SESSION_COVERAGE
+REFERENCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE = SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE
+REFERENCE_SYMBOL_MAX_RAW_EXTRA_SHARE = SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE
+REQUIRED_GIT_BRANCH = "feat/surge-wave-strategy"
+REQUIRED_GIT_UPSTREAM = "mine/feat/surge-wave-strategy"
+REQUIRED_GIT_REMOTE_URL = "git@github.com:lovelyzzc/czsc.git"
+
+
+class _AuthorizationLockLease:
+    """A process/thread-bound, revocable proof that the physical lock is held."""
+
+    __slots__ = ("active", "pid", "root", "thread_id")
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.pid = os.getpid()
+        self.thread_id = threading.get_ident()
+        self.active = True
+
+
+_AUTHORIZED_LEDGER_LOCK_LEASE: ContextVar[_AuthorizationLockLease | None] = ContextVar(
+    "xs_chan_stage3_authorized_ledger_lock_lease",
+    default=None,
+)
+_AUTHORIZATION_PHYSICAL_LOCKS = threading.local()
+_STAGE3_PATCH_LOCK = threading.RLock()
 
 
 class FirstWeekOperationError(RuntimeError):
@@ -121,6 +163,26 @@ def _git_output(repo_root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
+def _git_file_sha256_at_commit(
+    repo_root: Path,
+    commit: str,
+    relative_path: str,
+) -> str:
+    try:
+        completed = subprocess.run(
+            ("git", "show", f"{commit}:{relative_path}"),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout).decode(errors="replace").strip()
+        raise FirstWeekOperationError(
+            f"cannot read authorized operator bytes from Git commit {commit}: {detail}"
+        ) from exc
+    return sha256_bytes(completed.stdout)
+
+
 def validate_git_ready(
     *,
     repo_root: Path = stage3.REPO_ROOT,
@@ -152,11 +214,24 @@ def validate_git_ready(
     if upstream_head != head:
         raise FirstWeekOperationError(f"HEAD {head} differs from upstream {upstream_head}")
 
+    if branch != REQUIRED_GIT_BRANCH or upstream_name != REQUIRED_GIT_UPSTREAM:
+        raise FirstWeekOperationError(
+            "first-week formal operations are bound to "
+            f"{REQUIRED_GIT_UPSTREAM}; got branch={branch!r}, upstream={upstream_name!r}"
+        )
+    remote_name, separator, remote_branch = upstream_name.partition("/")
+    if not separator or not remote_name or not remote_branch:
+        raise FirstWeekOperationError(f"cannot resolve remote branch from upstream {upstream_name!r}")
+    fetch_url = _git_output(repo_root, "remote", "get-url", remote_name)
+    push_url = _git_output(repo_root, "remote", "get-url", "--push", remote_name)
+    if fetch_url != REQUIRED_GIT_REMOTE_URL or push_url != REQUIRED_GIT_REMOTE_URL:
+        raise FirstWeekOperationError(
+            "first-week remote URL differs from the frozen operator destination: "
+            f"fetch={fetch_url!r}, push={push_url!r}"
+        )
+
     remote_head: str | None = None
     if verify_remote:
-        remote_name, separator, remote_branch = upstream_name.partition("/")
-        if not separator or not remote_name or not remote_branch:
-            raise FirstWeekOperationError(f"cannot resolve remote branch from upstream {upstream_name!r}")
         remote_output = _git_output(
             repo_root,
             "ls-remote",
@@ -174,7 +249,81 @@ def validate_git_ready(
         "upstream": upstream_name,
         "upstream_head": upstream_head,
         "remote_head": remote_head,
+        "remote_fetch_url": fetch_url,
+        "remote_push_url": push_url,
+        "remote_verified": verify_remote,
         "worktree_clean": True,
+    }
+
+
+def validate_recovery_git_ready(
+    authorization: Mapping[str, Any],
+    *,
+    allowed_dirty_paths: set[str],
+    repo_root: Path = stage3.REPO_ROOT,
+) -> dict[str, Any]:
+    """Allow only the exact uncommitted evidence files after an append crash."""
+
+    branch = _git_output(repo_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    upstream = _git_output(
+        repo_root,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    )
+    upstream_head = _git_output(repo_root, "rev-parse", "@{upstream}")
+    remote_name, separator, remote_branch = upstream.partition("/")
+    if not separator or not remote_name or not remote_branch:
+        raise FirstWeekOperationError(f"cannot resolve recovery upstream {upstream!r}")
+    fetch_url = _git_output(repo_root, "remote", "get-url", remote_name)
+    push_url = _git_output(repo_root, "remote", "get-url", "--push", remote_name)
+    remote_output = _git_output(
+        repo_root,
+        "ls-remote",
+        "--heads",
+        remote_name,
+        f"refs/heads/{remote_branch}",
+    )
+    remote_matches = [line.split(maxsplit=1)[0] for line in remote_output.splitlines() if line.strip()]
+    authorized_git = authorization.get("git")
+    if not isinstance(authorized_git, Mapping):
+        raise FirstWeekOperationError("append authorization has no Git evidence")
+    current_core = {
+        "branch": branch,
+        "head": head,
+        "upstream": upstream,
+        "upstream_head": upstream_head,
+        "remote_head": remote_matches[0] if len(remote_matches) == 1 else None,
+        "remote_fetch_url": fetch_url,
+        "remote_push_url": push_url,
+        "remote_verified": len(remote_matches) == 1,
+    }
+    authorized_core = {key: authorized_git.get(key) for key in current_core}
+    if current_core != authorized_core or remote_matches != [head] or authorized_git.get("worktree_clean") is not True:
+        raise FirstWeekOperationError("recovery Git branch, URLs or actual remote differ from the authorized append")
+
+    dirty_entries = _git_output(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).splitlines()
+    dirty_paths: set[str] = set()
+    for entry in dirty_entries:
+        if len(entry) < 4 or " -> " in entry[3:]:
+            raise FirstWeekOperationError(f"cannot safely parse recovery Git status entry: {entry!r}")
+        dirty_paths.add(entry[3:])
+    if not dirty_paths <= allowed_dirty_paths:
+        raise FirstWeekOperationError(
+            "recovery worktree contains changes beyond the exact decision evidence: "
+            f"{sorted(dirty_paths - allowed_dirty_paths)}"
+        )
+    return {
+        **current_core,
+        "worktree_clean": not dirty_entries,
+        "allowed_dirty_paths": sorted(dirty_paths),
     }
 
 
@@ -238,6 +387,215 @@ def operator_lock(root: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def authorization_ledger_lock(root: Path) -> Iterator[None]:
+    """Hold the physical ledger lock and expose that fact only in this context."""
+
+    resolved = root.expanduser().resolve()
+    if _active_authorization_lock_lease() is not None or _physical_authorization_lock_owned(resolved):
+        raise FirstWeekOperationError("authorization ledger lock cannot be nested")
+    with stage3._exclusive_lock(root):
+        physical_locks = _physical_authorization_lock_registry()
+        owner = (os.getpid(), threading.get_ident())
+        physical_locks[resolved] = owner
+        lease = _AuthorizationLockLease(resolved)
+        token = _AUTHORIZED_LEDGER_LOCK_LEASE.set(lease)
+        try:
+            yield
+        finally:
+            lease.active = False
+            try:
+                _AUTHORIZED_LEDGER_LOCK_LEASE.reset(token)
+            finally:
+                if physical_locks.pop(resolved, None) != owner:
+                    raise FirstWeekOperationError("authorization physical lock ownership changed unexpectedly")
+
+
+def _active_authorization_lock_lease() -> _AuthorizationLockLease | None:
+    lease = _AUTHORIZED_LEDGER_LOCK_LEASE.get()
+    if lease is not None and lease.pid != os.getpid():
+        raise FirstWeekOperationError(
+            "a forked process inherited an authorization lock lease; Stage 3 writes are forbidden"
+        )
+    if lease is None or not lease.active or lease.thread_id != threading.get_ident():
+        return None
+    return lease
+
+
+def _physical_authorization_lock_registry() -> dict[Path, tuple[int, int]]:
+    registry = getattr(_AUTHORIZATION_PHYSICAL_LOCKS, "roots", None)
+    if registry is None:
+        registry = {}
+        _AUTHORIZATION_PHYSICAL_LOCKS.roots = registry
+    return registry
+
+
+def _physical_authorization_lock_owned(root: Path) -> bool:
+    owner = _physical_authorization_lock_registry().get(root.expanduser().resolve())
+    if owner is None:
+        return False
+    current = (os.getpid(), threading.get_ident())
+    if owner[0] != current[0]:
+        raise FirstWeekOperationError(
+            "a forked process inherited physical Stage 3 lock ownership; writes are forbidden"
+        )
+    return owner == current
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def atomic_stage3_writes(root: Path) -> Iterator[None]:
+    """Serialize temporary Stage 3 monkeypatches within this Python process."""
+
+    with _STAGE3_PATCH_LOCK, _atomic_stage3_writes_locked(root):
+        yield
+
+
+@contextmanager
+def _atomic_stage3_writes_locked(root: Path) -> Iterator[None]:
+    """Make every frozen collector write complete-or-absent during this operation."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    staging = root / ATOMIC_STAGING_DIR
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor = os.open(root, directory_flags)
+    staging_descriptor: int | None = None
+    try:
+        with suppress(FileExistsError):
+            os.mkdir(ATOMIC_STAGING_DIR, mode=0o700, dir_fd=root_descriptor)
+        try:
+            staging_descriptor = os.open(
+                ATOMIC_STAGING_DIR,
+                directory_flags,
+                dir_fd=root_descriptor,
+            )
+        except OSError as exc:
+            raise FirstWeekOperationError(
+                f"atomic staging directory cannot be a symlink or non-directory: {staging}"
+            ) from exc
+        staging_stat = os.fstat(staging_descriptor)
+        if not stat.S_ISDIR(staging_stat.st_mode):
+            raise FirstWeekOperationError(f"atomic staging path is not a directory: {staging}")
+        os.fsync(staging_descriptor)
+        os.fsync(root_descriptor)
+    except Exception:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        os.close(root_descriptor)
+        raise
+    assert staging_descriptor is not None
+
+    def clear_known_staging_files() -> None:
+        for name in sorted(os.listdir(staging_descriptor)):
+            entry_stat = os.stat(
+                name,
+                dir_fd=staging_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(entry_stat.st_mode) or not name.startswith("write_"):
+                raise FirstWeekOperationError(f"unexpected atomic staging entry: {staging / name}")
+            os.unlink(name, dir_fd=staging_descriptor)
+
+    try:
+        clear_known_staging_files()
+        os.fsync(staging_descriptor)
+    except Exception:
+        os.close(staging_descriptor)
+        os.close(root_descriptor)
+        raise
+
+    original_write = stage3._exclusive_write
+    owner = (os.getpid(), threading.get_ident())
+
+    def atomic_exclusive_write(path: Path, raw: bytes) -> None:
+        if (os.getpid(), threading.get_ident()) != owner:
+            original_write(path, raw)
+            return
+        parent_existed = path.parent.is_dir()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            _fsync_directory(path.parent)
+            _fsync_directory(path.parent.parent)
+        if path.exists():
+            raise stage3.Stage3ConflictError(f"immutable file already exists: {path}")
+        if path.parent.stat().st_dev != staging_stat.st_dev:
+            raise FirstWeekOperationError(f"atomic staging and final path are on different filesystems: {path}")
+        temporary_name = f"write_{secrets.token_hex(16)}"
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=staging_descriptor,
+            )
+            os.fchmod(descriptor, 0o644)
+            with os.fdopen(descriptor, "wb") as file:
+                descriptor = None
+                file.write(raw)
+                file.flush()
+                os.fsync(file.fileno())
+            os.fsync(staging_descriptor)
+            try:
+                os.link(
+                    temporary_name,
+                    path,
+                    src_dir_fd=staging_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise stage3.Stage3ConflictError(f"immutable file already exists: {path}") from exc
+            _fsync_directory(path.parent)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=staging_descriptor)
+            os.fsync(staging_descriptor)
+
+    stage3._exclusive_write = atomic_exclusive_write
+    try:
+        yield
+    finally:
+        stage3._exclusive_write = original_write
+        try:
+            clear_known_staging_files()
+            os.fsync(staging_descriptor)
+            current_stat = os.stat(
+                ATOMIC_STAGING_DIR,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                current_stat.st_dev != staging_stat.st_dev
+                or current_stat.st_ino != staging_stat.st_ino
+                or not stat.S_ISDIR(current_stat.st_mode)
+            ):
+                raise FirstWeekOperationError(f"atomic staging directory entry changed while it was open: {staging}")
+            try:
+                os.rmdir(ATOMIC_STAGING_DIR, dir_fd=root_descriptor)
+            except OSError as exc:
+                raise FirstWeekOperationError(f"atomic staging directory could not be removed: {staging}") from exc
+            os.fsync(root_descriptor)
+        finally:
+            try:
+                os.close(staging_descriptor)
+            finally:
+                os.close(root_descriptor)
 
 
 def _as_utc(now: datetime | None = None) -> datetime:
@@ -319,6 +677,25 @@ def validate_apply_window(
     }
 
 
+def validate_recovery_deadline(
+    entry_date: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Allow a pre-authorized crash recovery until, but never at, entry open."""
+
+    current = _as_utc(now)
+    entry_open = _entry_open(entry_date).astimezone(UTC)
+    if current >= entry_open:
+        raise FirstWeekOperationError(
+            f"decision evidence recovery must finish before entry open {entry_open.isoformat()}"
+        )
+    return {
+        "checked_at_utc": current,
+        "entry_open_utc": entry_open,
+    }
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = stage3.read_json(path)
@@ -338,6 +715,14 @@ def _trade_date_text(value: Any) -> str:
     except (TypeError, ValueError) as exc:
         raise FirstWeekOperationError(f"invalid daily-basic trade date: {value!r}") from exc
     return pd.Timestamp(parsed).date().isoformat()
+
+
+def _symbol_set_evidence(symbols: set[str]) -> dict[str, Any]:
+    normalized = sorted(map(str, symbols))
+    return {
+        "count": len(normalized),
+        "sha256": sha256_bytes(canonical_json(normalized)),
+    }
 
 
 def _iter_frozen_response_records(audit: Mapping[str, Any]) -> Iterator[dict[str, str]]:
@@ -481,7 +866,10 @@ def validate_raw_ready(
     if not isinstance(execution_binding, Mapping):
         raise FirstWeekOperationError("raw audit execution binding is missing")
     try:
-        assert_execution_binding_current(execution_binding)
+        assert_execution_binding_current(
+            execution_binding,
+            require_source_completeness=True,
+        )
     except Exception as exc:
         raise FirstWeekOperationError(f"raw audit execution binding is no longer current: {exc}") from exc
     binding = execution_binding.get("binding")
@@ -490,6 +878,30 @@ def validate_raw_ready(
     parameters = binding.get("parameters")
     if not isinstance(parameters, Mapping):
         raise FirstWeekOperationError("raw execution parameters are malformed")
+    input_evidence = binding.get("input_evidence")
+    source_completeness = audit.get("source_symbol_completeness")
+    target_symbols = {
+        Path(str(record["name"])).stem
+        for record in inventory["records"]
+        if _trade_date_text(record.get("max_dt")) == pd.Timestamp(decision_date).date().isoformat()
+    }
+    target_symbol_evidence = _symbol_set_evidence(target_symbols)
+    if (
+        not isinstance(input_evidence, Mapping)
+        or not isinstance(source_completeness, Mapping)
+        or canonical_json(input_evidence.get("source_symbol_completeness")) != canonical_json(source_completeness)
+        or source_completeness.get("passed") is not True
+        or source_completeness.get("report_sha256")
+        != sha256_bytes(
+            canonical_json({key: value for key, value in source_completeness.items() if key != "report_sha256"})
+        )
+        or not isinstance(source_completeness.get("sessions"), list)
+        or not source_completeness["sessions"]
+        or source_completeness["sessions"][-1].get("trade_date") != target
+        or canonical_json(source_completeness["sessions"][-1].get("daily_symbols"))
+        != canonical_json(target_symbol_evidence)
+    ):
+        raise FirstWeekOperationError("raw audit does not bind a valid complete target-universe report")
     if (
         parameters.get("apply") is not True
         or parameters.get("safe_end_date") != target
@@ -523,6 +935,9 @@ def validate_raw_ready(
         "audit_sha256": audit_path.stem,
         "audit_path": str(audit_path),
         "execution_binding_sha256": execution_binding["binding_sha256"],
+        "source_completeness_sha256": source_completeness["report_sha256"],
+        "target_daily_symbols": target_symbol_evidence,
+        "target_raw_adj_factor_symbol_count": source_completeness["sessions"][-1]["raw_adj_factor_symbols"]["count"],
         "frozen_object_count": object_count,
         "new_snapshot": new_snapshot,
     }
@@ -760,6 +1175,120 @@ def validate_state_ready(
     }
 
 
+def validate_reference_symbol_completeness(
+    daily: Mapping[str, pd.DataFrame],
+    *,
+    raw_summary: Mapping[str, Any],
+    decision_date: str,
+) -> dict[str, Any]:
+    """Reject a truncated daily-basic bridge before any path is frozen."""
+
+    previous_symbols: set[str] | None = None
+    sessions: list[dict[str, Any]] = []
+    for date_text in FIRST_WEEK_REFERENCE_DATES:
+        frame = daily[date_text]
+        symbols = set(frame["ts_code"].astype(str))
+        if len(symbols) < REFERENCE_SYMBOL_ABSOLUTE_MINIMUM:
+            raise FirstWeekOperationError(
+                f"daily_basic[{date_text}] has only {len(symbols)} unique symbols; "
+                f"fixed completeness minimum is {REFERENCE_SYMBOL_ABSOLUTE_MINIMUM}"
+            )
+        session: dict[str, Any] = {
+            "trade_date": date_text,
+            "symbols": _symbol_set_evidence(symbols),
+            "passed": True,
+        }
+        if previous_symbols is not None:
+            retained = previous_symbols & symbols
+            required_retained = math.ceil(len(previous_symbols) * REFERENCE_SYMBOL_MIN_PREVIOUS_COVERAGE)
+            added = symbols - previous_symbols
+            removed = previous_symbols - symbols
+            symmetric_count = len(added) + len(removed)
+            maximum_symmetric_count = math.floor(len(previous_symbols) * REFERENCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE)
+            if len(retained) < required_retained:
+                raise FirstWeekOperationError(
+                    f"daily_basic[{date_text}] retained only {len(retained)}/{len(previous_symbols)} "
+                    "symbols from the previous registered bridge date"
+                )
+            if symmetric_count > maximum_symmetric_count:
+                raise FirstWeekOperationError(
+                    f"daily_basic[{date_text}] changed {symmetric_count}/{len(previous_symbols)} "
+                    "symbols versus the previous registered bridge date"
+                )
+            session.update(
+                {
+                    "previous_symbols": _symbol_set_evidence(previous_symbols),
+                    "retained_from_previous": len(retained),
+                    "required_retained_from_previous": required_retained,
+                    "previous_coverage": len(retained) / len(previous_symbols),
+                    "added_since_previous": _symbol_set_evidence(added),
+                    "removed_since_previous": _symbol_set_evidence(removed),
+                    "symmetric_change_count": symmetric_count,
+                    "maximum_symmetric_change_count": maximum_symmetric_count,
+                    "symmetric_change_share": symmetric_count / len(previous_symbols),
+                }
+            )
+        sessions.append(session)
+        previous_symbols = symbols
+
+    inventory = inspect_inventory(Path(str(raw_summary["data_dir"])))
+    target_iso = pd.Timestamp(decision_date).date().isoformat()
+    raw_target_symbols = {
+        Path(str(record["name"])).stem
+        for record in inventory["records"]
+        if _trade_date_text(record.get("max_dt")) == target_iso
+    }
+    if not raw_target_symbols:
+        raise FirstWeekOperationError("raw active cache has no symbols on the formal target session")
+    raw_target_evidence = _symbol_set_evidence(raw_target_symbols)
+    if canonical_json(raw_summary.get("target_daily_symbols")) != canonical_json(raw_target_evidence):
+        raise FirstWeekOperationError("raw target symbol evidence changed during reference validation")
+    target_symbols = set(daily[target_iso]["ts_code"].astype(str))
+    raw_missing_from_daily_basic = raw_target_symbols - target_symbols
+    daily_basic_only = target_symbols - raw_target_symbols
+    maximum_daily_basic_only = math.floor(len(raw_target_symbols) * REFERENCE_SYMBOL_MAX_RAW_EXTRA_SHARE)
+    if raw_missing_from_daily_basic:
+        raise FirstWeekOperationError(
+            "target daily-basic response omits symbols present in the exact raw daily universe: "
+            f"{len(raw_missing_from_daily_basic)} missing"
+        )
+    if len(daily_basic_only) > maximum_daily_basic_only:
+        raise FirstWeekOperationError(
+            "target daily-basic response has an abnormal symbol expansion versus raw daily: "
+            f"{len(daily_basic_only)}/{len(raw_target_symbols)}"
+        )
+    target_raw_comparison = {
+        "raw_daily_symbols": raw_target_evidence,
+        "daily_basic_symbols": _symbol_set_evidence(target_symbols),
+        "raw_missing_from_daily_basic": _symbol_set_evidence(raw_missing_from_daily_basic),
+        "daily_basic_only": _symbol_set_evidence(daily_basic_only),
+        "maximum_daily_basic_only": maximum_daily_basic_only,
+        "passed": True,
+    }
+    rule = {
+        "schema": "xs_chan_stage3_daily_basic_symbol_completeness_rule_v1",
+        "absolute_minimum_symbols": REFERENCE_SYMBOL_ABSOLUTE_MINIMUM,
+        "minimum_previous_bridge_coverage": REFERENCE_SYMBOL_MIN_PREVIOUS_COVERAGE,
+        "maximum_previous_bridge_symmetric_change_share": (REFERENCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE),
+        "target_raw_daily_subset_required": True,
+        "maximum_target_daily_basic_only_share": REFERENCE_SYMBOL_MAX_RAW_EXTRA_SHARE,
+    }
+    report_without_hash = {
+        "schema": "xs_chan_stage3_daily_basic_symbol_completeness_v1",
+        "rule": {
+            **rule,
+            "rule_sha256": sha256_bytes(canonical_json(rule)),
+        },
+        "sessions": sessions,
+        "target_raw_comparison": target_raw_comparison,
+        "passed": True,
+    }
+    return {
+        **report_without_hash,
+        "report_sha256": sha256_bytes(canonical_json(report_without_hash)),
+    }
+
+
 def validate_reference_ready(
     spec: Mapping[str, Any],
     root: Path,
@@ -830,6 +1359,11 @@ def validate_reference_ready(
             or {_trade_date_text(value) for value in frame["trade_date"]} != {date_text}
         ):
             raise FirstWeekOperationError(f"daily_basic[{date_text}] has an invalid date or symbol cross-section")
+    daily_basic_completeness = validate_reference_symbol_completeness(
+        daily,
+        raw_summary=raw_summary,
+        decision_date=decision_date,
+    )
 
     schedule = stage3.build_forward_schedule(spec, official_sessions)
     target_row = schedule.loc[schedule["decision_dt"].eq(pd.Timestamp(decision_date))]
@@ -868,6 +1402,7 @@ def validate_reference_ready(
         "manifest_sha256": resolved_reference.stem,
         "state_manifest_sha256": state_summary["manifest_sha256"],
         "raw_source_closure_sha256": local_inputs["raw_source_closure_sha256"],
+        "daily_basic_completeness": daily_basic_completeness,
         "bridge_dates": list(bridge_dates),
         "bridge_path_sha256": sha256_bytes(canonical_json(path_bundle)),
         "bridge_week_count": len(weeks),
@@ -1046,6 +1581,10 @@ def build_preflight_report(
     before = ledger_closure(root)
     if before["record_count"] != 1 or before["head_type"] != "genesis":
         raise FirstWeekOperationError("first decision preflight requires the genesis-only ledger")
+    validate_authorization_sidecar_inventory(
+        root,
+        stage3.scan_records(root),
+    )
     git = validate_git_ready(verify_remote=verify_remote)
     anchors = validate_existing_anchor_chain(
         spec,
@@ -1277,17 +1816,23 @@ def validate_preflight_receipt(
     reference_manifest_path: Path,
     state_manifest_path: Path,
     expected_head: str,
+    expected_operator_source_sha256: str | None = None,
 ) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     if not resolved.is_file() or resolved.stem != sha256_file(resolved):
         raise FirstWeekOperationError("preflight report path must be its exact physical SHA256")
     report = _read_json(resolved)
+    operator_source_sha256 = (
+        expected_operator_source_sha256
+        if expected_operator_source_sha256 is not None
+        else sha256_file(Path(__file__).resolve())
+    )
     if (
         report.get("schema") != "xs_chan_stage3_first_week_preflight_v1"
         or report.get("mode") != "APPLIED_DATA_ONLY_FULL_BRIDGE"
         or report.get("formal_ledger_mutated") is not False
         or report.get("efficacy_output") != "FORBIDDEN"
-        or report.get("operator_source_sha256") != sha256_file(Path(__file__).resolve())
+        or report.get("operator_source_sha256") != operator_source_sha256
         or report.get("ledger_before", {}).get("head") != expected_head
         or report.get("ledger_after", {}).get("head") != expected_head
         or report.get("reference", {}).get("manifest_sha256") != reference_manifest_path.resolve().stem
@@ -1310,20 +1855,618 @@ def validate_preflight_receipt(
     return report
 
 
-@contextmanager
-def _no_ledger_lock(_root: Path) -> Iterator[None]:
-    yield
+def _root_relative_object_path(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+) -> str:
+    resolved_root = root.expanduser().resolve()
+    resolved = path.expanduser().resolve()
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise FirstWeekOperationError(f"{label} must be stored below the canonical ledger root") from exc
+    if not resolved.is_file():
+        raise FirstWeekOperationError(f"{label} is missing: {resolved}")
+    return relative.as_posix()
+
+
+def _anticipated_record_data(
+    records: Sequence[stage3.LedgerRecord],
+    *,
+    record_type: str,
+    logical_event_key: str,
+    payload: Mapping[str, Any],
+    recorded_at_utc: str | datetime,
+    ledger_id: str,
+) -> dict[str, Any]:
+    """Build the exact record hash before the immutable record is created."""
+
+    safe_payload = stage3._json_safe(payload)
+    if not isinstance(safe_payload, dict):
+        raise FirstWeekOperationError("guarded append payload must be a JSON object")
+    sequence = len(records)
+    previous_hash = records[-1].data["record_hash"] if records else stage3.ZERO_HASH
+    body = {
+        "schema": stage3.RECORD_SCHEMA,
+        "ledger_id": ledger_id,
+        "sequence": sequence,
+        "previous_hash": previous_hash,
+        "record_type": record_type,
+        "logical_event_key": logical_event_key,
+        "payload_sha256": stage3._payload_hash(safe_payload),
+        "recorded_at_utc": stage3._format_utc(recorded_at_utc),
+        "payload": safe_payload,
+    }
+    return {
+        **body,
+        "record_hash": stage3._record_body_hash(body),
+    }
+
+
+def _validate_final_preflight_report(
+    report: Mapping[str, Any],
+    *,
+    expected_head: str,
+    reference_manifest_path: Path,
+    state_manifest_path: Path,
+    expected_operator_source_sha256: str | None = None,
+) -> None:
+    operator_source_sha256 = (
+        expected_operator_source_sha256
+        if expected_operator_source_sha256 is not None
+        else sha256_file(Path(__file__).resolve())
+    )
+    if (
+        report.get("schema") != "xs_chan_stage3_first_week_preflight_v1"
+        or report.get("mode") != "READ_ONLY_FULL_BRIDGE"
+        or report.get("formal_ledger_mutated") is not False
+        or report.get("efficacy_output") != "FORBIDDEN"
+        or report.get("operator_source_sha256") != operator_source_sha256
+        or report.get("ledger_before", {}).get("head") != expected_head
+        or report.get("ledger_after", {}).get("head") != expected_head
+        or report.get("reference", {}).get("manifest_sha256") != reference_manifest_path.resolve().stem
+        or report.get("state", {}).get("manifest_sha256") != sha256_file(state_manifest_path.resolve())
+        or report.get("reference", {}).get("bridge_dates") != list(FIRST_WEEK_REFERENCE_DATES)
+        or report.get("reference", {}).get("decision_inputs_only") is not True
+        or report.get("reference", {}).get("prospective_week_count") != 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(report.get("reference", {}).get("bridge_path_sha256", "")),
+        )
+    ):
+        raise FirstWeekOperationError("final pre-append report does not bind the exact guarded decision")
+
+
+def _expected_append_authorization(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    reference_manifest_path: Path,
+    state_manifest_path: Path,
+    preflight_report_path: Path,
+    final_preflight_report: Mapping[str, Any],
+    final_preflight_report_path: Path,
+    operator_source_sha256: str | None = None,
+) -> dict[str, Any]:
+    payload = record["payload"]
+    expected_head = str(record["previous_hash"])
+    expected_operator_sha = (
+        operator_source_sha256 if operator_source_sha256 is not None else sha256_file(Path(__file__).resolve())
+    )
+    validate_preflight_receipt(
+        preflight_report_path,
+        reference_manifest_path=reference_manifest_path,
+        state_manifest_path=state_manifest_path,
+        expected_head=expected_head,
+        expected_operator_source_sha256=expected_operator_sha,
+    )
+    _validate_final_preflight_report(
+        final_preflight_report,
+        expected_head=expected_head,
+        reference_manifest_path=reference_manifest_path,
+        state_manifest_path=state_manifest_path,
+        expected_operator_source_sha256=expected_operator_sha,
+    )
+    recorded_at = stage3._parse_utc(str(record["recorded_at_utc"]))
+    time_gate = validate_apply_window(
+        str(payload["decision_dt"]),
+        str(payload["entry_dt"]),
+        now=recorded_at,
+    )
+    git = final_preflight_report.get("git")
+    if (
+        not isinstance(git, Mapping)
+        or git.get("branch") != REQUIRED_GIT_BRANCH
+        or git.get("upstream") != REQUIRED_GIT_UPSTREAM
+        or git.get("remote_fetch_url") != REQUIRED_GIT_REMOTE_URL
+        or git.get("remote_push_url") != REQUIRED_GIT_REMOTE_URL
+        or git.get("remote_verified") is not True
+        or git.get("worktree_clean") is not True
+        or git.get("head") != git.get("upstream_head")
+        or git.get("head") != git.get("remote_head")
+    ):
+        raise FirstWeekOperationError("final preflight Git evidence is not the exact actual remote branch")
+
+    reference_object = _root_relative_object_path(
+        root,
+        reference_manifest_path,
+        label="reference manifest",
+    )
+    preflight_object = _root_relative_object_path(
+        root,
+        preflight_report_path,
+        label="applied-data preflight receipt",
+    )
+    final_preflight_object = _root_relative_object_path(
+        root,
+        final_preflight_report_path,
+        label="final pre-append report",
+    )
+    return {
+        "schema": AUTHORIZATION_SCHEMA,
+        "study_id": spec["study_id"],
+        "study_identity": stage3.study_identity(spec),
+        "spec_physical_sha256": sha256_file(stage3.SPEC_PATH),
+        "collector_source_sha256": sha256_file(stage3.SOURCE_PATH),
+        "operator_source_sha256": expected_operator_sha,
+        "authorization_created_at_utc": record["recorded_at_utc"],
+        "ledger_id": record["ledger_id"],
+        "sequence": int(record["sequence"]),
+        "expected_head": expected_head,
+        "record_type": record["record_type"],
+        "logical_event_key": record["logical_event_key"],
+        "recorded_at_utc": record["recorded_at_utc"],
+        "payload_sha256": record["payload_sha256"],
+        "expected_record_hash": record["record_hash"],
+        "decision_date": payload["decision_dt"],
+        "entry_date": payload["entry_dt"],
+        "reference_manifest_object": reference_object,
+        "reference_manifest_sha256": reference_manifest_path.resolve().stem,
+        "state_manifest_path": str(state_manifest_path.expanduser().resolve()),
+        "state_manifest_sha256": sha256_file(state_manifest_path.expanduser().resolve()),
+        "preflight_report_object": preflight_object,
+        "preflight_report_sha256": sha256_file(preflight_report_path.expanduser().resolve()),
+        "final_preflight_report_object": final_preflight_object,
+        "final_preflight_report_sha256": sha256_file(final_preflight_report_path.expanduser().resolve()),
+        "raw_audit_sha256": final_preflight_report["raw"]["audit_sha256"],
+        "raw_parquet_inventory_sha256": final_preflight_report["raw"]["parquet_inventory_sha256"],
+        "raw_source_closure_sha256": final_preflight_report["reference"]["raw_source_closure_sha256"],
+        "state_projection_sha256": final_preflight_report["state"]["projection_sha256"],
+        "decision_path_sha256": final_preflight_report["reference"]["bridge_path_sha256"],
+        "git": dict(git),
+        "time_gate": _json_safe(time_gate),
+    }
+
+
+def store_append_authorization(
+    spec: Mapping[str, Any],
+    root: Path,
+    anticipated_record: Mapping[str, Any],
+    *,
+    reference_manifest_path: Path,
+    state_manifest_path: Path,
+    preflight_report_path: Path,
+    final_preflight_report: Mapping[str, Any],
+    fresh_git: Mapping[str, Any],
+) -> tuple[dict[str, Any], str, Path]:
+    """Persist the exact authorization before the immutable record write."""
+
+    resolved_root = root.expanduser().resolve()
+    lease = _active_authorization_lock_lease()
+    if lease is None or lease.root != resolved_root or not _physical_authorization_lock_owned(resolved_root):
+        raise FirstWeekOperationError(
+            "append authorization may only be stored while holding the guarded physical ledger lock"
+        )
+    if canonical_json(final_preflight_report.get("git")) != canonical_json(fresh_git):
+        raise FirstWeekOperationError("Git changed between final preflight and the locked append")
+    records = stage3.scan_records(root)
+    current_head = records[-1].data["record_hash"] if records else stage3.ZERO_HASH
+    current_ledger_id = records[0].data["ledger_id"] if records else anticipated_record.get("ledger_id")
+    existing_hashes = {record.data["record_hash"] for record in records}
+    existing_keys = {record.data["logical_event_key"] for record in records}
+    if (
+        int(anticipated_record.get("sequence", -1)) != len(records)
+        or anticipated_record.get("previous_hash") != current_head
+        or anticipated_record.get("ledger_id") != current_ledger_id
+        or anticipated_record.get("record_hash") in existing_hashes
+        or anticipated_record.get("logical_event_key") in existing_keys
+    ):
+        raise FirstWeekOperationError(
+            "append authorization must be created against the exact current ledger head "
+            "before its record or logical event exists"
+        )
+    final_digest, final_path = stage3._store_canonical_object(
+        root,
+        FINAL_PREFLIGHT_CATEGORY,
+        final_preflight_report,
+    )
+    if final_digest != sha256_file(final_path):
+        raise FirstWeekOperationError("final preflight object is not content-addressed by its exact bytes")
+    authorization = _expected_append_authorization(
+        spec,
+        root,
+        anticipated_record,
+        reference_manifest_path=reference_manifest_path,
+        state_manifest_path=state_manifest_path,
+        preflight_report_path=preflight_report_path,
+        final_preflight_report=final_preflight_report,
+        final_preflight_report_path=final_path,
+    )
+    digest, path = stage3._store_canonical_object(
+        root,
+        APPEND_AUTHORIZATION_CATEGORY,
+        authorization,
+    )
+    if digest != sha256_file(path):
+        raise FirstWeekOperationError("append authorization is not content-addressed by its exact bytes")
+    return authorization, digest, path
+
+
+def load_append_authorization(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    require_current_operator: bool = True,
+) -> tuple[dict[str, Any], str, Path]:
+    """Load one pre-existing intent and prove it exactly anticipated record."""
+
+    directory = root / "objects" / APPEND_AUTHORIZATION_CATEGORY
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            if path.stem != sha256_file(path):
+                raise FirstWeekOperationError(f"append authorization filename hash mismatch: {path}")
+            authorization = _read_json(path)
+            if canonical_json(authorization) != path.read_bytes():
+                raise FirstWeekOperationError(f"append authorization bytes are not canonical: {path}")
+            if authorization.get("expected_record_hash") == record["record_hash"]:
+                candidates.append((path, authorization))
+    if len(candidates) != 1:
+        raise FirstWeekOperationError(
+            "decision has no unique append-before-record authorization; "
+            "a direct frozen-collector append is permanently unauthorized"
+        )
+    path, authorization = candidates[0]
+    authorized_operator_sha = str(authorization.get("operator_source_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", authorized_operator_sha):
+        raise FirstWeekOperationError("append authorization has an invalid operator source hash")
+    if require_current_operator:
+        if authorized_operator_sha != sha256_file(Path(__file__).resolve()):
+            raise FirstWeekOperationError("current first-week operator bytes differ from the pre-record authorization")
+    else:
+        authorized_git = authorization.get("git")
+        if not isinstance(authorized_git, Mapping):
+            raise FirstWeekOperationError("append authorization has no Git evidence")
+        operator_relative_path = Path(__file__).resolve().relative_to(stage3.REPO_ROOT.resolve()).as_posix()
+        if (
+            _git_file_sha256_at_commit(
+                stage3.REPO_ROOT,
+                str(authorized_git.get("head", "")),
+                operator_relative_path,
+            )
+            != authorized_operator_sha
+        ):
+            raise FirstWeekOperationError("authorized Git commit does not contain the recorded operator bytes")
+    reference_path = root / str(authorization.get("reference_manifest_object", ""))
+    state_path = Path(str(authorization.get("state_manifest_path", "")))
+    preflight_path = root / str(authorization.get("preflight_report_object", ""))
+    final_preflight_path = root / str(authorization.get("final_preflight_report_object", ""))
+    if (
+        not final_preflight_path.is_file()
+        or final_preflight_path.stem != sha256_file(final_preflight_path)
+        or final_preflight_path.stem != authorization.get("final_preflight_report_sha256")
+    ):
+        raise FirstWeekOperationError("authorized final preflight object is missing or differs")
+    final_preflight = _read_json(final_preflight_path)
+    if canonical_json(final_preflight) != final_preflight_path.read_bytes():
+        raise FirstWeekOperationError("authorized final preflight bytes are not canonical")
+    expected = _expected_append_authorization(
+        spec,
+        root,
+        record,
+        reference_manifest_path=reference_path,
+        state_manifest_path=state_path,
+        preflight_report_path=preflight_path,
+        final_preflight_report=final_preflight,
+        final_preflight_report_path=final_preflight_path,
+        operator_source_sha256=authorized_operator_sha,
+    )
+    if canonical_json(authorization) != canonical_json(expected):
+        raise FirstWeekOperationError("append authorization does not exactly bind the decision record and evidence")
+    return authorization, path.stem, path
+
+
+def _authorization_sidecar_path(record: Mapping[str, Any]) -> Path:
+    return (
+        stage3.SCRIPTS_DIR
+        / AUTHORIZATION_SIDECAR_DIR_NAME
+        / f"{int(record['sequence']):06d}_{record['record_hash']}.json"
+    )
+
+
+def validate_authorization_sidecar_inventory(
+    root: Path,
+    records: Sequence[stage3.LedgerRecord],
+    *,
+    allow_missing_current_authorized: bool = False,
+) -> None:
+    """Require sidecars to equal records that have a durable authorization."""
+
+    record_by_hash = {
+        str(record.data["record_hash"]): record for record in records if record.data["record_type"] == "decision_freeze"
+    }
+    authorized_record_hashes: set[str] = set()
+    authorization_directory = root / "objects" / APPEND_AUTHORIZATION_CATEGORY
+    if authorization_directory.exists():
+        if authorization_directory.is_symlink() or not authorization_directory.is_dir():
+            raise FirstWeekOperationError("append authorization object path is not a real directory")
+        for path in sorted(authorization_directory.iterdir()):
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                raise FirstWeekOperationError(f"unexpected append authorization object: {path}")
+            if path.stem != sha256_file(path):
+                raise FirstWeekOperationError(f"append authorization filename hash mismatch: {path}")
+            authorization = _read_json(path)
+            if canonical_json(authorization) != path.read_bytes():
+                raise FirstWeekOperationError(f"append authorization bytes are not canonical: {path}")
+            expected_record_hash = str(authorization.get("expected_record_hash", ""))
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_record_hash):
+                raise FirstWeekOperationError(f"append authorization has an invalid record hash: {path}")
+            if expected_record_hash in record_by_hash:
+                authorized_record_hashes.add(expected_record_hash)
+
+    directory = stage3.SCRIPTS_DIR / AUTHORIZATION_SIDECAR_DIR_NAME
+    expected = {
+        f"{int(record.data['sequence']):06d}_{record.data['record_hash']}.json"
+        for record_hash, record in record_by_hash.items()
+        if record_hash in authorized_record_hashes
+    }
+    if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+        raise FirstWeekOperationError("tracked authorization sidecar path is not a real directory")
+    actual: set[str] = set()
+    if directory.is_dir():
+        for path in directory.iterdir():
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                raise FirstWeekOperationError(f"unexpected tracked authorization sidecar: {path}")
+            actual.add(path.name)
+    allowed_inventories = {frozenset(expected)}
+    if allow_missing_current_authorized and records:
+        current = records[-1].data
+        if current["record_hash"] in authorized_record_hashes:
+            current_name = f"{int(current['sequence']):06d}_{current['record_hash']}.json"
+            allowed_inventories.add(frozenset(expected - {current_name}))
+    if frozenset(actual) not in allowed_inventories:
+        raise FirstWeekOperationError(
+            "tracked authorization sidecar directory differs from the exact authorized decision chain: "
+            f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
+        )
+
+
+def _expected_authorization_sidecar(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    require_current_operator: bool,
+) -> tuple[dict[str, Any], Path]:
+    """Build the exact tracked proof without writing it."""
+
+    authorization, authorization_sha, authorization_path = load_append_authorization(
+        spec,
+        root,
+        record,
+        require_current_operator=require_current_operator,
+    )
+    payload = {
+        "schema": AUTHORIZATION_SIDECAR_SCHEMA,
+        "study_id": spec["study_id"],
+        "study_identity": stage3.study_identity(spec),
+        "sequence": record["sequence"],
+        "record_type": record["record_type"],
+        "logical_event_key": record["logical_event_key"],
+        "recorded_at_utc": record["recorded_at_utc"],
+        "record_hash": record["record_hash"],
+        "previous_hash": record["previous_hash"],
+        "authorization_object": str(authorization_path.relative_to(root)),
+        "authorization_sha256": authorization_sha,
+        "authorization": authorization,
+        "external_timestamp_or_signature": False,
+        "required_follow_up": "commit_and_push_with_the_matching_head_anchor_before_entry_open",
+    }
+    return payload, _authorization_sidecar_path(record)
+
+
+def export_authorization_sidecar(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    """Export a Git-tracked proof derived only from the pre-append intent."""
+
+    payload, path = _expected_authorization_sidecar(
+        spec,
+        root,
+        record,
+        require_current_operator=True,
+    )
+    raw = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if path.exists():
+        if path.read_bytes() != raw:
+            raise FirstWeekOperationError(f"tracked authorization sidecar bytes conflict: {path}")
+    else:
+        stage3._exclusive_write(path, raw)
+    return payload, path
+
+
+def validate_authorization_sidecar(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    require_pushed: bool,
+) -> dict[str, Any]:
+    expected, path = _expected_authorization_sidecar(
+        spec,
+        root,
+        record,
+        require_current_operator=False,
+    )
+    if not path.is_file():
+        raise FirstWeekOperationError(f"tracked authorization sidecar is missing: {path}")
+    expected_raw = (
+        json.dumps(
+            expected,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if path.read_bytes() != expected_raw:
+        raise FirstWeekOperationError("tracked authorization sidecar differs from its exact expected payload")
+    commit: str | None = None
+    deadline = _entry_open(str(record["payload"]["entry_dt"]))
+    if require_pushed:
+        try:
+            commit = stage3._validate_tracked_file_pushed(
+                path,
+                deadline=deadline,
+            )
+        except Stage3ValidationError as exc:
+            raise FirstWeekOperationError(
+                f"operator authorization sidecar is not validly committed and pushed: {exc}"
+            ) from exc
+        committed_at = datetime.fromisoformat(
+            _git_output(
+                stage3.REPO_ROOT,
+                "show",
+                "-s",
+                "--format=%cI",
+                commit,
+            )
+        )
+        if committed_at >= deadline:
+            raise FirstWeekOperationError(
+                "operator authorization commit must be strictly before entry open: "
+                f"{committed_at.isoformat()} >= {deadline.isoformat()}"
+            )
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "record_hash": record["record_hash"],
+        "authorization_sha256": expected["authorization_sha256"],
+        "commit": commit,
+        "deadline": deadline,
+    }
+
+
+def validate_authorized_anchor_pair(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    require_pushed: bool,
+) -> dict[str, Any]:
+    """Require the decision anchor and operator authorization as one commit."""
+
+    validate_authorization_sidecar_inventory(
+        root,
+        stage3.scan_records(root),
+    )
+    authorization = validate_authorization_sidecar(
+        spec,
+        root,
+        record,
+        require_pushed=require_pushed,
+    )
+    anchor = validate_anchor_for_record(
+        spec,
+        root,
+        record,
+        require_pushed=require_pushed,
+    )
+    if require_pushed:
+        if authorization["commit"] != anchor["commit"]:
+            raise FirstWeekOperationError("decision anchor and operator authorization must share one commit")
+        authorization_object, _, _ = load_append_authorization(
+            spec,
+            root,
+            record,
+            require_current_operator=False,
+        )
+        commit_line = _git_output(
+            stage3.REPO_ROOT,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            str(anchor["commit"]),
+        ).split()
+        authorized_head = str(authorization_object["git"]["head"])
+        if len(commit_line) != 2 or commit_line[1] != authorized_head:
+            raise FirstWeekOperationError(
+                "decision evidence commit must have exactly the authorized Git head as its parent"
+            )
+        expected_paths = {
+            Path(anchor["path"]).resolve().relative_to(stage3.REPO_ROOT.resolve()).as_posix(),
+            Path(authorization["path"]).resolve().relative_to(stage3.REPO_ROOT.resolve()).as_posix(),
+        }
+        changed_paths = set(
+            filter(
+                None,
+                _git_output(
+                    stage3.REPO_ROOT,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    str(anchor["commit"]),
+                ).splitlines(),
+            )
+        )
+        if changed_paths != expected_paths:
+            raise FirstWeekOperationError(
+                "decision evidence commit must contain exactly the matching anchor and authorization sidecar"
+            )
+    return {
+        "anchor": anchor,
+        "authorization": authorization,
+        "commit": anchor["commit"],
+    }
 
 
 def append_first_decision_with_final_guards(
     spec: Mapping[str, Any],
     root: Path,
     reference_manifest_path: Path,
+    state_manifest_path: Path,
+    preflight_report_path: Path,
     decision_date: str,
     *,
     expected_head: str,
     expected_decision_path_sha256: str,
-) -> tuple[stage3.LedgerRecord, dict[str, Any], Path]:
+    final_preflight_report: Mapping[str, Any],
+) -> tuple[
+    stage3.LedgerRecord,
+    dict[str, Any],
+    Path,
+    dict[str, Any],
+    Path,
+    Path,
+]:
     """Append under one ledger lock with a fresh final clock and raw check."""
 
     manifest = stage3.read_json(reference_manifest_path)
@@ -1336,16 +2479,44 @@ def append_first_decision_with_final_guards(
     )
     stage3.verify_raw_source_closure_current(closure)
 
-    original_append = stage3.append_record
-    original_lock = stage3._exclusive_lock
-    with original_lock(root):
+    authorization_path: Path | None = None
+
+    with authorization_ledger_lock(root), atomic_stage3_writes(root):
+        original_append = stage3.append_record
+        original_lock = stage3._exclusive_lock
+        owner_lease = _active_authorization_lock_lease()
+        if (
+            owner_lease is None
+            or owner_lease.root != root.expanduser().resolve()
+            or not _physical_authorization_lock_owned(root)
+        ):
+            raise FirstWeekOperationError("guarded append lost its physical authorization lock")
+
+        @contextmanager
+        def reuse_current_lock_or_block(lock_root: Path) -> Iterator[None]:
+            lease = _active_authorization_lock_lease()
+            resolved_lock_root = lock_root.expanduser().resolve()
+            if (
+                lease is owner_lease
+                and lease.root == resolved_lock_root
+                and _physical_authorization_lock_owned(resolved_lock_root)
+            ):
+                yield
+                return
+            if _physical_authorization_lock_owned(resolved_lock_root):
+                raise FirstWeekOperationError(
+                    "another authorization context attempted to reuse a physical Stage 3 lock"
+                )
+            with original_lock(lock_root):
+                yield
+
         records = stage3.scan_records(root)
         if not records or records[-1].data["record_hash"] != expected_head:
             raise FirstWeekOperationError("ledger head changed before the guarded append")
-        validate_anchor_for_record(
+        validate_authorization_sidecar_inventory(root, records)
+        validate_existing_anchor_chain(
             spec,
             root,
-            records[-1].data,
             require_pushed=True,
         )
 
@@ -1358,7 +2529,25 @@ def append_first_decision_with_final_guards(
             *,
             ledger_id: str | None = None,
         ) -> stage3.LedgerRecord:
+            lease = _active_authorization_lock_lease()
+            resolved_append_root = append_root.expanduser().resolve()
+            if lease is not owner_lease:
+                if _physical_authorization_lock_owned(resolved_append_root):
+                    raise FirstWeekOperationError("another authorization context attempted the guarded Stage 3 append")
+                return original_append(
+                    append_root,
+                    record_type,
+                    logical_event_key,
+                    payload,
+                    recorded_at_utc,
+                    ledger_id=ledger_id,
+                )
+            if lease.root != resolved_append_root or not _physical_authorization_lock_owned(resolved_append_root):
+                raise FirstWeekOperationError(
+                    "guarded append attempted another ledger while the authorization lock was active"
+                )
             del recorded_at_utc
+            nonlocal authorization_path
             current = stage3.scan_records(root)
             if (
                 append_root.resolve() != root.resolve()
@@ -1367,8 +2556,10 @@ def append_first_decision_with_final_guards(
                 or current[-1].data["record_hash"] != expected_head
                 or payload.get("decision_path_sha256") != expected_decision_path_sha256
                 or payload.get("reference_manifest_sha256") != reference_manifest_path.stem
+                or ledger_id != current[0].data["ledger_id"]
             ):
                 raise FirstWeekOperationError("guarded decision append target, head or preflight path changed")
+            fresh_git = validate_git_ready(verify_remote=True)
             stage3.verify_raw_source_closure_current(closure)
             fresh_now = stage3.utc_now()
             stage3.validate_decision_timing(
@@ -1381,7 +2572,25 @@ def append_first_decision_with_final_guards(
                 payload["entry_dt"],
                 now=pd.Timestamp(fresh_now).to_pydatetime(),
             )
-            return original_append(
+            anticipated = _anticipated_record_data(
+                current,
+                record_type=record_type,
+                logical_event_key=logical_event_key,
+                payload=payload,
+                recorded_at_utc=fresh_now,
+                ledger_id=str(ledger_id),
+            )
+            _, _, authorization_path = store_append_authorization(
+                spec,
+                root,
+                anticipated,
+                reference_manifest_path=reference_manifest_path,
+                state_manifest_path=state_manifest_path,
+                preflight_report_path=preflight_report_path,
+                final_preflight_report=final_preflight_report,
+                fresh_git=fresh_git,
+            )
+            appended = original_append(
                 append_root,
                 record_type,
                 logical_event_key,
@@ -1389,8 +2598,11 @@ def append_first_decision_with_final_guards(
                 fresh_now,
                 ledger_id=ledger_id,
             )
+            if canonical_json(appended.data) != canonical_json(anticipated):
+                raise FirstWeekOperationError("immutable decision record differs from its pre-append authorization")
+            return appended
 
-        stage3._exclusive_lock = _no_ledger_lock
+        stage3._exclusive_lock = reuse_current_lock_or_block
         stage3.append_record = guarded_append
         try:
             record = stage3.append_decision_freeze(
@@ -1405,17 +2617,269 @@ def append_first_decision_with_final_guards(
 
         if record.data["record_hash"] != stage3.scan_records(root)[-1].data["record_hash"]:
             raise FirstWeekOperationError("guarded decision record was not the final ledger head")
+        if authorization_path is None:
+            raise FirstWeekOperationError("guarded append returned without a durable pre-record authorization")
+        authorization_sidecar, authorization_sidecar_path = export_authorization_sidecar(
+            spec,
+            root,
+            record.data,
+        )
         anchor, anchor_path = stage3.export_ledger_head_anchor(
             spec,
             root,
         )
-        validate_anchor_for_record(
+        validate_authorized_anchor_pair(
             spec,
             root,
             record.data,
             require_pushed=False,
         )
-    return record, anchor, anchor_path
+        validate_existing_anchor_chain(
+            spec,
+            root,
+            require_pushed=False,
+        )
+    return (
+        record,
+        anchor,
+        anchor_path,
+        authorization_sidecar,
+        authorization_sidecar_path,
+        authorization_path,
+    )
+
+
+def _validate_recovery_anchor_inventory(
+    spec: Mapping[str, Any],
+    root: Path,
+    records: Sequence[stage3.LedgerRecord],
+) -> bool:
+    """Allow exactly the pushed prefix and an optional current-head anchor."""
+
+    anchor_dir = stage3.SCRIPTS_DIR / "xs_chan_exploration_stage3_ledger_anchors"
+    actual = {path.name for path in anchor_dir.iterdir()} if anchor_dir.is_dir() else set()
+    prefix = {f"{int(record.data['sequence']):06d}_{record.data['record_hash']}.json" for record in records[:-1]}
+    current_name = f"{int(records[-1].data['sequence']):06d}_{records[-1].data['record_hash']}.json"
+    if actual not in (prefix, prefix | {current_name}):
+        raise FirstWeekOperationError(
+            "recovery anchor inventory must be the exact pushed prefix with at most the current head"
+        )
+    for record in records[:-1]:
+        validate_anchor_for_record(
+            spec,
+            root,
+            record.data,
+            require_pushed=True,
+        )
+    return current_name in actual
+
+
+def _validate_recovery_authorization_inventory(
+    records: Sequence[stage3.LedgerRecord],
+) -> bool:
+    """Allow no sidecar yet or exactly the current decision sidecar."""
+
+    directory = stage3.SCRIPTS_DIR / AUTHORIZATION_SIDECAR_DIR_NAME
+    actual = {path.name for path in directory.iterdir()} if directory.is_dir() else set()
+    expected_prefix = {
+        f"{int(record.data['sequence']):06d}_{record.data['record_hash']}.json"
+        for record in records[:-1]
+        if record.data["record_type"] == "decision_freeze"
+    }
+    current_name = f"{int(records[-1].data['sequence']):06d}_{records[-1].data['record_hash']}.json"
+    if actual not in (expected_prefix, expected_prefix | {current_name}):
+        raise FirstWeekOperationError(
+            "recovery authorization inventory must be the exact prior decision set with at most the current sidecar"
+        )
+    return current_name in actual
+
+
+def recover_first_decision_anchor(
+    *,
+    spec: Mapping[str, Any],
+    root: Path,
+    record_hash: str,
+    decision_date: str,
+    reference_manifest_path: Path,
+    state_manifest_path: Path,
+    preflight_report_path: Path,
+    expected_head: str,
+    data_dir: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Recover only a record exactly anticipated by a durable locked intent."""
+
+    with operator_lock(root), cache_lock(data_dir), stage3._exclusive_lock(root):
+        records = stage3.scan_records(root)
+        if (
+            len(records) != 2
+            or records[-1].data["record_hash"] != record_hash
+            or records[-1].data["record_type"] != "decision_freeze"
+            or records[-1].data["payload"]["decision_dt"] != decision_date
+            or records[-1].data["previous_hash"] != expected_head
+        ):
+            raise FirstWeekOperationError("ledger changed before guarded decision-anchor recovery")
+        stage3.validate_record_semantics(spec, records, root=root)
+        anchor_already_exists = _validate_recovery_anchor_inventory(
+            spec,
+            root,
+            records,
+        )
+        sidecar_already_exists = _validate_recovery_authorization_inventory(records)
+        authorization, authorization_sha, authorization_path = load_append_authorization(
+            spec,
+            root,
+            records[-1].data,
+            require_current_operator=False,
+        )
+        if (
+            Path(str(authorization["state_manifest_path"])).resolve() != state_manifest_path.expanduser().resolve()
+            or (root / str(authorization["reference_manifest_object"])).resolve()
+            != reference_manifest_path.expanduser().resolve()
+            or (root / str(authorization["preflight_report_object"])).resolve()
+            != preflight_report_path.expanduser().resolve()
+        ):
+            raise FirstWeekOperationError("recovery inputs differ from the pre-record authorization")
+
+        decision = records[-1].data
+        try:
+            pushed_pair = validate_authorized_anchor_pair(
+                spec,
+                root,
+                decision,
+                require_pushed=True,
+            )
+        except (FirstWeekOperationError, Stage3Error):
+            pushed_pair = None
+        if pushed_pair is not None:
+            current_git = validate_git_ready(verify_remote=True)
+            anchor_path = Path(str(pushed_pair["anchor"]["path"]))
+            authorization_sidecar_path = Path(str(pushed_pair["authorization"]["path"]))
+            return {
+                "status": "DECISION_EVIDENCE_ALREADY_COMMITTED",
+                "record_hash": record_hash,
+                "anchor_path": str(anchor_path),
+                "anchor_sha256": sha256_file(anchor_path),
+                "anchor": _read_json(anchor_path),
+                "authorization_path": str(authorization_path),
+                "authorization_sha256": authorization_sha,
+                "authorization_sidecar_path": str(authorization_sidecar_path),
+                "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
+                "authorization_sidecar": _read_json(authorization_sidecar_path),
+                "evidence_commit": pushed_pair["commit"],
+                "current_git": current_git,
+                "formal_ledger_mutated": False,
+                "next_state": "DECISION_AUTHORIZED_WAIT_EXIT",
+                "required_action": "wait for the registered exit label window",
+            }
+
+        initial_gate = validate_recovery_deadline(
+            FIRST_WEEK_ENTRY_DATE,
+            now=now,
+        )
+        authorization, authorization_sha, authorization_path = load_append_authorization(
+            spec,
+            root,
+            decision,
+            require_current_operator=True,
+        )
+        anchor_path = (
+            stage3.SCRIPTS_DIR
+            / "xs_chan_exploration_stage3_ledger_anchors"
+            / f"{int(decision['sequence']):06d}_{decision['record_hash']}.json"
+        )
+        authorization_sidecar_path = _authorization_sidecar_path(decision)
+        allowed_dirty_paths = {
+            anchor_path.resolve().relative_to(stage3.REPO_ROOT.resolve()).as_posix(),
+            authorization_sidecar_path.resolve().relative_to(stage3.REPO_ROOT.resolve()).as_posix(),
+        }
+        recovery_git = validate_recovery_git_ready(
+            authorization,
+            allowed_dirty_paths=allowed_dirty_paths,
+        )
+        raw = validate_raw_ready(
+            decision_date,
+            data_dir=data_dir,
+        )
+        state = validate_state_ready(
+            state_manifest_path,
+            decision_date,
+            data_dir=data_dir,
+        )
+        if state["raw_parquet_inventory_sha256"] != raw["parquet_inventory_sha256"]:
+            raise FirstWeekOperationError("recovery raw and state evidence bind different closures")
+        reference = validate_reference_ready(
+            spec,
+            root,
+            reference_manifest_path,
+            state_manifest_path,
+            decision_date,
+            state_summary=state,
+            raw_summary=raw,
+        )
+        if (
+            authorization["raw_audit_sha256"] != raw["audit_sha256"]
+            or authorization["raw_parquet_inventory_sha256"] != raw["parquet_inventory_sha256"]
+            or authorization["raw_source_closure_sha256"] != reference["raw_source_closure_sha256"]
+            or authorization["state_manifest_sha256"] != state["manifest_sha256"]
+            or authorization["state_projection_sha256"] != state["projection_sha256"]
+            or authorization["reference_manifest_sha256"] != reference["manifest_sha256"]
+            or authorization["decision_path_sha256"] != reference["bridge_path_sha256"]
+            or decision["payload"]["decision_path_sha256"] != reference["bridge_path_sha256"]
+        ):
+            raise FirstWeekOperationError("current recovery evidence differs from the pre-record authorization")
+
+        final_recovery_git = validate_recovery_git_ready(
+            authorization,
+            allowed_dirty_paths=allowed_dirty_paths,
+        )
+        current_gate = validate_recovery_deadline(FIRST_WEEK_ENTRY_DATE)
+        with atomic_stage3_writes(root):
+            authorization_sidecar, authorization_sidecar_path = export_authorization_sidecar(
+                spec,
+                root,
+                decision,
+            )
+            anchor, anchor_path = stage3.export_ledger_head_anchor(
+                spec,
+                root,
+            )
+            validate_authorized_anchor_pair(
+                spec,
+                root,
+                decision,
+                require_pushed=False,
+            )
+            validate_existing_anchor_chain(
+                spec,
+                root,
+                require_pushed=False,
+            )
+        finished_gate = validate_recovery_deadline(FIRST_WEEK_ENTRY_DATE)
+    return {
+        "status": (
+            "AUTHORIZED_DECISION_EVIDENCE_REVALIDATED"
+            if anchor_already_exists and sidecar_already_exists
+            else "AUTHORIZED_DECISION_ANCHOR_RECOVERED"
+        ),
+        "record_hash": record_hash,
+        "anchor_path": str(anchor_path),
+        "anchor_sha256": sha256_file(anchor_path),
+        "anchor": anchor,
+        "authorization_path": str(authorization_path),
+        "authorization_sha256": authorization_sha,
+        "authorization_sidecar_path": str(authorization_sidecar_path),
+        "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
+        "authorization_sidecar": authorization_sidecar,
+        "recovery_git": recovery_git,
+        "final_recovery_git": final_recovery_git,
+        "initial_time_gate": initial_gate,
+        "recovery_time_gate": current_gate,
+        "recovery_finished_gate": finished_gate,
+        "formal_ledger_mutated": False,
+        "next_state": "DECISION_EVIDENCE_COMMIT_PENDING",
+        "required_action": ("commit and push exactly the matching anchor and operator authorization sidecar"),
+    }
 
 
 def freeze_first_decision(
@@ -1443,46 +2907,18 @@ def freeze_first_decision(
         and initial_records[-1].data["payload"]["decision_dt"] == target
         and initial_records[-1].data["previous_hash"] == expected_head
     ):
-        recovery_deadline = _entry_open(initial_records[-1].data["payload"]["entry_dt"]).astimezone(UTC)
-        if _as_utc(now) >= recovery_deadline:
-            raise FirstWeekOperationError(
-                "decision exists but its anchor cannot be recovered after entry open; the prospective chain is invalid"
-            )
-        with (
-            operator_lock(root),
-            cache_lock(data_dir),
-            stage3._exclusive_lock(root),
-        ):
-            current_records = stage3.scan_records(root)
-            if (
-                len(current_records) != 2
-                or current_records[-1].data["record_hash"] != initial_records[-1].data["record_hash"]
-            ):
-                raise FirstWeekOperationError("ledger changed during decision-anchor recovery")
-            if _as_utc() >= recovery_deadline:
-                raise FirstWeekOperationError(
-                    "decision-anchor recovery crossed entry open while waiting for locks; "
-                    "the prospective chain is invalid"
-                )
-            anchor, anchor_path = stage3.export_ledger_head_anchor(
-                spec,
-                root,
-            )
-            validate_anchor_for_record(
-                spec,
-                root,
-                current_records[-1].data,
-                require_pushed=False,
-            )
-        return {
-            "status": "DECISION_ALREADY_FROZEN_ANCHOR_EXPORTED",
-            "record_hash": current_records[-1].data["record_hash"],
-            "anchor_path": str(anchor_path),
-            "anchor_sha256": sha256_file(anchor_path),
-            "anchor": anchor,
-            "formal_ledger_mutated": False,
-            "next_state": "DECISION_ANCHOR_PENDING",
-        }
+        return recover_first_decision_anchor(
+            spec=spec,
+            root=root,
+            record_hash=initial_records[-1].data["record_hash"],
+            decision_date=target,
+            reference_manifest_path=reference_manifest_path,
+            state_manifest_path=state_manifest_path,
+            preflight_report_path=preflight_report_path,
+            expected_head=expected_head,
+            data_dir=data_dir,
+            now=now,
+        )
 
     time_gate = validate_apply_window(
         target,
@@ -1513,13 +2949,23 @@ def freeze_first_decision(
         expected_path_sha = current_report["reference"]["bridge_path_sha256"]
         if receipt["reference"]["bridge_path_sha256"] != expected_path_sha:
             raise FirstWeekOperationError("stored receipt and current preflight derive different decision paths")
-        record, anchor, anchor_path = append_first_decision_with_final_guards(
+        (
+            record,
+            anchor,
+            anchor_path,
+            authorization_sidecar,
+            authorization_sidecar_path,
+            authorization_path,
+        ) = append_first_decision_with_final_guards(
             spec,
             root,
             reference_manifest_path.resolve(),
+            state_manifest_path.resolve(),
+            preflight_report_path.resolve(),
             target,
             expected_head=expected_head,
             expected_decision_path_sha256=expected_path_sha,
+            final_preflight_report=current_report,
         )
         finished_at = _as_utc()
         entry_open = _entry_open(record.data["payload"]["entry_dt"]).astimezone(UTC)
@@ -1536,11 +2982,20 @@ def freeze_first_decision(
         "anchor_path": str(anchor_path),
         "anchor_sha256": sha256_file(anchor_path),
         "anchor": anchor,
-        "git_before_append": git,
+        "authorization_path": str(authorization_path),
+        "authorization_sha256": authorization_sidecar["authorization_sha256"],
+        "authorization_sidecar_path": str(authorization_sidecar_path),
+        "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
+        "authorization_sidecar": authorization_sidecar,
+        "git_before_append": authorization_sidecar["authorization"]["git"],
+        "initial_git_check": git,
         "time_gate": time_gate,
         "formal_ledger_mutated": True,
-        "next_state": "DECISION_ANCHOR_PENDING",
-        "required_action": ("commit and push exactly the exported anchor before entry open"),
+        "next_state": "DECISION_EVIDENCE_COMMIT_PENDING",
+        "required_action": (
+            "commit and push exactly the exported anchor and matching operator authorization "
+            "sidecar in one commit before entry open"
+        ),
         "anchor_deadline_utc": entry_open,
     }
 
@@ -1560,8 +3015,14 @@ def status_snapshot(
     decision_close = _decision_close(decision_date).astimezone(UTC)
     daily_release = _daily_release(decision_date).astimezone(UTC)
     entry_open = _entry_open(FIRST_WEEK_ENTRY_DATE).astimezone(UTC)
+    latest_safe_start = entry_open - ANCHOR_PUSH_RESERVE
     records = stage3.scan_records(root)
     stage3.validate_record_semantics(spec, records, root=root)
+    validate_authorization_sidecar_inventory(
+        root,
+        records,
+        allow_missing_current_authorized=True,
+    )
     blinded = stage3.status_report(spec, records, root=root)
     inventory = inspect_inventory(data_dir.expanduser().resolve())
     target = pd.Timestamp(decision_date).strftime("%Y%m%d")
@@ -1570,6 +3031,7 @@ def status_snapshot(
     try:
         git = {
             "ready": True,
+            "readiness_scope": "LOCAL_TRACKING_ONLY_NO_NETWORK",
             **validate_git_ready(verify_remote=False),
         }
     except FirstWeekOperationError as exc:
@@ -1598,7 +3060,7 @@ def status_snapshot(
         raise FirstWeekOperationError("first-week ledger contains duplicate decision or label events")
     if labels:
         try:
-            validate_anchor_for_record(
+            validate_authorized_anchor_pair(
                 spec,
                 root,
                 decisions[0].data,
@@ -1612,20 +3074,46 @@ def status_snapshot(
             )
             state = "FIRST_WEEK_COMPLETE"
         except (FirstWeekOperationError, Stage3Error):
-            state = "LABEL_ANCHOR_PENDING"
+            try:
+                load_append_authorization(
+                    spec,
+                    root,
+                    decisions[0].data,
+                    require_current_operator=False,
+                )
+            except (FirstWeekOperationError, Stage3Error):
+                state = "UNAUTHORIZED_DECISION_PRESENT"
+            else:
+                state = "LABEL_ANCHOR_PENDING"
     elif decisions:
         try:
-            validate_anchor_for_record(
+            load_append_authorization(
                 spec,
                 root,
                 decisions[0].data,
-                require_pushed=True,
+                require_current_operator=False,
             )
-            state = "DECISION_ANCHORED_WAIT_EXIT"
         except (FirstWeekOperationError, Stage3Error):
-            state = "INVALID_DECISION_ANCHOR_DEADLINE" if current >= entry_open else "DECISION_ANCHOR_PENDING"
+            state = "UNAUTHORIZED_DECISION_PRESENT"
+        else:
+            try:
+                validate_authorized_anchor_pair(
+                    spec,
+                    root,
+                    decisions[0].data,
+                    require_pushed=True,
+                )
+                state = "DECISION_AUTHORIZED_WAIT_EXIT"
+            except (FirstWeekOperationError, Stage3Error):
+                state = (
+                    "INVALID_DECISION_EVIDENCE_DEADLINE"
+                    if current >= entry_open
+                    else "DECISION_EVIDENCE_COMMIT_PENDING"
+                )
     elif current >= entry_open:
         state = "MISSED_DECISION_WINDOW"
+    elif current >= latest_safe_start:
+        state = "MISSED_SAFE_APPLY_WINDOW"
     elif current < decision_close:
         state = "WAIT_DECISION_DATE"
     elif current < daily_release:
@@ -1645,6 +3133,7 @@ def status_snapshot(
         "time_gate": {
             "decision_close_utc": decision_close,
             "daily_release_utc": daily_release,
+            "latest_safe_start_utc": latest_safe_start,
             "entry_open_utc": entry_open,
         },
         "git": git,
