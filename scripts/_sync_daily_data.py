@@ -19,8 +19,11 @@ import fcntl
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +53,15 @@ DEFAULT_SNAPSHOT_ROOT = Path.home() / ".ts_data_cache" / "xs_chan_raw_snapshots"
 DEFAULT_END_DATE = datetime.now(MARKET_TIMEZONE).strftime("%Y%m%d")
 DEFAULT_MIN_DAILY_ROWS = 1_000
 DEFAULT_NEW_SYMBOL_SLEEP_SECONDS = 0.3
+SOURCE_SYMBOL_ABSOLUTE_MINIMUM = 4_000
+SOURCE_SYMBOL_MIN_PREVIOUS_SESSION_COVERAGE = 0.95
+SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE = 0.05
+TS_CODE_PATTERN = re.compile(r"\d{6}\.(?:SH|SZ|BJ)")
+REQUIRED_GIT_BRANCH = "feat/surge-wave-strategy"
+REQUIRED_GIT_UPSTREAM = "mine/feat/surge-wave-strategy"
+REQUIRED_GIT_REMOTE_NAME = "mine"
+REQUIRED_GIT_REMOTE_URL = "git@github.com:lovelyzzc/czsc.git"
+REQUIRED_GIT_REMOTE_REF = "refs/heads/feat/surge-wave-strategy"
 FULL_QFQ_MAX_ATTEMPTS = 4
 FULL_QFQ_BACKOFF_CAP_SECONDS = 8
 DAILY_COLUMNS = (
@@ -70,6 +82,7 @@ RUN_PREFIX = ".a_stock_daily_qfq_sync_"
 SNAPSHOT_PREFIX = "RAW_"
 ARCHIVE_TEMP_PREFIX = ".tmp_raw_archive_"
 AUDIT_DIR_NAME = "a_stock_daily_qfq_sync_audits"
+API_OBJECT_DIR_NAME = "a_stock_daily_qfq_sync_objects"
 LOCK_FILE_NAME = ".a_stock_daily_qfq_sync.lock"
 JOURNAL_FILE_NAME = "journal.json"
 SNAPSHOT_MANIFEST_FILE_NAME = "snapshot_manifest.json"
@@ -103,32 +116,200 @@ def sha256_bytes(payload: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    parent_fd, descriptor, identity = _open_regular_file_nofollow(path)
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        _assert_directory_entry_identity(parent_fd, path.name, identity, label=str(path))
+    finally:
+        os.close(parent_fd)
     return digest.hexdigest()
+
+
+def _open_directory_nofollow(path: Path) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DailySyncError(f"directory is unavailable or is a symlink: {path}") from exc
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DailySyncError(f"path is not a directory: {path}")
+    return descriptor
+
+
+def _assert_directory_entry_identity(
+    parent_fd: int,
+    name: str,
+    identity: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise DailySyncError(f"regular file changed while being verified: {label}") from exc
+    if not stat.S_ISREG(current.st_mode) or current.st_dev != identity.st_dev or current.st_ino != identity.st_ino:
+        raise DailySyncError(f"regular file changed or became a symlink while being verified: {label}")
+
+
+def _open_regular_file_nofollow(path: Path) -> tuple[int, int, os.stat_result]:
+    parent_fd = _open_directory_nofollow(path.parent)
+    descriptor: int | None = None
+    try:
+        identity = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(identity.st_mode):
+            raise DailySyncError(f"payload is not a regular file or is a symlink: {path}")
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_dev != identity.st_dev or opened.st_ino != identity.st_ino:
+            raise DailySyncError(f"regular file changed while being opened: {path}")
+        return parent_fd, descriptor, opened
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+        raise
+
+
+def _read_regular_bytes_nofollow(path: Path) -> bytes:
+    parent_fd, descriptor, identity = _open_regular_file_nofollow(path)
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            raw = handle.read()
+        _assert_directory_entry_identity(parent_fd, path.name, identity, label=str(path))
+        return raw
+    finally:
+        os.close(parent_fd)
+
+
+def _fsync_regular_payload_directory(
+    path: Path,
+    *,
+    label: str,
+    fsync_files: bool = True,
+) -> None:
+    """Fsync every regular payload and its directory without following symlinks."""
+
+    directory_fd = _open_directory_nofollow(path)
+    try:
+        for name in sorted(os.listdir(directory_fd)):
+            identity = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(identity.st_mode):
+                raise DailySyncError(f"{label} contains a non-regular payload or symlink: {name}")
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_dev != identity.st_dev
+                    or opened.st_ino != identity.st_ino
+                ):
+                    raise DailySyncError(f"{label} payload changed while being opened: {name}")
+                if fsync_files:
+                    os.fsync(descriptor)
+                _assert_directory_entry_identity(directory_fd, name, opened, label=f"{path / name}")
+            finally:
+                os.close(descriptor)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    parent_fd, descriptor, identity = _open_regular_file_nofollow(path)
+    try:
+        os.fsync(descriptor)
+        _assert_directory_entry_identity(parent_fd, path.name, identity, label=str(path))
+        os.fsync(parent_fd)
+    finally:
+        os.close(descriptor)
+        os.close(parent_fd)
+
+
+def _copy_regular_file_nofollow(source: Path, destination: Path) -> None:
+    """Copy one immutable payload without following either endpoint."""
+
+    source_parent_fd, source_fd, source_identity = _open_regular_file_nofollow(source)
+    destination_parent_fd: int | None = None
+    destination_fd: int | None = None
+    try:
+        destination_parent_fd = _open_directory_nofollow(destination.parent)
+        destination_fd = os.open(
+            destination.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            stat.S_IMODE(source_identity.st_mode),
+            dir_fd=destination_parent_fd,
+        )
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            pending = memoryview(chunk)
+            while pending:
+                written = os.write(destination_fd, pending)
+                pending = pending[written:]
+        os.fsync(destination_fd)
+        destination_identity = os.fstat(destination_fd)
+        if not stat.S_ISREG(destination_identity.st_mode):
+            raise DailySyncError(f"copied payload is not a regular file: {destination}")
+        _assert_directory_entry_identity(
+            source_parent_fd,
+            source.name,
+            source_identity,
+            label=str(source),
+        )
+        _assert_directory_entry_identity(
+            destination_parent_fd,
+            destination.name,
+            destination_identity,
+            label=str(destination),
+        )
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if destination_parent_fd is not None:
+            os.close(destination_parent_fd)
+        os.close(source_fd)
+        os.close(source_parent_fd)
 
 
 def fsync_directory(path: Path) -> None:
     """同步目录项；用于保证 rename/replace 在断电后仍可恢复。"""
 
-    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    directory_fd = _open_directory_nofollow(path)
     try:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
 
 
+def _mkdir_parents_durable(path: Path) -> bool:
+    """Create missing directory components and durably publish every entry."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not os.path.lexists(cursor):
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True)
+    directory_fd = _open_directory_nofollow(path)
+    os.close(directory_fd)
+    for created in missing:
+        fsync_directory(created.parent)
+    return bool(missing)
+
+
 def atomic_write_bytes(path: Path, raw: bytes, *, replace_existing: bool = True) -> None:
     """在目标目录内原子写 bytes，并同步文件与父目录。"""
 
-    parent_existed = path.parent.is_dir()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not parent_existed:
-        fsync_directory(path.parent.parent)
-    if path.exists() and not replace_existing:
-        if path.read_bytes() != raw:
+    _mkdir_parents_durable(path.parent)
+    if os.path.lexists(path) and not replace_existing:
+        if _read_regular_bytes_nofollow(path) != raw:
             raise DailySyncError(f"refusing to overwrite conflicting immutable object: {path}")
+        _fsync_regular_file(path)
         return
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
@@ -137,11 +318,30 @@ def atomic_write_bytes(path: Path, raw: bytes, *, replace_existing: bool = True)
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if replace_existing:
+            os.replace(temporary, path)
+        else:
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                if _read_regular_bytes_nofollow(path) != raw:
+                    raise DailySyncError(f"refusing to overwrite conflicting immutable object: {path}") from None
+            else:
+                temporary.unlink()
+        _fsync_regular_file(path)
         fsync_directory(path.parent)
     finally:
-        if temporary.exists():
+        if os.path.lexists(temporary):
             temporary.unlink()
+
+
+def validate_storage_layout(data_dir: Path, snapshot_root: Path) -> None:
+    """Keep immutable archives outside the mutable active raw tree."""
+
+    resolved_data = data_dir.expanduser().resolve()
+    resolved_snapshot = snapshot_root.expanduser().resolve()
+    if resolved_snapshot == resolved_data or resolved_snapshot.is_relative_to(resolved_data):
+        raise DailySyncError("snapshot root must be outside the active data directory")
 
 
 def normalize_trade_date(value: object) -> str:
@@ -149,6 +349,226 @@ def normalize_trade_date(value: object) -> str:
     if len(text) == 8 and text.isdigit():
         return text
     return pd.Timestamp(value).strftime("%Y%m%d")
+
+
+def _validated_ts_codes(values: pd.Series, label: str) -> pd.Series:
+    """Return canonical Tushare equity identifiers without laundering nulls."""
+
+    if values.isna().any():
+        raise DailySyncError(f"{label} contains a null ts_code")
+    normalized = values.astype(str)
+    invalid = normalized.str.strip().eq("") | ~normalized.str.fullmatch(TS_CODE_PATTERN)
+    if invalid.any():
+        examples = sorted(set(normalized.loc[invalid].tolist()))[:5]
+        raise DailySyncError(f"{label} contains invalid ts_code values: {examples}")
+    return normalized
+
+
+def source_symbol_completeness_rule(
+    *,
+    absolute_minimum: int = SOURCE_SYMBOL_ABSOLUTE_MINIMUM,
+    minimum_previous_coverage: float = SOURCE_SYMBOL_MIN_PREVIOUS_SESSION_COVERAGE,
+    maximum_symmetric_change_share: float = SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE,
+) -> dict[str, Any]:
+    """Return the frozen, result-independent source-universe gate."""
+
+    rule = {
+        "schema": "a_stock_daily_qfq_source_symbol_completeness_rule_v1",
+        "absolute_minimum_symbols": absolute_minimum,
+        "minimum_previous_session_coverage": minimum_previous_coverage,
+        "maximum_symmetric_change_share": maximum_symmetric_change_share,
+        "daily_adj_factor_same_day_rule": (
+            "daily_symbols_must_all_have_adj_factor_and_equal_the_adj_factor_projection_onto_daily"
+        ),
+        "raw_adj_factor_only_symbols": "allowed_but_counted_and_hashed",
+        "session_chain": "each_fetched_session_compared_with_immediately_previous_active_session",
+    }
+    return {
+        **rule,
+        "rule_sha256": sha256_bytes(canonical_json(rule)),
+    }
+
+
+def _symbol_set_evidence(symbols: set[str]) -> dict[str, Any]:
+    normalized = sorted(map(str, symbols))
+    return {
+        "count": len(normalized),
+        "sha256": sha256_bytes(canonical_json(normalized)),
+    }
+
+
+def active_session_symbols(data_dir: Path, inventory: Mapping[str, Any]) -> tuple[str, set[str]]:
+    """Derive and row-verify the last active session's physical symbol set."""
+
+    resolved_data = data_dir.expanduser().resolve()
+    trade_date = normalize_trade_date(inventory.get("max_dt"))
+    records = inventory.get("records")
+    if not isinstance(records, list):
+        raise DailySyncError("active inventory has no physical source records")
+    symbols: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping) or normalize_trade_date(record.get("max_dt")) != trade_date:
+            continue
+        name = str(record.get("name", ""))
+        symbol = Path(name).stem
+        _validated_ts_codes(pd.Series([symbol], dtype=object), f"active inventory filename {name}")
+        path = resolved_data / name
+        if not path.is_file() or sha256_file(path) != record.get("sha256"):
+            raise DailySyncError(f"active inventory bytes changed before baseline verification: {path}")
+        try:
+            rows = pd.read_parquet(path, columns=["ts_code", "trade_date"])
+        except Exception as exc:
+            raise DailySyncError(f"cannot verify active-session identity in {path}: {exc}") from exc
+        rows["ts_code"] = _validated_ts_codes(rows["ts_code"], f"active inventory {name}")
+        rows["trade_date"] = rows["trade_date"].map(normalize_trade_date)
+        target_rows = rows.loc[rows["trade_date"].eq(trade_date), "ts_code"]
+        if len(target_rows) != 1 or target_rows.iloc[0] != symbol:
+            raise DailySyncError(
+                f"active inventory {name} does not contain exactly one matching {symbol} row on {trade_date}"
+            )
+        symbols.add(symbol)
+    if not symbols:
+        raise DailySyncError(f"active inventory has no symbols on its maximum session {trade_date}")
+    return trade_date, symbols
+
+
+def validate_source_symbol_completeness(
+    daily: pd.DataFrame,
+    factors: pd.DataFrame,
+    trade_dates: Sequence[str],
+    *,
+    previous_trade_date: str,
+    previous_symbols: set[str],
+    absolute_minimum: int = SOURCE_SYMBOL_ABSOLUTE_MINIMUM,
+    minimum_previous_coverage: float = SOURCE_SYMBOL_MIN_PREVIOUS_SESSION_COVERAGE,
+    maximum_symmetric_change_share: float = SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE,
+) -> dict[str, Any]:
+    """Fail closed on truncated or cross-source-inconsistent market universes."""
+
+    dates = [normalize_trade_date(value) for value in trade_dates]
+    if (
+        not dates
+        or len(dates) != len(set(dates))
+        or dates != sorted(dates)
+        or dates[0] != normalize_trade_date(previous_trade_date)
+    ):
+        raise DailySyncError("source completeness requires a unique ordered session chain starting at active max")
+    if absolute_minimum <= 0 or not 0 < minimum_previous_coverage <= 1 or not 0 <= maximum_symmetric_change_share < 1:
+        raise DailySyncError("source completeness thresholds are invalid")
+    required_columns = {"ts_code", "trade_date"}
+    if not required_columns <= set(daily) or not required_columns <= set(factors):
+        raise DailySyncError("source completeness inputs lack ts_code or trade_date")
+
+    def group_symbols(frame: pd.DataFrame, label: str) -> dict[str, set[str]]:
+        selected = frame.loc[:, ["ts_code", "trade_date"]].copy()
+        selected["ts_code"] = _validated_ts_codes(selected["ts_code"], label)
+        selected["trade_date"] = selected["trade_date"].map(normalize_trade_date)
+        if selected.duplicated(["trade_date", "ts_code"]).any():
+            raise DailySyncError(f"{label} contains duplicate same-day symbols")
+        grouped = {
+            str(trade_date): set(group["ts_code"]) for trade_date, group in selected.groupby("trade_date", sort=True)
+        }
+        if set(grouped) != set(dates):
+            raise DailySyncError(f"{label} dates differ from the official fetched session chain")
+        return grouped
+
+    daily_by_date = group_symbols(daily, "daily")
+    factor_by_date = group_symbols(factors, "adj_factor")
+    prior_date = normalize_trade_date(previous_trade_date)
+    prior_symbols = set(map(str, previous_symbols))
+    _validated_ts_codes(pd.Series(sorted(prior_symbols), dtype=object), "active session baseline")
+    if len(prior_symbols) < absolute_minimum:
+        raise DailySyncError(
+            f"active session {prior_date} has only {len(prior_symbols)} symbols; "
+            f"fixed absolute minimum is {absolute_minimum}"
+        )
+
+    sessions: list[dict[str, Any]] = []
+    for trade_date in dates:
+        daily_symbols = daily_by_date[trade_date]
+        factor_symbols = factor_by_date[trade_date]
+        missing_factors = daily_symbols - factor_symbols
+        factor_only = factor_symbols - daily_symbols
+        aligned_factor_symbols = factor_symbols & daily_symbols
+        if missing_factors or aligned_factor_symbols != daily_symbols:
+            raise DailySyncError(
+                f"daily/adj_factor symbol sets cannot align on {trade_date}: "
+                f"daily_without_factor={len(missing_factors)}"
+            )
+        if len(daily_symbols) < absolute_minimum:
+            raise DailySyncError(
+                f"daily[{trade_date}] has only {len(daily_symbols)} symbols; "
+                f"fixed absolute minimum is {absolute_minimum}"
+            )
+
+        retained = prior_symbols & daily_symbols
+        required_retained = math.ceil(len(prior_symbols) * minimum_previous_coverage)
+        if len(retained) < required_retained:
+            coverage = len(retained) / len(prior_symbols)
+            raise DailySyncError(
+                f"daily[{trade_date}] retained only {len(retained)}/{len(prior_symbols)} "
+                f"symbols from active session {prior_date} ({coverage:.6f}); "
+                f"minimum coverage is {minimum_previous_coverage:.6f}"
+            )
+        added = daily_symbols - prior_symbols
+        removed = prior_symbols - daily_symbols
+        symmetric_change_count = len(added) + len(removed)
+        maximum_symmetric_change_count = math.floor(len(prior_symbols) * maximum_symmetric_change_share)
+        if symmetric_change_count > maximum_symmetric_change_count:
+            raise DailySyncError(
+                f"daily[{trade_date}] changed {symmetric_change_count}/{len(prior_symbols)} "
+                f"symbols versus active session {prior_date}; maximum symmetric change share is "
+                f"{maximum_symmetric_change_share:.6f}"
+            )
+        previous_evidence = _symbol_set_evidence(prior_symbols)
+        daily_evidence = _symbol_set_evidence(daily_symbols)
+        factor_evidence = _symbol_set_evidence(factor_symbols)
+        aligned_factor_evidence = _symbol_set_evidence(aligned_factor_symbols)
+        sessions.append(
+            {
+                "trade_date": trade_date,
+                "previous_trade_date": prior_date,
+                "previous_symbols": previous_evidence,
+                "daily_symbols": daily_evidence,
+                "raw_adj_factor_symbols": factor_evidence,
+                "aligned_adj_factor_symbols": aligned_factor_evidence,
+                "daily_adj_factor_aligned_exact": daily_evidence == aligned_factor_evidence,
+                "daily_without_adj_factor": _symbol_set_evidence(missing_factors),
+                "raw_adj_factor_only": _symbol_set_evidence(factor_only),
+                "retained_from_previous": len(retained),
+                "required_retained_from_previous": required_retained,
+                "previous_session_coverage": len(retained) / len(prior_symbols),
+                "added_since_previous": _symbol_set_evidence(added),
+                "removed_since_previous": _symbol_set_evidence(removed),
+                "symmetric_change_count": symmetric_change_count,
+                "maximum_symmetric_change_count": maximum_symmetric_change_count,
+                "symmetric_change_share": symmetric_change_count / len(prior_symbols),
+                "passed": True,
+            }
+        )
+        prior_date = trade_date
+        prior_symbols = daily_symbols
+
+    rule = source_symbol_completeness_rule(
+        absolute_minimum=absolute_minimum,
+        minimum_previous_coverage=minimum_previous_coverage,
+        maximum_symmetric_change_share=maximum_symmetric_change_share,
+    )
+    baseline = {
+        "trade_date": normalize_trade_date(previous_trade_date),
+        "symbols": _symbol_set_evidence(set(map(str, previous_symbols))),
+    }
+    report_without_hash = {
+        "schema": "a_stock_daily_qfq_source_symbol_completeness_v1",
+        "rule": rule,
+        "baseline": baseline,
+        "sessions": sessions,
+        "passed": True,
+    }
+    return {
+        **report_without_hash,
+        "report_sha256": sha256_bytes(canonical_json(report_without_hash)),
+    }
 
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -169,6 +589,109 @@ def _git_output(repo_root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
+def _actual_remote_head(repo_root: Path, remote_name: str, remote_ref: str) -> str:
+    """Resolve exactly one branch head from the remote itself, not a tracking ref."""
+
+    try:
+        output = _git_output(repo_root, "ls-remote", "--heads", remote_name, remote_ref)
+    except subprocess.CalledProcessError as exc:
+        raise DailySyncError(f"cannot query actual Git remote {remote_name!r}") from exc
+    matches: list[str] = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise DailySyncError("actual Git remote returned a malformed branch record")
+        sha, ref = fields
+        if ref == remote_ref:
+            matches.append(sha)
+    if len(matches) != 1:
+        raise DailySyncError(f"actual Git remote ref {remote_ref!r} did not resolve exactly once")
+    return matches[0]
+
+
+def _git_repository_evidence(repo_root: Path, *, verify_remote: bool) -> dict[str, Any]:
+    """Bind local Git identity and optionally prove the frozen remote ref."""
+
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    dirty_entries = _git_output(repo_root, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
+    try:
+        branch = _git_output(repo_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+        upstream = _git_output(
+            repo_root,
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        )
+        upstream_head = _git_output(repo_root, "rev-parse", "@{upstream}")
+    except subprocess.CalledProcessError as exc:
+        if verify_remote:
+            raise DailySyncError("formal publication requires an attached branch with an upstream") from exc
+        branch = None
+        upstream = None
+        upstream_head = None
+
+    remote_name: str | None = None
+    remote_ref: str | None = None
+    fetch_url: str | None = None
+    push_url: str | None = None
+    if upstream is not None:
+        remote_name, separator, remote_branch = upstream.partition("/")
+        if separator and remote_name and remote_branch:
+            remote_ref = f"refs/heads/{remote_branch}"
+            try:
+                fetch_url = _git_output(repo_root, "remote", "get-url", remote_name)
+                push_url = _git_output(repo_root, "remote", "get-url", "--push", remote_name)
+            except subprocess.CalledProcessError as exc:
+                if verify_remote:
+                    raise DailySyncError("formal publication cannot resolve its upstream remote URLs") from exc
+                fetch_url = None
+                push_url = None
+
+    if verify_remote:
+        if dirty_entries:
+            raise DailySyncError("formal publication requires the Git worktree to remain clean")
+        required_identity = {
+            "branch": REQUIRED_GIT_BRANCH,
+            "upstream": REQUIRED_GIT_UPSTREAM,
+            "remote_name": REQUIRED_GIT_REMOTE_NAME,
+            "remote_ref": REQUIRED_GIT_REMOTE_REF,
+            "remote_fetch_url": REQUIRED_GIT_REMOTE_URL,
+            "remote_push_url": REQUIRED_GIT_REMOTE_URL,
+        }
+        current_identity = {
+            "branch": branch,
+            "upstream": upstream,
+            "remote_name": remote_name,
+            "remote_ref": remote_ref,
+            "remote_fetch_url": fetch_url,
+            "remote_push_url": push_url,
+        }
+        if current_identity != required_identity:
+            raise DailySyncError("formal publication Git branch, upstream, remote URL, or ref is not frozen")
+        if upstream_head != head:
+            raise DailySyncError("formal publication HEAD differs from its local upstream tracking ref")
+        remote_head = _actual_remote_head(repo_root, REQUIRED_GIT_REMOTE_NAME, REQUIRED_GIT_REMOTE_REF)
+        if remote_head != head:
+            raise DailySyncError("formal publication HEAD differs from the actual remote branch")
+    else:
+        remote_head = None
+
+    return {
+        "branch": branch,
+        "head": head,
+        "upstream": upstream,
+        "upstream_head": upstream_head,
+        "remote_name": remote_name,
+        "remote_ref": remote_ref,
+        "remote_head": remote_head,
+        "remote_fetch_url": fetch_url,
+        "remote_push_url": push_url,
+        "remote_verified": verify_remote,
+        "worktree_clean": not dirty_entries,
+    }
+
+
 def build_execution_binding(
     args: argparse.Namespace,
     data_dir: Path,
@@ -176,22 +699,13 @@ def build_execution_binding(
     safe_end: str,
     *,
     require_clean_and_pushed: bool,
+    source_symbol_completeness: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """绑定执行源码、依赖、Git 状态和所有会改变同步结果的参数。"""
 
+    validate_storage_layout(data_dir, snapshot_root)
     repo_root = Path(__file__).resolve().parents[1]
-    git_head = _git_output(repo_root, "rev-parse", "HEAD")
-    try:
-        upstream_head = _git_output(repo_root, "rev-parse", "@{upstream}")
-    except subprocess.CalledProcessError as exc:
-        if require_clean_and_pushed:
-            raise DailySyncError("apply requires a configured upstream branch") from exc
-        upstream_head = None
-    dirty_entries = _git_output(repo_root, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
-    if require_clean_and_pushed and dirty_entries:
-        raise DailySyncError("apply requires a clean Git worktree so execution bytes are immutable")
-    if require_clean_and_pushed and upstream_head != git_head:
-        raise DailySyncError("apply requires HEAD to equal the pushed upstream commit")
+    git_evidence = _git_repository_evidence(repo_root, verify_remote=require_clean_and_pushed)
 
     source_files = [
         {
@@ -201,18 +715,15 @@ def build_execution_binding(
         for path in SOURCE_FILES
     ]
     lock_path = repo_root / "uv.lock"
-    dependencies = {
-        name: importlib.metadata.version(name)
-        for name in DEPENDENCY_DISTRIBUTIONS
-    }
+    dependencies = {name: importlib.metadata.version(name) for name in DEPENDENCY_DISTRIBUTIONS}
+    completeness_rule = source_symbol_completeness_rule()
+    completeness_evidence = (
+        None if source_symbol_completeness is None else json.loads(canonical_json(source_symbol_completeness))
+    )
     binding = {
-        "schema": "a_stock_daily_qfq_execution_binding_v1",
+        "schema": "a_stock_daily_qfq_execution_binding_v2",
         "source_files": source_files,
-        "git": {
-            "head": git_head,
-            "upstream_head": upstream_head,
-            "worktree_clean": not dirty_entries,
-        },
+        "git": git_evidence,
         "environment": {
             "python": sys.version.split()[0],
             "dependencies": dependencies,
@@ -244,6 +755,13 @@ def build_execution_binding(
             "daily_fields": list(DAILY_COLUMNS),
             "adjustment_factor_fields": ["ts_code", "trade_date", "adj_factor"],
             "full_qfq_query": {"adj": "qfq", "freq": "D", "asset": "E"},
+            "source_symbol_completeness_rule": completeness_rule,
+        },
+        "input_evidence": {
+            "source_symbol_completeness": completeness_evidence,
+            "source_symbol_completeness_sha256": (
+                None if completeness_evidence is None else sha256_bytes(canonical_json(completeness_evidence))
+            ),
         },
     }
     return {
@@ -252,28 +770,79 @@ def build_execution_binding(
     }
 
 
-def assert_execution_binding_current(execution_binding: Mapping[str, Any]) -> None:
+def assert_execution_binding_current(
+    execution_binding: Mapping[str, Any],
+    *,
+    require_source_completeness: bool = False,
+    require_formal_publication: bool = False,
+) -> None:
     """发布前后均确认已冻结的执行环境没有漂移。"""
 
     binding = execution_binding.get("binding")
     expected_sha = execution_binding.get("binding_sha256")
     if not isinstance(binding, Mapping) or expected_sha != sha256_bytes(canonical_json(binding)):
         raise DailySyncError("execution binding is malformed or has been modified")
+    parameters = binding.get("parameters")
+    if (
+        binding.get("schema") != "a_stock_daily_qfq_execution_binding_v2"
+        or not isinstance(parameters, Mapping)
+        or parameters.get("source_symbol_completeness_rule") != source_symbol_completeness_rule()
+    ):
+        raise DailySyncError("execution binding does not contain the current source completeness rule")
+    input_evidence = binding.get("input_evidence")
+    if not isinstance(input_evidence, Mapping):
+        raise DailySyncError("execution binding has no source completeness evidence slot")
+    completeness = input_evidence.get("source_symbol_completeness")
+    completeness_sha = input_evidence.get("source_symbol_completeness_sha256")
+    if completeness is None:
+        if require_source_completeness:
+            raise DailySyncError("formal publication requires source completeness evidence")
+        if completeness_sha is not None:
+            raise DailySyncError("execution binding has a hash without source completeness evidence")
+    elif (
+        not isinstance(completeness, Mapping)
+        or completeness.get("schema") != "a_stock_daily_qfq_source_symbol_completeness_v1"
+        or completeness.get("passed") is not True
+        or completeness.get("rule") != source_symbol_completeness_rule()
+        or completeness.get("report_sha256")
+        != sha256_bytes(canonical_json({key: value for key, value in completeness.items() if key != "report_sha256"}))
+        or completeness_sha != sha256_bytes(canonical_json(completeness))
+    ):
+        raise DailySyncError("execution binding source completeness evidence is malformed or modified")
     expected_sources = {
         str(record["path"]): str(record["sha256"])
         for record in binding.get("source_files", [])
         if isinstance(record, Mapping) and "path" in record and "sha256" in record
     }
     repo_root = Path(__file__).resolve().parents[1]
-    current_sources = {
-        str(path.relative_to(repo_root)): sha256_file(path)
-        for path in SOURCE_FILES
-    }
+    current_sources = {str(path.relative_to(repo_root)): sha256_file(path) for path in SOURCE_FILES}
     if current_sources != expected_sources:
         raise DailySyncError("execution source bytes changed during synchronization")
     git_binding = binding.get("git")
     if not isinstance(git_binding, Mapping) or _git_output(repo_root, "rev-parse", "HEAD") != git_binding.get("head"):
         raise DailySyncError("Git HEAD changed during synchronization")
+    if require_formal_publication:
+        if (
+            not isinstance(parameters, Mapping)
+            or parameters.get("apply") is not True
+            or git_binding.get("worktree_clean") is not True
+            or not git_binding.get("head")
+            or git_binding.get("head") != git_binding.get("upstream_head")
+            or git_binding.get("branch") != REQUIRED_GIT_BRANCH
+            or git_binding.get("upstream") != REQUIRED_GIT_UPSTREAM
+            or git_binding.get("remote_name") != REQUIRED_GIT_REMOTE_NAME
+            or git_binding.get("remote_ref") != REQUIRED_GIT_REMOTE_REF
+            or git_binding.get("remote_head") != git_binding.get("head")
+            or git_binding.get("remote_fetch_url") != REQUIRED_GIT_REMOTE_URL
+            or git_binding.get("remote_push_url") != REQUIRED_GIT_REMOTE_URL
+            or git_binding.get("remote_verified") is not True
+        ):
+            raise DailySyncError(
+                "publication requires an apply=true clean binding at the frozen branch, upstream, URL, and remote ref"
+            )
+        current_git = _git_repository_evidence(repo_root, verify_remote=True)
+        if canonical_json(current_git) != canonical_json(dict(git_binding)):
+            raise DailySyncError("publication Git identity or actual remote HEAD changed during synchronization")
     if binding.get("environment", {}).get("uv_lock_sha256") != (
         sha256_file(repo_root / "uv.lock") if (repo_root / "uv.lock").is_file() else None
     ):
@@ -375,13 +944,11 @@ def _validate_daily_frame(frame: pd.DataFrame, trade_date: str, minimum_rows: in
     if missing:
         raise DailySyncError(f"daily[{trade_date}] missing columns: {sorted(missing)}")
     result = frame.loc[:, DAILY_COLUMNS].copy()
-    result["ts_code"] = result["ts_code"].astype(str)
+    result["ts_code"] = _validated_ts_codes(result["ts_code"], f"daily[{trade_date}]")
     result["trade_date"] = result["trade_date"].map(normalize_trade_date)
     result = result.sort_values("trade_date", kind="mergesort", ignore_index=True)
     if set(result["trade_date"]) != {trade_date}:
         raise DailySyncError(f"daily[{trade_date}] contains another trade_date")
-    if result["ts_code"].isna().any() or result["ts_code"].eq("").any():
-        raise DailySyncError(f"daily[{trade_date}] contains an empty ts_code")
     if result["ts_code"].duplicated().any():
         raise DailySyncError(f"daily[{trade_date}] contains duplicated ts_code rows")
     for column in NUMERIC_COLUMNS:
@@ -391,6 +958,33 @@ def _validate_daily_frame(frame: pd.DataFrame, trade_date: str, minimum_rows: in
     if len(result) < minimum_rows:
         raise DailySyncError(f"daily[{trade_date}] returned only {len(result)} rows; minimum is {minimum_rows}")
     return result.sort_values("ts_code", kind="mergesort", ignore_index=True)
+
+
+def _validate_adjustment_factor_frame(
+    frame: pd.DataFrame | None,
+    trade_date: str,
+    minimum_rows: int,
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise DailySyncError(f"adj_factor[{trade_date}] returned no rows")
+    missing = {"ts_code", "trade_date", "adj_factor"} - set(frame)
+    if missing:
+        raise DailySyncError(f"adj_factor[{trade_date}] missing columns: {sorted(missing)}")
+    normalized = frame.loc[:, ["ts_code", "trade_date", "adj_factor"]].copy()
+    normalized["ts_code"] = _validated_ts_codes(normalized["ts_code"], f"adj_factor[{trade_date}]")
+    normalized["trade_date"] = normalized["trade_date"].map(normalize_trade_date)
+    normalized["adj_factor"] = pd.to_numeric(normalized["adj_factor"], errors="raise")
+    if set(normalized["trade_date"]) != {trade_date}:
+        raise DailySyncError(f"adj_factor[{trade_date}] contains another trade_date")
+    if normalized["ts_code"].duplicated().any():
+        raise DailySyncError(f"adj_factor[{trade_date}] contains duplicated ts_code rows")
+    if not np.isfinite(normalized["adj_factor"].to_numpy(dtype=float)).all():
+        raise DailySyncError(f"adj_factor[{trade_date}] contains non-finite values")
+    if len(normalized) < minimum_rows:
+        raise DailySyncError(
+            f"adj_factor[{trade_date}] returned only {len(normalized)} rows; minimum is {minimum_rows}"
+        )
+    return normalized.sort_values("ts_code", kind="mergesort", ignore_index=True)
 
 
 def fetch_trade_calendar(start_date: str, end_date: str) -> tuple[list[str], pd.DataFrame, dict[str, Any]]:
@@ -482,26 +1076,7 @@ def fetch_adjustment_factors(
             trade_date=trade_date,
             fields="ts_code,trade_date,adj_factor",
         )
-        if frame is None or frame.empty:
-            raise DailySyncError(f"adj_factor[{trade_date}] returned no rows")
-        missing = {"ts_code", "trade_date", "adj_factor"} - set(frame)
-        if missing:
-            raise DailySyncError(f"adj_factor[{trade_date}] missing columns: {sorted(missing)}")
-        normalized = frame.loc[:, ["ts_code", "trade_date", "adj_factor"]].copy()
-        normalized["ts_code"] = normalized["ts_code"].astype(str)
-        normalized["trade_date"] = normalized["trade_date"].map(normalize_trade_date)
-        normalized["adj_factor"] = pd.to_numeric(normalized["adj_factor"], errors="raise")
-        if set(normalized["trade_date"]) != {trade_date}:
-            raise DailySyncError(f"adj_factor[{trade_date}] contains another trade_date")
-        if normalized["ts_code"].duplicated().any():
-            raise DailySyncError(f"adj_factor[{trade_date}] contains duplicated ts_code rows")
-        if not np.isfinite(normalized["adj_factor"].to_numpy(dtype=float)).all():
-            raise DailySyncError(f"adj_factor[{trade_date}] contains non-finite values")
-        if len(normalized) < minimum_rows:
-            raise DailySyncError(
-                f"adj_factor[{trade_date}] returned only {len(normalized)} rows; minimum is {minimum_rows}"
-            )
-        normalized = normalized.sort_values("ts_code", kind="mergesort", ignore_index=True)
+        normalized = _validate_adjustment_factor_frame(frame, trade_date, minimum_rows)
         response_bytes = normalized.to_csv(index=False, lineterminator="\n", float_format="%.12g").encode("utf-8")
         evidence.append(
             {
@@ -531,17 +1106,7 @@ def freeze_api_response_objects(
         raw = normalized.to_csv(index=False, lineterminator="\n", float_format="%.12g").encode("utf-8")
         digest = sha256_bytes(raw)
         path = object_root / category / f"{digest}.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            if path.read_bytes() != raw:
-                raise DailySyncError(f"content-addressed API response conflicts: {path}")
-        else:
-            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            with temporary.open("xb") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
+        atomic_write_bytes(path, raw, replace_existing=False)
         return {"path": str(path), "sha256": digest, "rows": len(normalized)}
 
     return {
@@ -584,8 +1149,8 @@ def merge_incremental_rows(local: pd.DataFrame, incoming: pd.DataFrame, symbol: 
         raise DailySyncError(f"{symbol}: incoming columns differ from the expected qfq schema")
     old = local.loc[:, DAILY_COLUMNS].copy()
     new = incoming.loc[:, DAILY_COLUMNS].copy()
-    old["ts_code"] = old["ts_code"].astype(str)
-    new["ts_code"] = new["ts_code"].astype(str)
+    old["ts_code"] = _validated_ts_codes(old["ts_code"], f"{symbol}: local")
+    new["ts_code"] = _validated_ts_codes(new["ts_code"], f"{symbol}: incoming")
     old["trade_date"] = old["trade_date"].map(normalize_trade_date)
     new["trade_date"] = new["trade_date"].map(normalize_trade_date)
     if set(old["ts_code"]) != {symbol} or set(new["ts_code"]) != {symbol}:
@@ -614,7 +1179,7 @@ def _validate_full_qfq(frame: pd.DataFrame | None, symbol: str, end_date: str) -
     if missing:
         raise DailySyncError(f"full qfq download for {symbol} missing columns: {sorted(missing)}")
     result = frame.loc[:, DAILY_COLUMNS].copy()
-    result["ts_code"] = result["ts_code"].astype(str)
+    result["ts_code"] = _validated_ts_codes(result["ts_code"], f"full qfq download for {symbol}")
     result["trade_date"] = result["trade_date"].map(normalize_trade_date)
     result = result.sort_values("trade_date", kind="mergesort", ignore_index=True)
     if set(result["ts_code"]) != {symbol}:
@@ -651,19 +1216,19 @@ def fetch_new_symbol_histories(
     evidence: list[dict[str, Any]] = []
     cache_dir = None if object_root is None else object_root / "full_qfq" / end_date
     if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_parents_durable(cache_dir)
     for index, symbol in enumerate(sorted(symbols), 1):
         cache_path = None if cache_dir is None else cache_dir / f"{symbol}.parquet"
         cache_manifest_path = None if cache_path is None else cache_path.with_suffix(".json")
-        reused = bool(
-            cache_path is not None
-            and cache_path.is_file()
-            and cache_manifest_path is not None
-            and cache_manifest_path.is_file()
-        )
+        cache_exists = cache_path is not None and os.path.lexists(cache_path)
+        manifest_exists = cache_manifest_path is not None and os.path.lexists(cache_manifest_path)
+        if cache_exists != manifest_exists:
+            raise DailySyncError(f"full qfq cache object pair is incomplete for {symbol}")
+        reused = bool(cache_exists and manifest_exists)
         if reused:
             try:
-                cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+                assert cache_path is not None and cache_manifest_path is not None
+                cache_manifest = json.loads(_read_regular_bytes_nofollow(cache_manifest_path).decode("utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise DailySyncError(f"cannot read full qfq cache manifest for {symbol}: {exc}") from exc
             expected_cache_fields = {
@@ -693,12 +1258,24 @@ def fetch_new_symbol_histories(
                 f"full qfq history for {symbol} ends at {actual_max}, expected observed daily max {expected_max}"
             )
         if cache_path is not None and cache_manifest_path is not None and not reused:
-            temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
-            histories[symbol].to_parquet(temporary, index=False)
-            os.replace(temporary, cache_path)
-            atomic_write_json(
-                cache_manifest_path,
-                {
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{cache_path.name}.",
+                suffix=".tmp",
+                dir=cache_path.parent,
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    histories[symbol].to_parquet(handle, index=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary, cache_path, follow_symlinks=False)
+                except FileExistsError as exc:
+                    raise DailySyncError(f"refusing conflicting full qfq cache object: {cache_path}") from exc
+                temporary.unlink()
+                _fsync_regular_file(cache_path)
+                manifest_payload = {
                     "schema": "a_stock_daily_qfq_full_refresh_object_v1",
                     "ts_code": symbol,
                     "start_date": DEFAULT_START_DATE,
@@ -708,8 +1285,24 @@ def fetch_new_symbol_histories(
                     "min_dt": histories[symbol]["trade_date"].min(),
                     "max_dt": actual_max,
                     "parquet_sha256": sha256_file(cache_path),
-                },
-            )
+                }
+                manifest_raw = (
+                    json.dumps(
+                        manifest_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        indent=2,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                atomic_write_bytes(cache_manifest_path, manifest_raw, replace_existing=False)
+            finally:
+                if os.path.lexists(temporary):
+                    temporary.unlink()
+        if cache_path is not None and cache_manifest_path is not None:
+            _fsync_regular_file(cache_path)
+            _fsync_regular_file(cache_manifest_path)
         physical_sha = (
             sha256_file(cache_path)
             if cache_path is not None
@@ -827,17 +1420,19 @@ def archive_raw_snapshot(
 ) -> tuple[Path, dict[str, Any]]:
     """固化完整 raw snapshot；目录 identity 覆盖 parquet 与辅助文件 bytes。"""
 
-    snapshot_root.mkdir(parents=True, exist_ok=True)
+    validate_storage_layout(data_dir, snapshot_root)
+    _mkdir_parents_durable(snapshot_root)
     temporary = Path(tempfile.mkdtemp(prefix=ARCHIVE_TEMP_PREFIX, dir=snapshot_root))
     base_names = {str(row["name"]) for row in inventory["records"]}
     try:
         for row in inventory["records"]:
             name = str(row["name"])
             override = None if staged_dir is None else staged_dir / name
-            source = override if override is not None and override.is_file() else data_dir / name
+            use_override = override is not None and os.path.lexists(override)
+            source = override if use_override else data_dir / name
             destination = temporary / name
-            shutil.copy2(source, destination)
-            expected_sha = sha256_file(override) if override is not None and override.is_file() else str(row["sha256"])
+            _copy_regular_file_nofollow(source, destination)
+            expected_sha = sha256_file(override) if use_override else str(row["sha256"])
             if sha256_file(destination) != expected_sha:
                 raise DailySyncError(f"snapshot copy differs from source: {name}")
         if staged_dir is not None:
@@ -845,19 +1440,22 @@ def archive_raw_snapshot(
                 if source.name in base_names:
                     continue
                 destination = temporary / source.name
-                shutil.copy2(source, destination)
+                _copy_regular_file_nofollow(source, destination)
                 if sha256_file(destination) != sha256_file(source):
                     raise DailySyncError(f"new snapshot copy differs from staged source: {source.name}")
         auxiliary_files: list[dict[str, Any]] = []
         for source in sorted(data_dir.iterdir()):
+            source_identity = source.stat(follow_symlinks=False)
+            if stat.S_ISLNK(source_identity.st_mode):
+                raise DailySyncError(f"snapshot source contains a symlink payload: {source}")
             if (
-                not source.is_file()
+                not stat.S_ISREG(source_identity.st_mode)
                 or source.suffix == ".parquet"
                 or source.name == SNAPSHOT_MANIFEST_FILE_NAME
             ):
                 continue
             destination = temporary / source.name
-            shutil.copy2(source, destination)
+            _copy_regular_file_nofollow(source, destination)
             auxiliary_files.append(
                 {
                     "name": source.name,
@@ -866,6 +1464,11 @@ def archive_raw_snapshot(
                 }
             )
 
+        _fsync_regular_payload_directory(
+            temporary,
+            label="raw snapshot temporary",
+            fsync_files=False,
+        )
         archived_inventory = inspect_inventory(temporary)
         payload_files = [
             {
@@ -894,14 +1497,20 @@ def archive_raw_snapshot(
             "auxiliary_files": auxiliary_files,
         }
         atomic_write_json(temporary / SNAPSHOT_MANIFEST_FILE_NAME, manifest)
+        _fsync_regular_payload_directory(
+            temporary,
+            label="raw snapshot temporary",
+            fsync_files=False,
+        )
         archived_inventory["snapshot_payload_sha256"] = payload_closure_sha
         archived_inventory["snapshot_payload_files"] = payload_files
-        if target.exists():
+        if os.path.lexists(target):
+            _fsync_regular_payload_directory(target, label="existing content-addressed raw snapshot")
             existing = inspect_inventory(target)
             existing_manifest_path = target / SNAPSHOT_MANIFEST_FILE_NAME
             try:
-                existing_manifest = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                existing_manifest = json.loads(_read_regular_bytes_nofollow(existing_manifest_path).decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise DailySyncError(f"invalid snapshot manifest: {existing_manifest_path}") from exc
             existing_payload_files = [
                 {
@@ -910,7 +1519,7 @@ def archive_raw_snapshot(
                     "sha256": sha256_file(path),
                 }
                 for path in sorted(target.iterdir())
-                if path.is_file() and path.name != SNAPSHOT_MANIFEST_FILE_NAME
+                if stat.S_ISREG(path.stat(follow_symlinks=False).st_mode) and path.name != SNAPSHOT_MANIFEST_FILE_NAME
             ]
             existing_payload_sha = sha256_bytes(canonical_json(existing_payload_files))
             if (
@@ -950,11 +1559,11 @@ def materialize_active_candidate(
     for row in inventory["records"]:
         name = str(row["name"])
         staged = staged_dir / name
-        source = staged if staged.is_file() else data_dir / name
-        shutil.copy2(source, candidate / name)
+        source = staged if os.path.lexists(staged) else data_dir / name
+        _copy_regular_file_nofollow(source, candidate / name)
     for staged in sorted(staged_dir.glob("*.parquet")):
         if staged.name not in base_names:
-            shutil.copy2(staged, candidate / staged.name)
+            _copy_regular_file_nofollow(staged, candidate / staged.name)
 
     candidate_inventory = inspect_inventory(candidate)
     if candidate_inventory["max_dt"] != safe_end:
@@ -1037,6 +1646,85 @@ def _inventory_digest_if_directory(path: Path) -> str | None:
         return None
 
 
+def _assert_directory_exchange_pair(
+    data_dir: Path,
+    candidate: Path,
+    *,
+    expected_active: str,
+    expected_candidate: str,
+    phase: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require both exchange sides to retain their bound physical closures."""
+
+    active_inventory = inspect_inventory(data_dir)
+    candidate_inventory = inspect_inventory(candidate)
+    active_digest = str(active_inventory["content_inventory_sha256"])
+    candidate_digest = str(candidate_inventory["content_inventory_sha256"])
+    if active_digest != expected_active or candidate_digest != expected_candidate:
+        raise DailySyncError(
+            f"directory exchange closure pair differs {phase}; "
+            f"active={active_digest}, candidate={candidate_digest}, "
+            f"expected_active={expected_active}, expected_candidate={expected_candidate}"
+        )
+    return active_inventory, candidate_inventory
+
+
+def _validated_committed_audit(
+    data_dir: Path,
+    journal: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Accept only the exact audit commit marker emitted by this publisher."""
+
+    audit_path_value = journal.get("audit_path")
+    if not isinstance(audit_path_value, str):
+        return None
+    audit_path = Path(audit_path_value).expanduser()
+    audit_sha = audit_path.stem
+    expected_root = (data_dir.parent / AUDIT_DIR_NAME).resolve()
+    expected_path = expected_root / f"{audit_sha}.json"
+    if not audit_path.is_absolute() or audit_path != expected_path or re.fullmatch(r"[0-9a-f]{64}", audit_sha) is None:
+        return None
+    try:
+        raw = _read_regular_bytes_nofollow(audit_path)
+        audit = json.loads(raw)
+        canonical_raw = (
+            json.dumps(
+                audit,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+    except (DailySyncError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(audit, dict) or raw != canonical_raw or sha256_bytes(raw) != audit_sha:
+        return None
+    before = audit.get("before_inventory")
+    after = audit.get("after_inventory")
+    execution_binding = audit.get("execution_binding")
+    binding = execution_binding.get("binding") if isinstance(execution_binding, Mapping) else None
+    try:
+        audit_data_dir = Path(str(audit.get("data_dir", ""))).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if (
+        audit.get("schema") != "a_stock_daily_qfq_sync_audit_v2"
+        or audit_data_dir != data_dir.expanduser().resolve()
+        or not isinstance(before, Mapping)
+        or before.get("content_inventory_sha256") != journal.get("old_inventory_sha256")
+        or audit.get("expected_active_inventory_sha256") != journal.get("new_inventory_sha256")
+        or not isinstance(after, Mapping)
+        or after.get("content_inventory_sha256") != journal.get("new_inventory_sha256")
+        or not isinstance(execution_binding, Mapping)
+        or not isinstance(binding, Mapping)
+        or execution_binding.get("binding_sha256") != sha256_bytes(canonical_json(binding))
+    ):
+        return None
+    return audit
+
+
 def recover_orphaned_runs(data_dir: Path) -> list[str]:
     """按 journal 恢复目录交换；有效 audit 文件是唯一提交标记。"""
 
@@ -1053,23 +1741,49 @@ def recover_orphaned_runs(data_dir: Path) -> list[str]:
             shutil.rmtree(run_dir)
             recovered.append(f"discarded_unpublished:{run_dir.name}")
             continue
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        audit_path_value = journal.get("audit_path")
-        audit_path = Path(audit_path_value) if isinstance(audit_path_value, str) else None
-        if audit_path is not None and audit_path.is_file() and audit_path.stem == sha256_file(audit_path):
+        try:
+            journal = json.loads(_read_regular_bytes_nofollow(journal_path).decode("utf-8"))
+        except (DailySyncError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DailySyncError(f"publication journal is unavailable or malformed: {journal_path}") from exc
+        if not isinstance(journal, dict):
+            raise DailySyncError(f"publication journal is not a JSON object: {journal_path}")
+        candidate = run_dir / "candidate_active"
+        old_digest = journal.get("old_inventory_sha256")
+        new_digest = journal.get("new_inventory_sha256")
+        try:
+            journal_data_dir = Path(str(journal.get("data_dir", ""))).expanduser().resolve()
+            journal_candidate = Path(str(journal.get("candidate_path", ""))).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise DailySyncError(f"publication journal paths are malformed: {journal_path}") from exc
+        if (
+            journal.get("schema") != "a_stock_daily_qfq_directory_exchange_journal_v2"
+            or journal_data_dir != data_dir.expanduser().resolve()
+            or journal_candidate != candidate.expanduser().resolve()
+            or re.fullmatch(r"[0-9a-f]{64}", str(old_digest)) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(new_digest)) is None
+        ):
+            raise DailySyncError(f"publication journal identity or closures are malformed: {journal_path}")
+        active_digest = _inventory_digest_if_directory(data_dir)
+        candidate_digest = _inventory_digest_if_directory(candidate)
+        if _validated_committed_audit(data_dir, journal) is not None:
+            if active_digest != new_digest or candidate_digest != old_digest:
+                raise DailySyncError(
+                    f"cannot clean committed {run_dir}; active={active_digest}, "
+                    f"candidate={candidate_digest}, expected_old={old_digest}, expected_new={new_digest}"
+                )
             shutil.rmtree(run_dir)
             recovered.append(f"cleaned_committed:{run_dir.name}")
             continue
-        candidate = run_dir / "candidate_active"
-        active_digest = _inventory_digest_if_directory(data_dir)
-        candidate_digest = _inventory_digest_if_directory(candidate)
-        old_digest = journal.get("old_inventory_sha256")
-        new_digest = journal.get("new_inventory_sha256")
         if active_digest == new_digest and candidate_digest == old_digest:
             atomic_exchange_directories(data_dir, candidate)
         elif active_digest != old_digest:
             raise DailySyncError(
                 f"cannot automatically recover {run_dir}; active={active_digest}, "
+                f"candidate={candidate_digest}, expected_old={old_digest}, expected_new={new_digest}"
+            )
+        elif candidate_digest != new_digest:
+            raise DailySyncError(
+                f"cannot discard drifted candidate in {run_dir}; active={active_digest}, "
                 f"candidate={candidate_digest}, expected_old={old_digest}, expected_new={new_digest}"
             )
         shutil.rmtree(run_dir)
@@ -1086,6 +1800,330 @@ def discard_orphaned_archive_temporaries(snapshot_root: Path) -> list[str]:
             shutil.rmtree(path)
             discarded.append(f"discarded_archive_temporary:{path.name}")
     return discarded
+
+
+def _inventory_summary(inventory: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in inventory.items() if key != "records"}
+
+
+def _validated_snapshot_for_publication(
+    snapshot: object,
+    *,
+    expected_root: Path,
+    label: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Verify a v2 snapshot from its physical bytes and content-addressed path."""
+
+    if not isinstance(snapshot, Mapping):
+        raise DailySyncError(f"{label} snapshot evidence is missing")
+    closure = str(snapshot.get("closure_sha256", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", closure) is None:
+        raise DailySyncError(f"{label} snapshot closure is malformed")
+    path = Path(str(snapshot.get("path", ""))).expanduser().resolve()
+    root = expected_root.expanduser().resolve()
+    if path.parent != root or path.name != f"{SNAPSHOT_PREFIX}{closure}" or not path.is_dir():
+        raise DailySyncError(f"{label} snapshot path is outside its bound content-addressed root")
+    _fsync_regular_payload_directory(path, label=f"{label} snapshot")
+    children = sorted(path.iterdir())
+    if any(not stat.S_ISREG(child.stat(follow_symlinks=False).st_mode) for child in children):
+        raise DailySyncError(f"{label} snapshot contains a non-file payload entry")
+    manifest_path = path / SNAPSHOT_MANIFEST_FILE_NAME
+    try:
+        manifest = json.loads(_read_regular_bytes_nofollow(manifest_path).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DailySyncError(f"{label} snapshot manifest is unavailable or malformed") from exc
+    payload_files = [
+        {
+            "name": child.name,
+            "size": child.stat().st_size,
+            "sha256": sha256_file(child),
+        }
+        for child in children
+        if child.name != SNAPSHOT_MANIFEST_FILE_NAME
+    ]
+    payload_sha = sha256_bytes(canonical_json(payload_files))
+    inventory = inspect_inventory(path)
+    auxiliary_files = [record for record in payload_files if not str(record["name"]).endswith(".parquet")]
+    if (
+        payload_sha != closure
+        or snapshot.get("parquet_content_inventory_sha256") != inventory["content_inventory_sha256"]
+        or manifest.get("schema") != "a_stock_daily_qfq_raw_snapshot_v2"
+        or manifest.get("closure_sha256") != closure
+        or manifest.get("payload_closure_sha256") != closure
+        or manifest.get("parquet_content_inventory_sha256") != inventory["content_inventory_sha256"]
+        or int(manifest.get("file_count", -1)) != inventory["file_count"]
+        or manifest.get("min_dt") != inventory["min_dt"]
+        or manifest.get("max_dt") != inventory["max_dt"]
+        or manifest.get("columns") != inventory["columns"]
+        or canonical_json(manifest.get("files")) != canonical_json(inventory["records"])
+        or canonical_json(manifest.get("auxiliary_files")) != canonical_json(auxiliary_files)
+    ):
+        raise DailySyncError(f"{label} snapshot identity differs from its physical bytes")
+    return path, inventory
+
+
+def _read_frozen_csv_object(
+    record: object,
+    *,
+    expected_parent: Path,
+    label: str,
+    dtype: Mapping[str, str],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not isinstance(record, Mapping):
+        raise DailySyncError(f"{label} frozen response object is missing")
+    digest = str(record.get("sha256", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise DailySyncError(f"{label} frozen response hash is malformed")
+    path = Path(str(record.get("path", ""))).expanduser().resolve()
+    if (
+        path.parent != expected_parent.expanduser().resolve()
+        or path.name != f"{digest}.csv"
+        or not path.is_file()
+        or sha256_file(path) != digest
+    ):
+        raise DailySyncError(f"{label} frozen response path or bytes differ from its content address")
+    try:
+        frame = pd.read_csv(path, dtype=dict(dtype))
+    except Exception as exc:
+        raise DailySyncError(f"{label} frozen response CSV is unreadable: {exc}") from exc
+    try:
+        expected_rows = int(record.get("rows", -1))
+    except (TypeError, ValueError) as exc:
+        raise DailySyncError(f"{label} frozen response row count is malformed") from exc
+    if expected_rows != len(frame):
+        raise DailySyncError(f"{label} frozen response row count differs from its physical CSV")
+    return frame, {"path": str(path), "sha256": digest, "rows": expected_rows}
+
+
+def _assert_response_evidence_matches_objects(
+    evidence: object,
+    objects: Mapping[str, Any],
+    trade_dates: Sequence[str],
+    *,
+    label: str,
+) -> None:
+    if not isinstance(evidence, list):
+        raise DailySyncError(f"{label} response evidence is missing")
+    by_date: dict[str, Mapping[str, Any]] = {}
+    for record in evidence:
+        if not isinstance(record, Mapping):
+            raise DailySyncError(f"{label} response evidence is malformed")
+        trade_date = normalize_trade_date(record.get("trade_date"))
+        if trade_date in by_date:
+            raise DailySyncError(f"{label} response evidence contains duplicate dates")
+        by_date[trade_date] = record
+    if set(by_date) != set(trade_dates):
+        raise DailySyncError(f"{label} response evidence dates differ from frozen objects")
+    for trade_date in trade_dates:
+        evidence_record = by_date[trade_date]
+        object_record = objects[trade_date]
+        if (
+            int(evidence_record.get("rows", -1)) != int(object_record["rows"])
+            or evidence_record.get("canonical_csv_sha256") != object_record["sha256"]
+        ):
+            raise DailySyncError(f"{label}[{trade_date}] evidence differs from its frozen object")
+
+
+def _recompute_frozen_source_completeness(
+    audit_payload: Mapping[str, Any],
+    *,
+    data_dir: Path,
+    safe_end: str,
+    previous_trade_date: str,
+    previous_symbols: set[str],
+    minimum_rows: int,
+) -> dict[str, Any]:
+    """Recompute the source-universe gate exclusively from frozen input bytes."""
+
+    trade_dates_value = audit_payload.get("trade_dates")
+    if not isinstance(trade_dates_value, list) or not trade_dates_value:
+        raise DailySyncError("formal publication requires a non-empty trade-date chain")
+    trade_dates = [normalize_trade_date(value) for value in trade_dates_value]
+    if [str(value) for value in trade_dates_value] != trade_dates:
+        raise DailySyncError("formal publication trade dates are not canonical")
+
+    api_objects = audit_payload.get("api_response_objects")
+    if not isinstance(api_objects, Mapping) or set(api_objects) != {"official_calendar", "daily", "adj_factor"}:
+        raise DailySyncError("formal publication requires the exact frozen calendar/daily/adj_factor object set")
+    daily_objects = api_objects.get("daily")
+    factor_objects = api_objects.get("adj_factor")
+    if (
+        not isinstance(daily_objects, Mapping)
+        or not isinstance(factor_objects, Mapping)
+        or set(map(str, daily_objects)) != set(trade_dates)
+        or set(map(str, factor_objects)) != set(trade_dates)
+    ):
+        raise DailySyncError("frozen daily/adj_factor object dates differ from the publication chain")
+
+    object_root = data_dir.expanduser().resolve().parent / API_OBJECT_DIR_NAME
+    calendar, calendar_object = _read_frozen_csv_object(
+        api_objects.get("official_calendar"),
+        expected_parent=object_root / "official_calendar",
+        label="official_calendar",
+        dtype={"exchange": "string", "cal_date": "string", "pretrade_date": "string"},
+    )
+    required_calendar = {"exchange", "cal_date", "is_open", "pretrade_date"}
+    if set(calendar) != required_calendar or calendar[list(required_calendar)].isna().any().any():
+        raise DailySyncError("frozen official calendar schema or values are malformed")
+    calendar["exchange"] = calendar["exchange"].astype(str)
+    calendar["cal_date"] = calendar["cal_date"].map(normalize_trade_date)
+    calendar["pretrade_date"] = calendar["pretrade_date"].map(normalize_trade_date)
+    calendar["is_open"] = pd.to_numeric(calendar["is_open"], errors="raise").astype(int)
+    if (
+        set(calendar["exchange"]) != {"SSE"}
+        or not set(calendar["is_open"]) <= {0, 1}
+        or calendar.duplicated(["exchange", "cal_date"]).any()
+    ):
+        raise DailySyncError("frozen official calendar contains invalid exchange/date/open rows")
+    official_trade_dates = sorted(
+        calendar.loc[
+            calendar["is_open"].eq(1) & calendar["cal_date"].between(previous_trade_date, safe_end, inclusive="both"),
+            "cal_date",
+        ].tolist()
+    )
+    if official_trade_dates != trade_dates:
+        raise DailySyncError("publication trade-date chain differs from the frozen official calendar")
+    calendar_evidence = audit_payload.get("official_calendar_response")
+    if (
+        not isinstance(calendar_evidence, Mapping)
+        or int(calendar_evidence.get("rows", -1)) != calendar_object["rows"]
+        or calendar_evidence.get("canonical_csv_sha256") != calendar_object["sha256"]
+    ):
+        raise DailySyncError("official calendar evidence differs from its frozen object")
+
+    daily_frames: list[pd.DataFrame] = []
+    factor_frames: list[pd.DataFrame] = []
+    normalized_daily_objects: dict[str, Any] = {}
+    normalized_factor_objects: dict[str, Any] = {}
+    for trade_date in trade_dates:
+        daily_frame, daily_object = _read_frozen_csv_object(
+            daily_objects[trade_date],
+            expected_parent=object_root / "daily",
+            label=f"daily[{trade_date}]",
+            dtype={"ts_code": "string", "trade_date": "string"},
+        )
+        factor_frame, factor_object = _read_frozen_csv_object(
+            factor_objects[trade_date],
+            expected_parent=object_root / "adj_factor",
+            label=f"adj_factor[{trade_date}]",
+            dtype={"ts_code": "string", "trade_date": "string"},
+        )
+        daily_frames.append(_validate_daily_frame(daily_frame, trade_date, minimum_rows))
+        factor_frames.append(_validate_adjustment_factor_frame(factor_frame, trade_date, minimum_rows))
+        normalized_daily_objects[trade_date] = daily_object
+        normalized_factor_objects[trade_date] = factor_object
+    _assert_response_evidence_matches_objects(
+        audit_payload.get("daily_responses"),
+        normalized_daily_objects,
+        trade_dates,
+        label="daily",
+    )
+    _assert_response_evidence_matches_objects(
+        audit_payload.get("adjustment_factor_responses"),
+        normalized_factor_objects,
+        trade_dates,
+        label="adj_factor",
+    )
+    return validate_source_symbol_completeness(
+        pd.concat(daily_frames, ignore_index=True),
+        pd.concat(factor_frames, ignore_index=True),
+        trade_dates,
+        previous_trade_date=previous_trade_date,
+        previous_symbols=previous_symbols,
+    )
+
+
+def _validate_publication_evidence(
+    data_dir: Path,
+    candidate: Path,
+    audit_payload: Mapping[str, Any],
+    execution_binding: Mapping[str, Any],
+) -> None:
+    """Close all formal publication claims against frozen physical evidence."""
+
+    binding = execution_binding.get("binding")
+    if not isinstance(binding, Mapping):
+        raise DailySyncError("formal publication execution binding is malformed")
+    parameters = binding.get("parameters")
+    input_evidence = binding.get("input_evidence")
+    if not isinstance(parameters, Mapping) or not isinstance(input_evidence, Mapping):
+        raise DailySyncError("formal publication binding parameters or evidence are malformed")
+    resolved_data = data_dir.expanduser().resolve()
+    resolved_candidate = candidate.expanduser().resolve()
+    try:
+        bound_data = Path(str(parameters.get("data_dir", ""))).expanduser().resolve()
+        snapshot_root = Path(str(parameters.get("snapshot_root", ""))).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise DailySyncError("formal publication binding paths are malformed") from exc
+    safe_end = str(parameters.get("safe_end_date", ""))
+    if (
+        audit_payload.get("schema") != "a_stock_daily_qfq_sync_audit_v2"
+        or bound_data != resolved_data
+        or Path(str(audit_payload.get("data_dir", ""))).expanduser().resolve() != resolved_data
+        or re.fullmatch(r"\d{8}", safe_end) is None
+        or audit_payload.get("safe_end_date") != safe_end
+        or str(audit_payload.get("requested_end_date")) != str(parameters.get("requested_end_date"))
+    ):
+        raise DailySyncError("formal publication data path, requested date, or safe end differs from its binding")
+
+    current_inventory = inspect_inventory(resolved_data)
+    candidate_inventory = inspect_inventory(resolved_candidate)
+    before_summary = _inventory_summary(current_inventory)
+    if (
+        canonical_json(audit_payload.get("before_inventory")) != canonical_json(before_summary)
+        or audit_payload.get("expected_active_inventory_sha256") != candidate_inventory["content_inventory_sha256"]
+        or candidate_inventory["max_dt"] != safe_end
+    ):
+        raise DailySyncError("formal publication active/candidate inventory differs from its audit")
+
+    old_snapshot_path, old_snapshot_inventory = _validated_snapshot_for_publication(
+        audit_payload.get("old_raw_snapshot"),
+        expected_root=snapshot_root,
+        label="old raw",
+    )
+    _, new_snapshot_inventory = _validated_snapshot_for_publication(
+        audit_payload.get("new_raw_snapshot"),
+        expected_root=snapshot_root,
+        label="new raw",
+    )
+    if (
+        canonical_json(_inventory_summary(old_snapshot_inventory)) != canonical_json(before_summary)
+        or new_snapshot_inventory["content_inventory_sha256"] != candidate_inventory["content_inventory_sha256"]
+    ):
+        raise DailySyncError("formal publication snapshots differ from active/candidate physical inventories")
+
+    previous_trade_date, previous_symbols = active_session_symbols(old_snapshot_path, old_snapshot_inventory)
+    if audit_payload.get("overlap_start_date") != previous_trade_date:
+        raise DailySyncError("formal publication overlap start differs from the physical old snapshot")
+    minimum_rows = int(parameters.get("minimum_daily_rows", 0))
+    if minimum_rows <= 0:
+        raise DailySyncError("formal publication minimum daily rows is invalid")
+    recomputed = _recompute_frozen_source_completeness(
+        audit_payload,
+        data_dir=resolved_data,
+        safe_end=safe_end,
+        previous_trade_date=previous_trade_date,
+        previous_symbols=previous_symbols,
+        minimum_rows=minimum_rows,
+    )
+    top_level_report = audit_payload.get("source_symbol_completeness")
+    bound_report = input_evidence.get("source_symbol_completeness")
+    if (
+        not isinstance(top_level_report, Mapping)
+        or not isinstance(bound_report, Mapping)
+        or canonical_json(top_level_report) != canonical_json(recomputed)
+        or canonical_json(bound_report) != canonical_json(recomputed)
+    ):
+        raise DailySyncError("source completeness report differs from recomputed frozen physical evidence")
+
+    target_trade_date, target_symbols = active_session_symbols(resolved_candidate, candidate_inventory)
+    last_session = recomputed["sessions"][-1]
+    if (
+        target_trade_date != safe_end
+        or last_session.get("trade_date") != safe_end
+        or canonical_json(last_session.get("daily_symbols")) != canonical_json(_symbol_set_evidence(target_symbols))
+    ):
+        raise DailySyncError("candidate target universe differs from the recomputed frozen daily response")
 
 
 def publish_candidate(
@@ -1109,17 +2147,39 @@ def publish_candidate(
     execution_binding = audit_payload.get("execution_binding")
     if not isinstance(execution_binding, Mapping):
         raise DailySyncError("audit payload is missing its execution binding")
-    assert_execution_binding_current(execution_binding)
+    assert_execution_binding_current(
+        execution_binding,
+        require_source_completeness=True,
+        require_formal_publication=True,
+    )
+    _validate_publication_evidence(data_dir, candidate, audit_payload, execution_binding)
+    assert_execution_binding_current(
+        execution_binding,
+        require_source_completeness=True,
+        require_formal_publication=True,
+    )
+    _fsync_regular_payload_directory(candidate, label="active raw candidate before exchange")
     atomic_write_json(journal_path, journal)
     exchanged = False
     try:
+        _assert_directory_exchange_pair(
+            data_dir,
+            candidate,
+            expected_active=journal["old_inventory_sha256"],
+            expected_candidate=journal["new_inventory_sha256"],
+            phase="immediately before atomic exchange",
+        )
         atomic_exchange_directories(data_dir, candidate)
         exchanged = True
+        after, _ = _assert_directory_exchange_pair(
+            data_dir,
+            candidate,
+            expected_active=journal["new_inventory_sha256"],
+            expected_candidate=journal["old_inventory_sha256"],
+            phase="immediately after atomic exchange",
+        )
         journal["phase"] = "ACTIVE_EXCHANGED"
         atomic_write_json(journal_path, journal)
-        after = inspect_inventory(data_dir)
-        if after["content_inventory_sha256"] != journal["new_inventory_sha256"]:
-            raise DailySyncError("active raw closure differs after atomic directory exchange")
         audit_payload["after_inventory"] = {key: value for key, value in after.items() if key != "records"}
         audit_payload["published_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         audit_raw = (
@@ -1139,8 +2199,26 @@ def publish_candidate(
         journal["audit_path"] = str(audit_path)
         journal["phase"] = "AUDIT_PREPARED"
         atomic_write_json(journal_path, journal)
-        assert_execution_binding_current(execution_binding)
+        assert_execution_binding_current(
+            execution_binding,
+            require_source_completeness=True,
+            require_formal_publication=True,
+        )
+        _assert_directory_exchange_pair(
+            data_dir,
+            candidate,
+            expected_active=journal["new_inventory_sha256"],
+            expected_candidate=journal["old_inventory_sha256"],
+            phase="immediately before audit commit",
+        )
         atomic_write_bytes(audit_path, audit_raw, replace_existing=False)
+        _assert_directory_exchange_pair(
+            data_dir,
+            candidate,
+            expected_active=journal["new_inventory_sha256"],
+            expected_candidate=journal["old_inventory_sha256"],
+            phase="before successful publication return",
+        )
         return audit_path
     except Exception:
         if exchanged:
@@ -1165,10 +2243,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run_sync(args: argparse.Namespace) -> dict[str, Any]:
     data_dir = args.data_dir.expanduser().resolve()
     snapshot_root = args.snapshot_root.expanduser().resolve()
+    validate_storage_layout(data_dir, snapshot_root)
     if args.min_daily_rows <= 0 or args.new_symbol_sleep_seconds < 0:
         raise DailySyncError("row threshold must be positive and sleep seconds cannot be negative")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_root.mkdir(parents=True, exist_ok=True)
+    _mkdir_parents_durable(data_dir)
+    _mkdir_parents_durable(snapshot_root)
 
     with cache_lock(data_dir):
         recovered = recover_orphaned_runs(data_dir)
@@ -1176,6 +2255,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
         for action in recovered:
             print(f"[RECOVER] {action}")
         before = inspect_inventory(data_dir)
+        previous_trade_date, previous_symbols = active_session_symbols(data_dir, before)
         safe_end = get_expected_end_date(args.end_date)
         execution_binding = build_execution_binding(
             args,
@@ -1212,6 +2292,21 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
             )
         daily, daily_evidence = fetch_daily_frames(trade_dates, args.min_daily_rows)
         factors, factor_evidence = fetch_adjustment_factors(trade_dates, args.min_daily_rows)
+        source_symbol_completeness = validate_source_symbol_completeness(
+            daily,
+            factors,
+            trade_dates,
+            previous_trade_date=previous_trade_date,
+            previous_symbols=previous_symbols,
+        )
+        execution_binding = build_execution_binding(
+            args,
+            data_dir,
+            snapshot_root,
+            safe_end,
+            require_clean_and_pushed=bool(args.apply),
+            source_symbol_completeness=source_symbol_completeness,
+        )
         existing_symbols = {Path(row["name"]).stem for row in before["records"]}
         new_symbols = sorted(set(daily["ts_code"]) - existing_symbols)
         daily_existing = set(daily["ts_code"]) & existing_symbols
@@ -1232,7 +2327,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
             safe_end,
             sleep_seconds=args.new_symbol_sleep_seconds,
             expected_max_dates=expected_max_dates,
-            object_root=data_dir.parent / "a_stock_daily_qfq_sync_objects" if args.apply else None,
+            object_root=data_dir.parent / API_OBJECT_DIR_NAME if args.apply else None,
         )
 
         run_dir = Path(tempfile.mkdtemp(prefix=RUN_PREFIX, dir=data_dir.parent))
@@ -1264,6 +2359,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
                 "official_calendar_response": calendar_evidence,
                 "daily_responses": daily_evidence,
                 "adjustment_factor_responses": factor_evidence,
+                "source_symbol_completeness": source_symbol_completeness,
                 "before_inventory": {key: value for key, value in before.items() if key != "records"},
                 "new_symbols": new_symbols,
                 "new_symbol_count": len(new_symbols),
@@ -1290,6 +2386,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
                     "full_qfq_refresh_symbol_count": len(full_refresh_symbols),
                     "qfq_seams_fixed": seams_fixed,
                     "candidate_inventory_sha256": candidate_inventory["content_inventory_sha256"],
+                    "source_symbol_completeness": source_symbol_completeness,
                     "recovery_actions": recovered,
                 }
             old_snapshot, old_snapshot_inventory = archive_raw_snapshot(
@@ -1303,7 +2400,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
                 snapshot_root,
             )
             response_objects = freeze_api_response_objects(
-                data_dir.parent / "a_stock_daily_qfq_sync_objects",
+                data_dir.parent / API_OBJECT_DIR_NAME,
                 calendar,
                 daily,
                 factors,
@@ -1329,6 +2426,7 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
                 snapshot_root,
                 safe_end,
                 require_clean_and_pushed=bool(args.apply),
+                source_symbol_completeness=source_symbol_completeness,
             )
             if current_execution_binding != execution_binding:
                 raise DailySyncError("execution binding changed before publication")
@@ -1345,8 +2443,16 @@ def run_sync(args: argparse.Namespace) -> dict[str, Any]:
                 "old_raw_snapshot": str(old_snapshot),
                 "new_raw_snapshot": str(new_snapshot),
                 "active_inventory_sha256": candidate_inventory["content_inventory_sha256"],
+                "source_symbol_completeness_sha256": source_symbol_completeness["report_sha256"],
                 "recovery_actions": recovered,
             }
+            _assert_directory_exchange_pair(
+                data_dir,
+                candidate,
+                expected_active=candidate_inventory["content_inventory_sha256"],
+                expected_candidate=before["content_inventory_sha256"],
+                phase="immediately before committed run cleanup",
+            )
             shutil.rmtree(run_dir)
             return result
         except Exception:
