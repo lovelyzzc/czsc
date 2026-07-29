@@ -21,6 +21,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import _sync_daily_data as sync  # noqa: E402
 import xs_chan_exploration_stage3 as stage3  # noqa: E402
 import xs_chan_stage3_first_week as first_week  # noqa: E402
+import xs_chan_stage3_weekly as weekly  # noqa: E402
 
 FROZEN_COLLECTOR_SHA256 = "4f4a97407973246083e9d08c31044f21a1c4ecafde15dd43e81445ef9ba475ea"
 FROZEN_SPEC_SHA256 = "3f01620964300440ee1d02ea374e7a42ea16ae3a48379675cc2543a5f64862fa"
@@ -2282,6 +2283,23 @@ def test_recovery_with_exact_preexisting_authorization_revalidates_all_evidence(
         "validate_existing_anchor_chain",
         lambda *_args, **_kwargs: [],
     )
+    successor_calls: list[tuple[int, str, int, bool]] = []
+    monkeypatch.setattr(
+        weekly,
+        "validate_successor_authorized_head",
+        lambda _spec, _root, prefix, current, *, prefix_pair_evidence,
+        require_pushed_prefix: (
+            successor_calls.append(
+                (
+                    len(prefix),
+                    current["record_hash"],
+                    len(prefix_pair_evidence),
+                    require_pushed_prefix,
+                )
+            )
+            or {"actual_remote_verified": False}
+        ),
+    )
 
     if crosses_entry_during_export:
         with pytest.raises(
@@ -2301,6 +2319,9 @@ def test_recovery_with_exact_preexisting_authorization_revalidates_all_evidence(
                 now=datetime(2026, 7, 31, 10, 2, tzinfo=UTC),
             )
         assert deadline_checks == 3
+        assert successor_calls == [
+            (1, decision.data["record_hash"], 0, True)
+        ]
         return
 
     result = first_week.recover_first_decision_anchor(
@@ -2319,6 +2340,9 @@ def test_recovery_with_exact_preexisting_authorization_revalidates_all_evidence(
     assert result["record_hash"] == decision.data["record_hash"]
     assert result["formal_ledger_mutated"] is False
     assert deadline_checks == 3
+    assert successor_calls == [
+        (1, decision.data["record_hash"], 0, True)
+    ]
 
 
 def test_recovery_of_already_pushed_pair_is_idempotent_after_entry_open(
@@ -2396,6 +2420,23 @@ def test_recovery_of_already_pushed_pair_is_idempotent_after_entry_open(
         "validate_git_ready",
         lambda **_kwargs: TEST_FORMAL_GIT,
     )
+    successor_calls: list[tuple[int, str, int, bool]] = []
+    monkeypatch.setattr(
+        weekly,
+        "validate_successor_authorized_head",
+        lambda _spec, _root, prefix, current, *, prefix_pair_evidence,
+        require_pushed_prefix: (
+            successor_calls.append(
+                (
+                    len(prefix),
+                    current["record_hash"],
+                    len(prefix_pair_evidence),
+                    require_pushed_prefix,
+                )
+            )
+            or {"actual_remote_verified": False}
+        ),
+    )
 
     def fail_if_revalidated(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("an already-pushed evidence pair re-entered mutable recovery")
@@ -2419,3 +2460,6 @@ def test_recovery_of_already_pushed_pair_is_idempotent_after_entry_open(
     assert result["status"] == "DECISION_EVIDENCE_ALREADY_COMMITTED"
     assert result["evidence_commit"] == "4" * 40
     assert result["formal_ledger_mutated"] is False
+    assert successor_calls == [
+        (1, decision.data["record_hash"], 0, True)
+    ]

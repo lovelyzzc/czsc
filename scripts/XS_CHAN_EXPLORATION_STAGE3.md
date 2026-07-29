@@ -55,12 +55,12 @@ Stage 1 最后一个 primary 决策日是 2026-06-05，但其 delay 与 20-sessi
 组成的 SHA256 链；精确重试幂等，同一 key 的不同 payload 冲突并保存失败证据。账本
 HEAD 由 records 重算，不信任可变指针。
 
-每个 decision/label 记录还必须运行 `export-head-anchor`，在
-`scripts/xs_chan_exploration_stage3_ledger_anchors/` 生成唯一的小型 head 承诺并提交、
-推送；导出前会用当时磁盘上的 reference/raw 闭包重新生成当前 decision projection 或
-label observation，逐字节一致才允许产生 anchor。已有 anchor 永不改写。完整 projection 保存在 content-addressed 本地对象中，
-需要同步备份整个 Stage 3 `_output` 目录。Git anchor 能证明之后未无痕改写，但本地
-SHA256 本身仍不是第三方时间戳或数字签名。
+每个 decision/label 记录都由外部操作器在同一个 ledger lock 内自动导出唯一的 head
+anchor；不得再单独运行 collector 的 `export-head-anchor` 拼接正式证据。导出前会用
+当时磁盘上的 reference/raw 闭包重新生成当前 decision projection 或 label observation，
+逐字节一致才允许产生 anchor。已有 anchor 永不改写。完整 projection 保存在
+content-addressed 本地对象中，需要同步备份整个 Stage 3 `_output` 目录。Git anchor
+能证明之后未无痕改写，但本地 SHA256 本身仍不是第三方时间戳或数字签名。
 生产 CLI 不允许注入 `recorded_at`，但本地系统时钟与 Git commit time 仍可由机器
 所有者影响；所以本研究只称 `LOCAL_PROSPECTIVE`，不声称具备受托第三方时间认证。
 
@@ -68,24 +68,40 @@ SHA256 本身仍不是第三方时间戳或数字签名。
 
 1. 首周前运行 `anchor`，提交并推送规格、源码和 protocol anchor；
 2. 运行 `init`、`export-head-anchor`，再提交并推送 genesis anchor；
-3. 每周只在合法窗口运行 `freeze-decision`，随后立刻
-   `export-head-anchor`、提交并推送；
-4. 退出日收盘后运行 `complete-label`，随后同样导出、提交并推送 head anchor；
-5. 下一事件若看不到上一个 head 的已推送 anchor，collector 会拒绝追加。
+3. 每个决策窗口使用 `scripts/xs_chan_stage3_first_week.py` 准备并冻结唯一的下一
+   decision；操作器在追加前写 authorization，并在追加后自动导出 matching sidecar
+   与 anchor；
+4. 退出日 18:00（Asia/Shanghai）以后使用 `scripts/xs_chan_stage3_weekly.py` 完成
+   最老的未标签 decision；它同样执行 authorization-before-record，并自动导出 matching
+   sidecar 与 anchor；
+5. 每个事件的 sidecar 与 anchor 必须是一个单父 Git commit 中仅有的两个变更，立即
+   推送后才能开始下一正式事件。
 
-首个 2026-07-31 decision 由
-`scripts/xs_chan_stage3_first_week.py` 作为外部操作保护层执行。它不替换或修改冻结
-collector/spec，也不改变 study identity；它只把首周的数据准备、完整八日期
-preflight、锁内最终复核以及 decision head anchor 导出做成 fail-closed 编排。
-因此首周步骤 3 的 `freeze-decision` 与紧随其后的 `export-head-anchor` 由该操作器一次
-完成。操作器还会在 record 写入前持久化精确的 append authorization，并导出匹配的
-Git sidecar；anchor 与 sidecar 必须作为唯一两个变更、在同一个单父提交中提交并推送，
-该提交的父提交必须正是 authorization 绑定的远端 HEAD，且必须严格早于 entry open。
-首周不得直接调用冻结 collector 自带的 `freeze-decision` CLI；该旧入口仅因研究身份与
-重放兼容性而保留。直接调用产生的 decision 没有 append-before-record authorization，
-状态会永久标记为 `UNAUTHORIZED_DECISION_PRESENT`，不能事后补造 authorization 洗白。
+`xs_chan_stage3_first_week.py` 是历史兼容文件名，现在是覆盖 D1–D52 的通用 decision
+操作器。省略全局 `--decision-date` 时，它从语义账本和官方 SSE 日历自动推导唯一的下一
+decision；提供该参数时只作为相等性断言，不能选周。D1 使用冻结的完整八日期 bootstrap
+reference；D2–D52 每次只追加精确的下一决策日，并继承上一 decision 的成员身份与
+`daily_basic` baseline。窗口恰为 52 个 decision；D52 之后只能补齐 outstanding labels
+并最终评价，D53 永久禁止。
 
-首周保护层还固定以下与结果无关的完整性门：
+日历优先级高于标签到期顺序：完成任一 label 前，所有决策日不晚于该 label 退出日的
+decision 都必须已经授权、锚定、提交并推送。因此 D2（2026-08-07）必须先于 L1
+（退出日 2026-08-10）出现；遇到短交易周时，可能有更多 later decisions 先于同一
+label。label 操作器始终只允许完成最老的未标签前缀，且 raw、state 与 observation
+必须精确止于退出日；退出日 18:00 前不允许生成或追加 label。
+
+两个操作器不替换或修改冻结 collector/spec，也不参与 study identity 计算。冻结值
+保持为 spec
+`3f01620964300440ee1d02ea374e7a42ea16ae3a48379675cc2543a5f64862fa`、
+collector
+`4f4a97407973246083e9d08c31044f21a1c4ecafde15dd43e81445ef9ba475ea`、
+study identity
+`f0afe61d932fbdf68b5b5ee242b68c7eed75bc932e4f6cf785bd7c9af51fb607`。
+冻结 collector 保留原始 `freeze-decision`、`complete-label` 和
+`export-head-anchor` 入口只为研究身份与重放兼容；正式链严禁直接调用。绕过操作器产生
+的 record 没有 append-before-record authorization，不能事后补造 sidecar 洗白。
+
+通用 decision 操作器还固定以下与结果无关的完整性门：
 
 - 每个新增 raw session 的 daily 股票全集至少 4,000 个；
 - 相对上一个 active session 至少保留 95%，对称集合变化不超过 5%；
@@ -94,7 +110,7 @@ Git sidecar；anchor 与 sidecar 必须作为唯一两个变更、在同一个�
 - 八日期 `daily_basic` bridge 使用相同的 4,000 / 95% / 5% 门，正式目标日还必须
   完整覆盖 raw daily 股票全集，额外股票不超过 raw 全集的 5%。
 
-这些证据被纳入 raw execution binding、audit、首周 preflight 和最终 authorization。
+这些证据被纳入 raw execution binding、audit、每周 preflight 和最终 authorization。
 正式发布在目录交换前还会从旧 raw snapshot 的实际 parquet 行以及内容寻址的
 calendar/daily/adj-factor CSV 独立重算整份报告，并要求与 binding 和 audit 顶层逐字节
 等价。正式 binding 固定当前研究分支、upstream、fetch/push URL 和真实远端 ref，并在
@@ -105,11 +121,19 @@ calendar/daily/adj-factor CSV 独立重算整份报告，并要求与 binding �
 data_dir/before/after/binding 的文件才是 commit marker。门是在 2026-07-31 数据获取前
 冻结的；旧 audit 不会被追溯性补写成已证明。
 
-若 record 已获预授权但进程在 sidecar 或 anchor 写出前后崩溃，恢复只允许当前
-authorization 所绑定的 Git HEAD、远端和原始数据闭包，并只容许这两个预期证据路径为
-dirty。合法 append 的记录时间仍必须在两小时安全截止前；恢复可持续到 entry open
-之前。若双文件提交已推送，重试只做幂等验证，不再要求旧 raw 闭包仍是当前 active
-数据。所有 collector 证据写入都经过 complete-or-absent 的同文件系统原子发布。
+label 的 tracked sidecar 是不含 events、returns 或其他 outcome 的最小承诺，只保存
+record/authorization/operator/Git 绑定；完整 observation 与 authorization 留在本地
+content-addressed 对象中。每次 formal append 前都会重放从 genesis 到当前 HEAD 的全部
+D/L pair，并证明上一 pair commit 是下一 authorization Git HEAD 的祖先；最新 pair 还
+必须位于直接查询到的真实远端历史中，不能只信任 tracking ref。
+
+若 record 已获预授权但进程在 sidecar、anchor、双文件 commit 或 push 前后崩溃，恢复
+会区分未导出、dirty exact pair、已提交未推送和已推送四种状态。只有当前 head 的精确
+authorization 及预期两个证据路径可恢复；已提交未推送的 exact pair 必须原样 push，
+已推送 pair 的重试只做幂等验证，不要求旧 raw 闭包仍是当前 active 数据。decision 的
+合法追加仍须满足 entry-open 截止；label 的合法追加仍须满足退出日 18:00 gate。所有
+collector 证据写入都经过 complete-or-absent 的同文件系统原子发布。两个 `status`
+命令只做本地重放、不调用网络或市场 API；正式 mutation 与恢复才直接核对真实远端。
 
 ## 样本门与盲态
 

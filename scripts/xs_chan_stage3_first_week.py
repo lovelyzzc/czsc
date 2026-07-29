@@ -1,16 +1,18 @@
-"""Fail-closed operator for the first XS-Chan Stage 3 prospective week.
+"""Fail-closed decision operator for all XS-Chan Stage 3 prospective weeks.
 
 This module is deliberately separate from the frozen Stage 3 collector.  It
 does not change the study identity; it adds operational gates around the
 registered collector:
 
 * prepare raw/state/reference evidence only after the target daily bar release;
-* validate the full eight-date bridge without writing the formal ledger;
+* bootstrap D1 from the frozen eight-date bridge, then derive D2--D52 exactly;
 * re-check time, raw closure and expected head inside the ledger append lock;
-* export the unique head anchor immediately after a successful decision append.
+* require every prior decision/label evidence pair and its cross-event Git edge;
+* export the unique head anchor immediately after each successful decision.
 
 Read-only commands never call market APIs and never write the ledger.  Formal
 mutation requires both an explicit apply flag and the expected current head.
+The filename and ``first_week_*`` schema names are retained as historical ABI.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -68,6 +71,9 @@ from xs_chan_exploration_stage3 import (
     Stage3ValidationError,
 )
 
+if __name__ == "__main__":
+    sys.modules.setdefault("xs_chan_stage3_first_week", sys.modules[__name__])
+
 FIRST_WEEK_REFERENCE_DATES = (
     "2026-06-12",
     "2026-06-18",
@@ -98,6 +104,103 @@ REFERENCE_SYMBOL_MAX_RAW_EXTRA_SHARE = SOURCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE
 REQUIRED_GIT_BRANCH = "feat/surge-wave-strategy"
 REQUIRED_GIT_UPSTREAM = "mine/feat/surge-wave-strategy"
 REQUIRED_GIT_REMOTE_URL = "git@github.com:lovelyzzc/czsc.git"
+
+
+@dataclass(frozen=True)
+class DecisionOperationContext:
+    """One uniquely derived prospective decision transition.
+
+    The full inherited membership is retained in memory for deterministic
+    path replay.  Persisted reports bind only its count and digest so the
+    operational evidence stays compact while still detecting any substitution.
+    """
+
+    week_index: int
+    decision_count: int
+    decision_date: str
+    entry_date: str
+    exit_date: str
+    reference_dates: tuple[str, ...]
+    initial_decision_date: str
+    initial_membership: tuple[str, ...]
+    previous_decision_record_hash: str | None
+    expected_head: str
+    ledger_id: str
+    bootstrap: bool
+    due_label_bindings: tuple[tuple[str, str], ...] = ()
+    previous_reference_manifest_sha256: str | None = None
+    previous_daily_basic_date: str | None = None
+    previous_daily_basic_symbols: tuple[str, ...] = ()
+
+    def evidence(self) -> dict[str, Any]:
+        return serialize_decision_operation_context_v1(self)
+
+
+DECISION_OPERATION_CONTEXT_V1_SCHEMA = "xs_chan_stage3_decision_operation_context_v1"
+DECISION_OPERATION_CONTEXT_V1_KEYS = frozenset(
+    {
+        "schema",
+        "week_index",
+        "decision_count_before_append",
+        "decision_date",
+        "entry_date",
+        "exit_date",
+        "reference_dates",
+        "initial_decision_date",
+        "initial_membership_count",
+        "initial_membership_sha256",
+        "previous_decision_record_hash",
+        "expected_head",
+        "ledger_id",
+        "bootstrap",
+        "due_label_bindings",
+        "previous_reference_manifest_sha256",
+        "previous_daily_basic_date",
+        "previous_daily_basic_symbol_count",
+        "previous_daily_basic_symbols_sha256",
+    }
+)
+
+
+def serialize_decision_operation_context_v1(
+    context: DecisionOperationContext,
+) -> dict[str, Any]:
+    """Frozen v1 serializer; future context additions must use a new schema."""
+
+    membership = sorted(map(str, context.initial_membership))
+    previous_symbols = sorted(map(str, context.previous_daily_basic_symbols))
+    evidence = {
+        "schema": DECISION_OPERATION_CONTEXT_V1_SCHEMA,
+        "week_index": context.week_index,
+        "decision_count_before_append": context.decision_count,
+        "decision_date": context.decision_date,
+        "entry_date": context.entry_date,
+        "exit_date": context.exit_date,
+        "reference_dates": list(context.reference_dates),
+        "initial_decision_date": context.initial_decision_date,
+        "initial_membership_count": len(membership),
+        "initial_membership_sha256": sha256_bytes(canonical_json(membership)),
+        "previous_decision_record_hash": context.previous_decision_record_hash,
+        "expected_head": context.expected_head,
+        "ledger_id": context.ledger_id,
+        "bootstrap": context.bootstrap,
+        "due_label_bindings": [
+            {
+                "decision_record_hash": decision_hash,
+                "label_record_hash": label_hash,
+            }
+            for decision_hash, label_hash in context.due_label_bindings
+        ],
+        "previous_reference_manifest_sha256": context.previous_reference_manifest_sha256,
+        "previous_daily_basic_date": context.previous_daily_basic_date,
+        "previous_daily_basic_symbol_count": len(previous_symbols),
+        "previous_daily_basic_symbols_sha256": (
+            None if not previous_symbols else sha256_bytes(canonical_json(previous_symbols))
+        ),
+    }
+    if set(evidence) != DECISION_OPERATION_CONTEXT_V1_KEYS:
+        raise AssertionError("decision operation context v1 serializer keys changed")
+    return evidence
 
 
 class _AuthorizationLockLease:
@@ -183,6 +286,28 @@ def _git_file_sha256_at_commit(
     return sha256_bytes(completed.stdout)
 
 
+def _git_file_bytes_at_commit(
+    repo_root: Path,
+    commit: str,
+    relative_path: str,
+) -> bytes:
+    """Read one path's exact bytes from a commit without consulting a worktree."""
+
+    try:
+        completed = subprocess.run(
+            ("git", "show", f"{commit}:{relative_path}"),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout).decode(errors="replace").strip()
+        raise FirstWeekOperationError(
+            f"cannot read {relative_path} bytes from Git commit {commit}: {detail}"
+        ) from exc
+    return completed.stdout
+
+
 def validate_git_ready(
     *,
     repo_root: Path = stage3.REPO_ROOT,
@@ -216,7 +341,7 @@ def validate_git_ready(
 
     if branch != REQUIRED_GIT_BRANCH or upstream_name != REQUIRED_GIT_UPSTREAM:
         raise FirstWeekOperationError(
-            "first-week formal operations are bound to "
+            "Stage 3 decision operations are bound to "
             f"{REQUIRED_GIT_UPSTREAM}; got branch={branch!r}, upstream={upstream_name!r}"
         )
     remote_name, separator, remote_branch = upstream_name.partition("/")
@@ -226,7 +351,7 @@ def validate_git_ready(
     push_url = _git_output(repo_root, "remote", "get-url", "--push", remote_name)
     if fetch_url != REQUIRED_GIT_REMOTE_URL or push_url != REQUIRED_GIT_REMOTE_URL:
         raise FirstWeekOperationError(
-            "first-week remote URL differs from the frozen operator destination: "
+            "Stage 3 decision remote URL differs from the operator destination: "
             f"fetch={fetch_url!r}, push={push_url!r}"
         )
 
@@ -253,6 +378,52 @@ def validate_git_ready(
         "remote_push_url": push_url,
         "remote_verified": verify_remote,
         "worktree_clean": True,
+    }
+
+
+def validate_actual_remote_branch(
+    *,
+    repo_root: Path = stage3.REPO_ROOT,
+) -> dict[str, str]:
+    """Resolve the configured branch directly on its actual remote.
+
+    Unlike formal worktree readiness this helper is intentionally insensitive
+    to the exact recovery evidence files being dirty.
+    """
+
+    branch = _git_output(repo_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    upstream = _git_output(
+        repo_root,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    )
+    if branch != REQUIRED_GIT_BRANCH or upstream != REQUIRED_GIT_UPSTREAM:
+        raise FirstWeekOperationError("actual-remote validation is bound to the formal Stage 3 branch")
+    remote_name, separator, remote_branch = upstream.partition("/")
+    if not separator or not remote_name or not remote_branch:
+        raise FirstWeekOperationError(f"cannot resolve remote branch from upstream {upstream!r}")
+    fetch_url = _git_output(repo_root, "remote", "get-url", remote_name)
+    push_url = _git_output(repo_root, "remote", "get-url", "--push", remote_name)
+    if fetch_url != REQUIRED_GIT_REMOTE_URL or push_url != REQUIRED_GIT_REMOTE_URL:
+        raise FirstWeekOperationError("actual-remote validation found an unexpected remote URL")
+    output = _git_output(
+        repo_root,
+        "ls-remote",
+        "--heads",
+        remote_name,
+        f"refs/heads/{remote_branch}",
+    )
+    matches = [line.split(maxsplit=1)[0] for line in output.splitlines() if line.strip()]
+    if len(matches) != 1:
+        raise FirstWeekOperationError("actual remote branch did not resolve to one commit")
+    return {
+        "branch": branch,
+        "upstream": upstream,
+        "remote_fetch_url": fetch_url,
+        "remote_push_url": push_url,
+        "remote_head": matches[0],
     }
 
 
@@ -377,7 +548,7 @@ def assert_ledger_unchanged(
 
 @contextmanager
 def operator_lock(root: Path) -> Iterator[None]:
-    """Serialize first-week operators before taking the raw or ledger lock."""
+    """Serialize Stage 3 decision operators before taking raw or ledger locks."""
 
     root.mkdir(parents=True, exist_ok=True)
     path = root / OPERATOR_LOCK_FILE
@@ -702,6 +873,346 @@ def _read_json(path: Path) -> dict[str, Any]:
     except Stage3ValidationError as exc:
         raise FirstWeekOperationError(f"cannot read JSON evidence: {path}") from exc
     return payload
+
+
+def _normalized_date(value: str | pd.Timestamp, *, label: str) -> str:
+    try:
+        return pd.Timestamp(value).date().isoformat()
+    except (TypeError, ValueError) as exc:
+        raise FirstWeekOperationError(f"{label} is not a valid date: {value!r}") from exc
+
+
+def _decision_schedule_row(
+    spec: Mapping[str, Any],
+    official_sessions: Sequence[str | pd.Timestamp],
+    week_index: int,
+) -> tuple[str, str, str]:
+    if not 1 <= week_index <= int(spec["accrual"]["window_weeks"]):
+        raise FirstWeekOperationError(
+            f"prospective week {week_index} is outside the frozen "
+            f"{int(spec['accrual']['window_weeks'])}-week window"
+        )
+    schedule = stage3.build_forward_schedule(spec, official_sessions)
+    selected = schedule.loc[schedule["week_index"].eq(week_index)]
+    if len(selected) != 1:
+        raise FirstWeekOperationError(
+            f"official calendar cannot derive one complete prospective week {week_index}"
+        )
+    row = selected.iloc[0]
+    return tuple(
+        pd.Timestamp(row[column]).date().isoformat()
+        for column in ("decision_dt", "entry_dt", "exit_dt")
+    )
+
+
+def _context_schedule(
+    spec: Mapping[str, Any],
+    root: Path,
+    *,
+    week_index: int,
+    prior_decision: Mapping[str, Any] | None,
+    reference_manifest_path: Path | None,
+) -> tuple[str, str, str]:
+    manifest_path = reference_manifest_path
+    if manifest_path is None and prior_decision is not None:
+        manifest_path = (
+            root
+            / "objects"
+            / "reference_manifest"
+            / f"{prior_decision['payload']['reference_manifest_sha256']}.json"
+        )
+    if manifest_path is None:
+        if week_index != 1:
+            raise FirstWeekOperationError("the next decision schedule has no prior official-calendar binding")
+        return (
+            FIRST_WEEK_REFERENCE_DATES[-1],
+            FIRST_WEEK_ENTRY_DATE,
+            FIRST_WEEK_EXIT_DATE,
+        )
+    _, official_sessions, _ = stage3.load_reference_manifest(
+        root,
+        manifest_path.expanduser().resolve(),
+    )
+    return _decision_schedule_row(spec, official_sessions, week_index)
+
+
+def _validate_reference_calendar_extension(
+    root: Path,
+    prior_decision: Mapping[str, Any] | None,
+    reference_manifest_path: Path | None,
+) -> None:
+    """Allow calendar extension, never a rewrite through the prior frozen exit."""
+
+    if prior_decision is None or reference_manifest_path is None:
+        return
+    prior_manifest_path = (
+        root
+        / "objects"
+        / "reference_manifest"
+        / f"{prior_decision['payload']['reference_manifest_sha256']}.json"
+    )
+    if prior_manifest_path.expanduser().resolve() == reference_manifest_path.expanduser().resolve():
+        return
+    _, old_sessions, _ = stage3.load_reference_manifest(root, prior_manifest_path)
+    _, new_sessions, _ = stage3.load_reference_manifest(
+        root,
+        reference_manifest_path.expanduser().resolve(),
+    )
+    prior_exit = pd.Timestamp(str(prior_decision["payload"]["exit_dt"]))
+    old_prefix = old_sessions[old_sessions <= prior_exit]
+    new_prefix = new_sessions[new_sessions <= prior_exit]
+    if not old_prefix.equals(new_prefix):
+        raise FirstWeekOperationError(
+            "fresh official calendar rewrites the frozen session prefix through the prior exit"
+        )
+
+
+def validate_provisional_final_context(
+    provisional: DecisionOperationContext,
+    final: DecisionOperationContext,
+) -> None:
+    """Require a fresh reference to refine only the not-yet-bound exit date."""
+
+    old = serialize_decision_operation_context_v1(provisional)
+    new = serialize_decision_operation_context_v1(final)
+    if provisional.bootstrap:
+        if canonical_json(old) != canonical_json(new):
+            raise FirstWeekOperationError("bootstrap decision context changed after reference fetch")
+        return
+    old_without_exit = {key: value for key, value in old.items() if key != "exit_date"}
+    new_without_exit = {key: value for key, value in new.items() if key != "exit_date"}
+    if canonical_json(old_without_exit) != canonical_json(new_without_exit):
+        raise FirstWeekOperationError(
+            "fresh reference changed a decision field already bound before raw preparation"
+        )
+
+
+def _due_label_bindings(
+    records: Sequence[stage3.LedgerRecord],
+    decisions: Sequence[Mapping[str, Any]],
+    target_decision_date: str,
+) -> tuple[tuple[str, str], ...]:
+    labels = {
+        str(item.data["payload"]["decision_record_hash"]): str(item.data["record_hash"])
+        for item in records
+        if item.data["record_type"] == "label_completion"
+    }
+    due = [
+        str(decision["record_hash"])
+        for decision in decisions
+        if pd.Timestamp(str(decision["payload"]["exit_dt"])) < pd.Timestamp(target_decision_date)
+    ]
+    missing = [decision_hash for decision_hash in due if decision_hash not in labels]
+    if missing:
+        raise FirstWeekOperationError(
+            "the next decision is forbidden until every label due before its close is completed; "
+            f"missing decision hashes={missing}"
+        )
+    return tuple((decision_hash, labels[decision_hash]) for decision_hash in due)
+
+
+def _previous_daily_basic_baseline(
+    root: Path,
+    prior_decision: Mapping[str, Any] | None,
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if prior_decision is None:
+        return None, None, ()
+    manifest_sha = str(prior_decision["payload"]["reference_manifest_sha256"])
+    manifest_path = root / "objects" / "reference_manifest" / f"{manifest_sha}.json"
+    _, _, daily = stage3.load_reference_manifest(root, manifest_path)
+    prior_date = str(prior_decision["payload"]["decision_dt"])
+    frame = daily.get(prior_date)
+    if frame is None or "ts_code" not in frame or frame["ts_code"].astype(str).duplicated().any():
+        raise FirstWeekOperationError(
+            "the predecessor reference manifest has no unique decision-date daily-basic baseline"
+        )
+    symbols = tuple(sorted(set(frame["ts_code"].astype(str))))
+    if len(symbols) < REFERENCE_SYMBOL_ABSOLUTE_MINIMUM:
+        raise FirstWeekOperationError("the predecessor daily-basic baseline is unexpectedly truncated")
+    return manifest_sha, prior_date, symbols
+
+
+def derive_decision_operation_context(
+    spec: Mapping[str, Any],
+    root: Path,
+    *,
+    decision_date: str | pd.Timestamp | None = None,
+    reference_manifest_path: Path | None = None,
+    records: Sequence[stage3.LedgerRecord] | None = None,
+) -> DecisionOperationContext:
+    """Derive the only legal next decision before any data mutation."""
+
+    chain = tuple(records) if records is not None else stage3.scan_records(root)
+    if not chain or chain[0].data["record_type"] != "genesis":
+        raise FirstWeekOperationError("decision operation requires an initialized Stage 3 ledger")
+    stage3.validate_record_semantics(spec, chain, root=root)
+    decisions = list(stage3._prospective_decisions(chain))
+    window_weeks = int(spec["accrual"]["window_weeks"])
+    if len(decisions) >= window_weeks:
+        raise FirstWeekOperationError(
+            f"the frozen {window_weeks}-week decision window is already complete; D{window_weeks + 1} is forbidden"
+        )
+
+    week_index = len(decisions) + 1
+    prior = decisions[-1] if decisions else None
+    _validate_reference_calendar_extension(
+        root,
+        prior,
+        reference_manifest_path,
+    )
+    derived_decision, entry_date, exit_date = _context_schedule(
+        spec,
+        root,
+        week_index=week_index,
+        prior_decision=prior,
+        reference_manifest_path=reference_manifest_path,
+    )
+    requested = derived_decision if decision_date is None else _normalized_date(decision_date, label="decision date")
+    if requested != derived_decision:
+        raise FirstWeekOperationError(
+            f"the semantic ledger and official schedule require D{week_index}={derived_decision}; "
+            f"got {requested}"
+        )
+    due_labels = _due_label_bindings(chain, decisions, derived_decision)
+    previous_manifest_sha, previous_daily_date, previous_daily_symbols = (
+        _previous_daily_basic_baseline(root, prior)
+    )
+
+    if week_index == 1:
+        reference_dates = FIRST_WEEK_REFERENCE_DATES
+        initial_decision_date = "2026-06-05"
+        initial_membership = tuple(map(str, stage3.load_initial_fc_membership()))
+        previous_decision_hash = None
+    else:
+        assert prior is not None
+        reference_dates = (derived_decision,)
+        initial_decision_date = str(prior["payload"]["decision_dt"])
+        initial_membership = tuple(map(str, prior["payload"]["current_membership"]))
+        previous_decision_hash = str(prior["record_hash"])
+
+    return DecisionOperationContext(
+        week_index=week_index,
+        decision_count=len(decisions),
+        decision_date=derived_decision,
+        entry_date=entry_date,
+        exit_date=exit_date,
+        reference_dates=reference_dates,
+        initial_decision_date=initial_decision_date,
+        initial_membership=initial_membership,
+        previous_decision_record_hash=previous_decision_hash,
+        expected_head=str(chain[-1].data["record_hash"]),
+        ledger_id=str(chain[0].data["ledger_id"]),
+        bootstrap=week_index == 1,
+        due_label_bindings=due_labels,
+        previous_reference_manifest_sha256=previous_manifest_sha,
+        previous_daily_basic_date=previous_daily_date,
+        previous_daily_basic_symbols=previous_daily_symbols,
+    )
+
+
+def decision_operation_context_for_record(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    reference_manifest_path: Path | None = None,
+    records: Sequence[stage3.LedgerRecord] | None = None,
+) -> DecisionOperationContext:
+    """Reconstruct a decision's append-time context for recovery/replay."""
+
+    chain = tuple(records) if records is not None else stage3.scan_records(root)
+    if not chain or chain[0].data["record_type"] != "genesis":
+        raise FirstWeekOperationError("decision recovery requires an initialized Stage 3 ledger")
+    stage3.validate_record_semantics(spec, chain, root=root)
+    if (
+        record.get("record_type") != "decision_freeze"
+        or not any(item.data["record_hash"] == record.get("record_hash") for item in chain)
+    ):
+        raise FirstWeekOperationError("decision recovery target is not in the semantic ledger")
+    decisions = list(stage3._prospective_decisions(chain))
+    matching = [item for item in decisions if item["record_hash"] == record["record_hash"]]
+    if len(matching) != 1:
+        raise FirstWeekOperationError("decision recovery target is not one unique prospective decision")
+    target = matching[0]
+    week_index = int(target["payload"]["week_index"])
+    if not 1 <= week_index <= int(spec["accrual"]["window_weeks"]):
+        raise FirstWeekOperationError("decision recovery target is outside the frozen accrual window")
+    if decisions[week_index - 1]["record_hash"] != target["record_hash"]:
+        raise FirstWeekOperationError("decision recovery target week is discontinuous")
+    prior = None if week_index == 1 else decisions[week_index - 2]
+    manifest_path = reference_manifest_path or (
+        root
+        / "objects"
+        / "reference_manifest"
+        / f"{target['payload']['reference_manifest_sha256']}.json"
+    )
+    decision_date, entry_date, exit_date = _context_schedule(
+        spec,
+        root,
+        week_index=week_index,
+        prior_decision=prior,
+        reference_manifest_path=manifest_path,
+    )
+    payload_dates = (
+        str(target["payload"]["decision_dt"]),
+        str(target["payload"]["entry_dt"]),
+        str(target["payload"]["exit_dt"]),
+    )
+    if payload_dates != (decision_date, entry_date, exit_date):
+        raise FirstWeekOperationError("decision recovery payload differs from its official schedule")
+    due_labels = _due_label_bindings(
+        tuple(item for item in chain if int(item.data["sequence"]) < int(target["sequence"])),
+        decisions[: week_index - 1],
+        decision_date,
+    )
+    previous_manifest_sha, previous_daily_date, previous_daily_symbols = (
+        _previous_daily_basic_baseline(root, prior)
+    )
+
+    if prior is None:
+        reference_dates = FIRST_WEEK_REFERENCE_DATES
+        initial_decision_date = "2026-06-05"
+        initial_membership = tuple(map(str, stage3.load_initial_fc_membership()))
+        previous_decision_hash = None
+    else:
+        reference_dates = (decision_date,)
+        initial_decision_date = str(prior["payload"]["decision_dt"])
+        initial_membership = tuple(map(str, prior["payload"]["current_membership"]))
+        previous_decision_hash = str(prior["record_hash"])
+    return DecisionOperationContext(
+        week_index=week_index,
+        decision_count=week_index - 1,
+        decision_date=decision_date,
+        entry_date=entry_date,
+        exit_date=exit_date,
+        reference_dates=reference_dates,
+        initial_decision_date=initial_decision_date,
+        initial_membership=initial_membership,
+        previous_decision_record_hash=previous_decision_hash,
+        expected_head=str(target["previous_hash"]),
+        ledger_id=str(target["ledger_id"]),
+        bootstrap=week_index == 1,
+        due_label_bindings=due_labels,
+        previous_reference_manifest_sha256=previous_manifest_sha,
+        previous_daily_basic_date=previous_daily_date,
+        previous_daily_basic_symbols=previous_daily_symbols,
+    )
+
+
+def _require_context_evidence(
+    value: Any,
+    context: DecisionOperationContext,
+    *,
+    label: str,
+) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema") != DECISION_OPERATION_CONTEXT_V1_SCHEMA
+        or set(value) != DECISION_OPERATION_CONTEXT_V1_KEYS
+        or canonical_json(value)
+        != canonical_json(serialize_decision_operation_context_v1(context))
+    ):
+        raise FirstWeekOperationError(f"{label} does not bind the exact derived decision context")
 
 
 def _trade_date_text(value: Any) -> str:
@@ -1180,12 +1691,17 @@ def validate_reference_symbol_completeness(
     *,
     raw_summary: Mapping[str, Any],
     decision_date: str,
+    reference_dates: Sequence[str] = FIRST_WEEK_REFERENCE_DATES,
+    previous_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Reject a truncated daily-basic bridge before any path is frozen."""
+    """Reject a truncated decision-time daily-basic path before it is frozen."""
 
-    previous_symbols: set[str] | None = None
+    expected_dates = tuple(map(str, reference_dates))
+    if not expected_dates or tuple(sorted(expected_dates)) != expected_dates:
+        raise FirstWeekOperationError("reference decision dates must be non-empty, unique and increasing")
+    comparison_symbols = None if previous_symbols is None else set(map(str, previous_symbols))
     sessions: list[dict[str, Any]] = []
-    for date_text in FIRST_WEEK_REFERENCE_DATES:
+    for date_text in expected_dates:
         frame = daily[date_text]
         symbols = set(frame["ts_code"].astype(str))
         if len(symbols) < REFERENCE_SYMBOL_ABSOLUTE_MINIMUM:
@@ -1198,38 +1714,40 @@ def validate_reference_symbol_completeness(
             "symbols": _symbol_set_evidence(symbols),
             "passed": True,
         }
-        if previous_symbols is not None:
-            retained = previous_symbols & symbols
-            required_retained = math.ceil(len(previous_symbols) * REFERENCE_SYMBOL_MIN_PREVIOUS_COVERAGE)
-            added = symbols - previous_symbols
-            removed = previous_symbols - symbols
+        if comparison_symbols is not None:
+            retained = comparison_symbols & symbols
+            required_retained = math.ceil(len(comparison_symbols) * REFERENCE_SYMBOL_MIN_PREVIOUS_COVERAGE)
+            added = symbols - comparison_symbols
+            removed = comparison_symbols - symbols
             symmetric_count = len(added) + len(removed)
-            maximum_symmetric_count = math.floor(len(previous_symbols) * REFERENCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE)
+            maximum_symmetric_count = math.floor(
+                len(comparison_symbols) * REFERENCE_SYMBOL_MAX_SYMMETRIC_CHANGE_SHARE
+            )
             if len(retained) < required_retained:
                 raise FirstWeekOperationError(
-                    f"daily_basic[{date_text}] retained only {len(retained)}/{len(previous_symbols)} "
+                    f"daily_basic[{date_text}] retained only {len(retained)}/{len(comparison_symbols)} "
                     "symbols from the previous registered bridge date"
                 )
             if symmetric_count > maximum_symmetric_count:
                 raise FirstWeekOperationError(
-                    f"daily_basic[{date_text}] changed {symmetric_count}/{len(previous_symbols)} "
+                    f"daily_basic[{date_text}] changed {symmetric_count}/{len(comparison_symbols)} "
                     "symbols versus the previous registered bridge date"
                 )
             session.update(
                 {
-                    "previous_symbols": _symbol_set_evidence(previous_symbols),
+                    "previous_symbols": _symbol_set_evidence(comparison_symbols),
                     "retained_from_previous": len(retained),
                     "required_retained_from_previous": required_retained,
-                    "previous_coverage": len(retained) / len(previous_symbols),
+                    "previous_coverage": len(retained) / len(comparison_symbols),
                     "added_since_previous": _symbol_set_evidence(added),
                     "removed_since_previous": _symbol_set_evidence(removed),
                     "symmetric_change_count": symmetric_count,
                     "maximum_symmetric_change_count": maximum_symmetric_count,
-                    "symmetric_change_share": symmetric_count / len(previous_symbols),
+                    "symmetric_change_share": symmetric_count / len(comparison_symbols),
                 }
             )
         sessions.append(session)
-        previous_symbols = symbols
+        comparison_symbols = symbols
 
     inventory = inspect_inventory(Path(str(raw_summary["data_dir"])))
     target_iso = pd.Timestamp(decision_date).date().isoformat()
@@ -1298,11 +1816,30 @@ def validate_reference_ready(
     *,
     state_summary: Mapping[str, Any],
     raw_summary: Mapping[str, Any],
+    context: DecisionOperationContext | None = None,
 ) -> dict[str, Any]:
-    """Validate the exact eight-date reference and simulate the full bridge."""
+    """Validate the exact derived reference and simulate its decision path."""
 
     resolved_reference = reference_manifest_path.expanduser().resolve()
     resolved_state = state_manifest_path.expanduser().resolve()
+    operation = context
+    if operation is None:
+        operation = DecisionOperationContext(
+            week_index=1,
+            decision_count=0,
+            decision_date=FIRST_WEEK_REFERENCE_DATES[-1],
+            entry_date=FIRST_WEEK_ENTRY_DATE,
+            exit_date=FIRST_WEEK_EXIT_DATE,
+            reference_dates=FIRST_WEEK_REFERENCE_DATES,
+            initial_decision_date="2026-06-05",
+            initial_membership=tuple(map(str, stage3.load_initial_fc_membership())),
+            previous_decision_record_hash=None,
+            expected_head="",
+            ledger_id="",
+            bootstrap=True,
+        )
+    if _normalized_date(decision_date, label="decision date") != operation.decision_date:
+        raise FirstWeekOperationError("reference validation target differs from the derived decision context")
     manifest, official_sessions, daily = stage3.load_reference_manifest(
         root,
         resolved_reference,
@@ -1338,17 +1875,25 @@ def validate_reference_ready(
     ):
         raise FirstWeekOperationError("reference raw closure does not cover and equal the active target cache")
 
-    bridge_dates = tuple(
-        value.date().isoformat()
-        for value in stage3._official_weekly_decisions(
-            official_sessions,
-            BRIDGE_START_EXCLUSIVE,
-            decision_date,
+    bridge_dates = (
+        tuple(
+            value.date().isoformat()
+            for value in stage3._official_weekly_decisions(
+                official_sessions,
+                BRIDGE_START_EXCLUSIVE,
+                decision_date,
+            )
         )
+        if operation.bootstrap
+        else (operation.decision_date,)
     )
-    if bridge_dates != FIRST_WEEK_REFERENCE_DATES or tuple(sorted(daily)) != FIRST_WEEK_REFERENCE_DATES:
-        raise FirstWeekOperationError("formal reference must contain exactly the registered eight bridge dates")
-    for date_text in FIRST_WEEK_REFERENCE_DATES:
+    if bridge_dates != operation.reference_dates or tuple(sorted(daily)) != operation.reference_dates:
+        raise FirstWeekOperationError(
+            "formal reference must contain exactly the registered eight bridge dates"
+            if operation.bootstrap
+            else "formal reference must contain exactly the derived one-date decision path"
+        )
+    for date_text in operation.reference_dates:
         frame = daily[date_text]
         if len(frame) < DEFAULT_MIN_DAILY_ROWS:
             raise FirstWeekOperationError(f"daily_basic[{date_text}] has only {len(frame)} rows")
@@ -1363,17 +1908,28 @@ def validate_reference_ready(
         daily,
         raw_summary=raw_summary,
         decision_date=decision_date,
+        reference_dates=operation.reference_dates,
+        previous_symbols=(
+            None
+            if operation.bootstrap
+            else set(operation.previous_daily_basic_symbols)
+        ),
     )
 
     schedule = stage3.build_forward_schedule(spec, official_sessions)
-    target_row = schedule.loc[schedule["decision_dt"].eq(pd.Timestamp(decision_date))]
+    target_row = schedule.loc[schedule["week_index"].eq(operation.week_index)]
     if len(target_row) != 1:
-        raise FirstWeekOperationError("official calendar does not contain one complete first prospective week")
+        raise FirstWeekOperationError("official calendar does not contain the derived complete prospective week")
     schedule_row = target_row.iloc[0]
+    scheduled_decision = pd.Timestamp(schedule_row["decision_dt"]).date().isoformat()
     entry_date = pd.Timestamp(schedule_row["entry_dt"]).date().isoformat()
     exit_date = pd.Timestamp(schedule_row["exit_dt"]).date().isoformat()
-    if int(schedule_row["week_index"]) != 1 or entry_date != FIRST_WEEK_ENTRY_DATE or exit_date != FIRST_WEEK_EXIT_DATE:
-        raise FirstWeekOperationError("official first-week entry/exit schedule differs from the registered operation")
+    if (
+        scheduled_decision != operation.decision_date
+        or entry_date != operation.entry_date
+        or exit_date != operation.exit_date
+    ):
+        raise FirstWeekOperationError("official decision/entry/exit schedule differs from the derived operation")
 
     projections = stage3.build_decision_projections(
         spec,
@@ -1386,17 +1942,17 @@ def validate_reference_ready(
         spec,
         bridge_dates,
         projections,
-        initial_symbols=stage3.load_initial_fc_membership(),
-        initial_decision_date="2026-06-05",
+        initial_symbols=operation.initial_membership,
+        initial_decision_date=operation.initial_decision_date,
     )
     weeks = path_bundle.get("weeks")
     if (
         not isinstance(weeks, list)
-        or len(weeks) != len(FIRST_WEEK_REFERENCE_DATES)
+        or len(weeks) != len(operation.reference_dates)
         or weeks[-1].get("decision_dt") != decision_date
         or stage3._contains_outcome_key(path_bundle)
     ):
-        raise FirstWeekOperationError("eight-date bridge simulation is incomplete or contains outcome data")
+        raise FirstWeekOperationError("derived decision path is incomplete or contains outcome data")
     return {
         "manifest_path": str(resolved_reference),
         "manifest_sha256": resolved_reference.stem,
@@ -1411,9 +1967,10 @@ def validate_reference_ready(
         "decision_date": decision_date,
         "entry_date": entry_date,
         "exit_date": exit_date,
-        "week_index": 1,
+        "week_index": operation.week_index,
+        "decision_context": serialize_decision_operation_context_v1(operation),
         "decision_inputs_only": True,
-        "prospective_week_count": 0,
+        "prospective_week_count": operation.decision_count,
         "formal_ledger_mutated": False,
     }
 
@@ -1560,6 +2117,90 @@ def validate_existing_anchor_chain(
     ]
 
 
+def validate_prior_decision_evidence(
+    spec: Mapping[str, Any],
+    root: Path,
+    records: Sequence[stage3.LedgerRecord],
+) -> list[dict[str, Any]]:
+    """Require every already-recorded decision authorization pair to be pushed."""
+
+    return [
+        validate_authorized_anchor_pair(
+            spec,
+            root,
+            record.data,
+            require_pushed=True,
+            verify_remote=True,
+        )
+        for record in records
+        if record.data["record_type"] == "decision_freeze"
+    ]
+
+
+def validate_due_label_evidence(
+    spec: Mapping[str, Any],
+    root: Path,
+    records: Sequence[stage3.LedgerRecord],
+    context: DecisionOperationContext,
+) -> list[dict[str, Any]]:
+    """Require every context-bound due label's weekly authorization pair."""
+
+    by_hash = {str(record.data["record_hash"]): record.data for record in records}
+    import xs_chan_stage3_weekly as weekly
+
+    pair_validator = getattr(weekly, "validate_label_authorized_anchor_pair", None)
+    if not callable(pair_validator):
+        raise FirstWeekOperationError("weekly label authorization validator is unavailable")
+    evidence: list[dict[str, Any]] = []
+    for decision_hash, label_hash in context.due_label_bindings:
+        label = by_hash.get(label_hash)
+        if (
+            label is None
+            or label.get("record_type") != "label_completion"
+            or label.get("payload", {}).get("decision_record_hash") != decision_hash
+        ):
+            raise FirstWeekOperationError("a context-bound due label disappeared from the ledger")
+        pair = pair_validator(
+            spec,
+            root,
+            label,
+            require_pushed=True,
+        )
+        evidence.append(
+            {
+                "decision_record_hash": decision_hash,
+                "label_record_hash": label_hash,
+                "authorized_anchor_pair": pair,
+            }
+        )
+    return evidence
+
+
+def validate_global_weekly_label_evidence(
+    spec: Mapping[str, Any],
+    root: Path,
+    records: Sequence[stage3.LedgerRecord],
+    *,
+    verify_actual_remote: bool,
+    ignored_decision_sidecar_names: set[str] | None = None,
+) -> Any:
+    """Audit the complete cross-operator D/L evidence chain."""
+
+    import xs_chan_stage3_weekly as weekly
+
+    validator = getattr(weekly, "validate_stage3_operator_pair_chain", None)
+    if not callable(validator):
+        raise FirstWeekOperationError("global Stage 3 operator-pair-chain validator is unavailable")
+    return validator(
+        spec,
+        root,
+        records,
+        require_pushed=True,
+        verify_actual_remote=verify_actual_remote,
+        ignored_decision_sidecar_names=ignored_decision_sidecar_names,
+    )
+
+
 def build_preflight_report(
     spec: Mapping[str, Any],
     root: Path,
@@ -1570,26 +2211,72 @@ def build_preflight_report(
     data_dir: Path = DEFAULT_DATA_DIR,
     verify_remote: bool,
     generated_at: datetime | None = None,
+    context: DecisionOperationContext | None = None,
 ) -> dict[str, Any]:
-    """Run all read-only first-week gates and prove the ledger stayed byte-equal."""
+    """Run all read-only decision gates and prove the ledger stayed byte-equal."""
 
     target = pd.Timestamp(decision_date).date().isoformat()
-    registered = spec["historical_exclusion"]["first_prospective_decision_date"]
-    if target != registered:
-        raise FirstWeekOperationError(f"first-week operator only accepts registered date {registered}")
     validate_frozen_data_dir(data_dir)
     before = ledger_closure(root)
-    if before["record_count"] != 1 or before["head_type"] != "genesis":
-        raise FirstWeekOperationError("first decision preflight requires the genesis-only ledger")
+    records = stage3.scan_records(root)
+    operation = context
+    if operation is None:
+        registered = spec["historical_exclusion"]["first_prospective_decision_date"]
+        if target == registered and before["record_count"] == 1 and before["head_type"] == "genesis":
+            operation = DecisionOperationContext(
+                week_index=1,
+                decision_count=0,
+                decision_date=registered,
+                entry_date=FIRST_WEEK_ENTRY_DATE,
+                exit_date=FIRST_WEEK_EXIT_DATE,
+                reference_dates=FIRST_WEEK_REFERENCE_DATES,
+                initial_decision_date="2026-06-05",
+                initial_membership=tuple(map(str, stage3.load_initial_fc_membership())),
+                previous_decision_record_hash=None,
+                expected_head=str(before["head"]),
+                ledger_id=str(records[0].data["ledger_id"]),
+                bootstrap=True,
+            )
+        else:
+            operation = derive_decision_operation_context(
+                spec,
+                root,
+                decision_date=target,
+                reference_manifest_path=reference_manifest_path,
+                records=records,
+            )
+    if (
+        target != operation.decision_date
+        or before["head"] != operation.expected_head
+        or before["record_count"] != len(records)
+    ):
+        raise FirstWeekOperationError("decision preflight ledger or target differs from its derived context")
     validate_authorization_sidecar_inventory(
         root,
-        stage3.scan_records(root),
+        records,
     )
     git = validate_git_ready(verify_remote=verify_remote)
     anchors = validate_existing_anchor_chain(
         spec,
         root,
         require_pushed=True,
+    )
+    prior_decision_evidence = validate_prior_decision_evidence(
+        spec,
+        root,
+        records,
+    )
+    due_label_evidence = validate_due_label_evidence(
+        spec,
+        root,
+        records,
+        operation,
+    )
+    global_label_evidence = validate_global_weekly_label_evidence(
+        spec,
+        root,
+        records,
+        verify_actual_remote=verify_remote,
     )
     raw = validate_raw_ready(target, data_dir=data_dir)
     state = validate_state_ready(
@@ -1607,6 +2294,7 @@ def build_preflight_report(
         target,
         state_summary=state,
         raw_summary=raw,
+        context=operation,
     )
     after = assert_ledger_unchanged(before, root)
     operator_path = Path(__file__).resolve()
@@ -1617,6 +2305,7 @@ def build_preflight_report(
         "study_id": spec["study_id"],
         "study_identity": stage3.study_identity(spec),
         "decision_date": target,
+        "decision_context": serialize_decision_operation_context_v1(operation),
         "collector_source_sha256": sha256_file(stage3.SOURCE_PATH),
         "operator_source_sha256": sha256_file(operator_path),
         "git": git,
@@ -1624,6 +2313,9 @@ def build_preflight_report(
         "ledger_after": after,
         "formal_ledger_mutated": False,
         "anchors": anchors,
+        "prior_decision_evidence": prior_decision_evidence,
+        "due_label_evidence": due_label_evidence,
+        "global_label_evidence": global_label_evidence,
         "raw": raw,
         "state": state,
         "reference": reference,
@@ -1685,7 +2377,7 @@ def build_or_reuse_state_cache(
 
 def prepare_decision_data(
     *,
-    decision_date: str,
+    decision_date: str | None,
     data_dir: Path,
     snapshot_root: Path,
     state_output_root: Path,
@@ -1695,23 +2387,55 @@ def prepare_decision_data(
     """Apply data-only transitions and produce a content-addressed preflight."""
 
     spec = stage3.load_and_validate_spec()
-    target = pd.Timestamp(decision_date).date().isoformat()
-    registered = spec["historical_exclusion"]["first_prospective_decision_date"]
-    if target != registered:
-        raise FirstWeekOperationError(f"data preparation only accepts registered date {registered}")
+    root = stage3.resolve_ledger_root(spec)
+    operation = derive_decision_operation_context(
+        spec,
+        root,
+        decision_date=decision_date,
+    )
+    target = operation.decision_date
     data_dir = validate_frozen_data_dir(data_dir)
     prepare_gate = validate_prepare_time(target, now=now)
     apply_gate = validate_apply_window(
         target,
-        FIRST_WEEK_ENTRY_DATE,
+        operation.entry_date,
         now=now,
     )
     git = validate_git_ready(verify_remote=True)
-    root = stage3.resolve_ledger_root(spec)
     with operator_lock(root):
         ledger_before = ledger_closure(root)
-        if ledger_before["record_count"] != 1 or ledger_before["head_type"] != "genesis":
-            raise FirstWeekOperationError("data preparation requires the genesis-only ledger")
+        locked_context = derive_decision_operation_context(
+            spec,
+            root,
+            decision_date=target,
+        )
+        if canonical_json(
+            serialize_decision_operation_context_v1(locked_context)
+        ) != canonical_json(serialize_decision_operation_context_v1(operation)):
+            raise FirstWeekOperationError("decision context changed before raw data preparation")
+        records = stage3.scan_records(root)
+        validate_existing_anchor_chain(
+            spec,
+            root,
+            require_pushed=True,
+        )
+        validate_prior_decision_evidence(
+            spec,
+            root,
+            records,
+        )
+        validate_due_label_evidence(
+            spec,
+            root,
+            records,
+            operation,
+        )
+        validate_global_weekly_label_evidence(
+            spec,
+            root,
+            records,
+            verify_actual_remote=True,
+        )
         raw_result = run_sync(
             argparse.Namespace(
                 data_dir=data_dir,
@@ -1744,12 +2468,22 @@ def prepare_decision_data(
             )
             manifest, reference_path = stage3.fetch_reference_data(
                 spec,
-                FIRST_WEEK_REFERENCE_DATES,
+                operation.reference_dates,
                 root=root,
                 state_manifest_path=state_manifest_path,
             )
             if manifest["manifest_sha256"] != reference_path.stem:
                 raise FirstWeekOperationError("reference fetch returned a non-content-derived manifest")
+            final_operation = derive_decision_operation_context(
+                spec,
+                root,
+                decision_date=target,
+                reference_manifest_path=reference_path,
+            )
+            validate_provisional_final_context(
+                operation,
+                final_operation,
+            )
             report = build_preflight_report(
                 spec,
                 root,
@@ -1759,21 +2493,34 @@ def prepare_decision_data(
                 data_dir=data_dir,
                 verify_remote=True,
                 generated_at=now,
+                context=final_operation,
             )
-            rehearsal = stage3.rehearse_pipeline(
-                spec,
-                root,
-                reference_path,
+            rehearsal = (
+                stage3.rehearse_pipeline(
+                    spec,
+                    root,
+                    reference_path,
+                )
+                if operation.bootstrap
+                else {
+                    "status": "DECISION_PATH_VALIDATED_NEVER_COUNTS",
+                    "prospective_week_count": operation.decision_count,
+                    "efficacy_summary_emitted": False,
+                }
             )
             if (
-                rehearsal.get("status") != "REHEARSAL_VALID_NEVER_COUNTS"
-                or rehearsal.get("prospective_week_count") != 0
+                rehearsal.get("status")
+                not in {
+                    "REHEARSAL_VALID_NEVER_COUNTS",
+                    "DECISION_PATH_VALIDATED_NEVER_COUNTS",
+                }
+                or rehearsal.get("prospective_week_count") != final_operation.decision_count
                 or rehearsal.get("efficacy_summary_emitted") is not False
             ):
                 raise FirstWeekOperationError("final reference rehearsal violated the non-counting gate")
             finish_gate = validate_apply_window(
                 target,
-                FIRST_WEEK_ENTRY_DATE,
+                final_operation.entry_date,
             )
             assert_ledger_unchanged(ledger_before, root)
             report = {
@@ -1789,6 +2536,7 @@ def prepare_decision_data(
                 },
                 "rehearsal": rehearsal,
                 "git": git,
+                "decision_context": serialize_decision_operation_context_v1(final_operation),
                 "formal_ledger_mutated": False,
                 "next_state": "READY_DECISION_WINDOW",
             }
@@ -1797,6 +2545,8 @@ def prepare_decision_data(
     return {
         "status": "DECISION_DATA_PREPARED",
         "decision_date": target,
+        "week_index": final_operation.week_index,
+        "decision_context": serialize_decision_operation_context_v1(final_operation),
         "reference_manifest_path": str(reference_path),
         "reference_manifest_sha256": reference_path.stem,
         "state_manifest_path": str(state_manifest_path),
@@ -1817,6 +2567,7 @@ def validate_preflight_receipt(
     state_manifest_path: Path,
     expected_head: str,
     expected_operator_source_sha256: str | None = None,
+    context: DecisionOperationContext | None = None,
 ) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     if not resolved.is_file() or resolved.stem != sha256_file(resolved):
@@ -1827,6 +2578,23 @@ def validate_preflight_receipt(
         if expected_operator_source_sha256 is not None
         else sha256_file(Path(__file__).resolve())
     )
+    expected_reference_dates = (
+        list(FIRST_WEEK_REFERENCE_DATES)
+        if context is None
+        else list(context.reference_dates)
+    )
+    expected_prospective_count = 0 if context is None else context.decision_count
+    if context is not None:
+        _require_context_evidence(
+            report.get("decision_context"),
+            context,
+            label="preflight receipt",
+        )
+        _require_context_evidence(
+            report.get("reference", {}).get("decision_context"),
+            context,
+            label="preflight reference",
+        )
     if (
         report.get("schema") != "xs_chan_stage3_first_week_preflight_v1"
         or report.get("mode") != "APPLIED_DATA_ONLY_FULL_BRIDGE"
@@ -1837,9 +2605,9 @@ def validate_preflight_receipt(
         or report.get("ledger_after", {}).get("head") != expected_head
         or report.get("reference", {}).get("manifest_sha256") != reference_manifest_path.resolve().stem
         or report.get("state", {}).get("manifest_sha256") != sha256_file(state_manifest_path.resolve())
-        or report.get("rehearsal", {}).get("prospective_week_count") != 0
+        or report.get("rehearsal", {}).get("prospective_week_count") != expected_prospective_count
         or report.get("rehearsal", {}).get("efficacy_summary_emitted") is not False
-        or report.get("reference", {}).get("bridge_dates") != list(FIRST_WEEK_REFERENCE_DATES)
+        or report.get("reference", {}).get("bridge_dates") != expected_reference_dates
         or report.get("reference", {}).get("decision_inputs_only") is not True
         or not re.fullmatch(
             r"[0-9a-f]{64}",
@@ -1912,12 +2680,30 @@ def _validate_final_preflight_report(
     reference_manifest_path: Path,
     state_manifest_path: Path,
     expected_operator_source_sha256: str | None = None,
+    context: DecisionOperationContext | None = None,
 ) -> None:
     operator_source_sha256 = (
         expected_operator_source_sha256
         if expected_operator_source_sha256 is not None
         else sha256_file(Path(__file__).resolve())
     )
+    expected_reference_dates = (
+        list(FIRST_WEEK_REFERENCE_DATES)
+        if context is None
+        else list(context.reference_dates)
+    )
+    expected_prospective_count = 0 if context is None else context.decision_count
+    if context is not None:
+        _require_context_evidence(
+            report.get("decision_context"),
+            context,
+            label="final pre-append report",
+        )
+        _require_context_evidence(
+            report.get("reference", {}).get("decision_context"),
+            context,
+            label="final pre-append reference",
+        )
     if (
         report.get("schema") != "xs_chan_stage3_first_week_preflight_v1"
         or report.get("mode") != "READ_ONLY_FULL_BRIDGE"
@@ -1928,9 +2714,9 @@ def _validate_final_preflight_report(
         or report.get("ledger_after", {}).get("head") != expected_head
         or report.get("reference", {}).get("manifest_sha256") != reference_manifest_path.resolve().stem
         or report.get("state", {}).get("manifest_sha256") != sha256_file(state_manifest_path.resolve())
-        or report.get("reference", {}).get("bridge_dates") != list(FIRST_WEEK_REFERENCE_DATES)
+        or report.get("reference", {}).get("bridge_dates") != expected_reference_dates
         or report.get("reference", {}).get("decision_inputs_only") is not True
-        or report.get("reference", {}).get("prospective_week_count") != 0
+        or report.get("reference", {}).get("prospective_week_count") != expected_prospective_count
         or not re.fullmatch(
             r"[0-9a-f]{64}",
             str(report.get("reference", {}).get("bridge_path_sha256", "")),
@@ -1950,9 +2736,20 @@ def _expected_append_authorization(
     final_preflight_report: Mapping[str, Any],
     final_preflight_report_path: Path,
     operator_source_sha256: str | None = None,
+    context: DecisionOperationContext | None = None,
 ) -> dict[str, Any]:
     payload = record["payload"]
     expected_head = str(record["previous_hash"])
+    if context is not None and (
+        expected_head != context.expected_head
+        or int(payload.get("week_index", -1)) != context.week_index
+        or str(payload.get("decision_dt")) != context.decision_date
+        or str(payload.get("entry_dt")) != context.entry_date
+        or str(payload.get("exit_dt")) != context.exit_date
+        or payload.get("previous_decision_record_hash")
+        != context.previous_decision_record_hash
+    ):
+        raise FirstWeekOperationError("anticipated decision record differs from its derived operation context")
     expected_operator_sha = (
         operator_source_sha256 if operator_source_sha256 is not None else sha256_file(Path(__file__).resolve())
     )
@@ -1962,6 +2759,7 @@ def _expected_append_authorization(
         state_manifest_path=state_manifest_path,
         expected_head=expected_head,
         expected_operator_source_sha256=expected_operator_sha,
+        context=context,
     )
     _validate_final_preflight_report(
         final_preflight_report,
@@ -1969,6 +2767,7 @@ def _expected_append_authorization(
         reference_manifest_path=reference_manifest_path,
         state_manifest_path=state_manifest_path,
         expected_operator_source_sha256=expected_operator_sha,
+        context=context,
     )
     recorded_at = stage3._parse_utc(str(record["recorded_at_utc"]))
     time_gate = validate_apply_window(
@@ -2005,7 +2804,7 @@ def _expected_append_authorization(
         final_preflight_report_path,
         label="final pre-append report",
     )
-    return {
+    authorization = {
         "schema": AUTHORIZATION_SCHEMA,
         "study_id": spec["study_id"],
         "study_identity": stage3.study_identity(spec),
@@ -2039,6 +2838,9 @@ def _expected_append_authorization(
         "git": dict(git),
         "time_gate": _json_safe(time_gate),
     }
+    if context is not None:
+        authorization["decision_context"] = serialize_decision_operation_context_v1(context)
+    return authorization
 
 
 def store_append_authorization(
@@ -2051,6 +2853,7 @@ def store_append_authorization(
     preflight_report_path: Path,
     final_preflight_report: Mapping[str, Any],
     fresh_git: Mapping[str, Any],
+    context: DecisionOperationContext | None = None,
 ) -> tuple[dict[str, Any], str, Path]:
     """Persist the exact authorization before the immutable record write."""
 
@@ -2094,6 +2897,7 @@ def store_append_authorization(
         preflight_report_path=preflight_report_path,
         final_preflight_report=final_preflight_report,
         final_preflight_report_path=final_path,
+        context=context,
     )
     digest, path = stage3._store_canonical_object(
         root,
@@ -2136,7 +2940,9 @@ def load_append_authorization(
         raise FirstWeekOperationError("append authorization has an invalid operator source hash")
     if require_current_operator:
         if authorized_operator_sha != sha256_file(Path(__file__).resolve()):
-            raise FirstWeekOperationError("current first-week operator bytes differ from the pre-record authorization")
+            raise FirstWeekOperationError(
+                "current Stage 3 decision operator bytes differ from the pre-record authorization"
+            )
     else:
         authorized_git = authorization.get("git")
         if not isinstance(authorized_git, Mapping):
@@ -2164,6 +2970,19 @@ def load_append_authorization(
     final_preflight = _read_json(final_preflight_path)
     if canonical_json(final_preflight) != final_preflight_path.read_bytes():
         raise FirstWeekOperationError("authorized final preflight bytes are not canonical")
+    context: DecisionOperationContext | None = None
+    if "decision_context" in authorization:
+        context = decision_operation_context_for_record(
+            spec,
+            root,
+            record,
+            reference_manifest_path=reference_path,
+        )
+        _require_context_evidence(
+            authorization.get("decision_context"),
+            context,
+            label="append authorization",
+        )
     expected = _expected_append_authorization(
         spec,
         root,
@@ -2174,6 +2993,7 @@ def load_append_authorization(
         final_preflight_report=final_preflight,
         final_preflight_report_path=final_preflight_path,
         operator_source_sha256=authorized_operator_sha,
+        context=context,
     )
     if canonical_json(authorization) != canonical_json(expected):
         raise FirstWeekOperationError("append authorization does not exactly bind the decision record and evidence")
@@ -2190,14 +3010,21 @@ def _authorization_sidecar_path(record: Mapping[str, Any]) -> Path:
 
 def validate_authorization_sidecar_inventory(
     root: Path,
-    records: Sequence[stage3.LedgerRecord],
+    records: Sequence[stage3.LedgerRecord | Mapping[str, Any]],
     *,
     allow_missing_current_authorized: bool = False,
+    ignored_sidecar_names: set[str] | None = None,
 ) -> None:
     """Require sidecars to equal records that have a durable authorization."""
 
+    rows = [
+        record.data if isinstance(record, stage3.LedgerRecord) else record
+        for record in records
+    ]
     record_by_hash = {
-        str(record.data["record_hash"]): record for record in records if record.data["record_type"] == "decision_freeze"
+        str(record["record_hash"]): record
+        for record in rows
+        if record["record_type"] == "decision_freeze"
     }
     authorized_record_hashes: set[str] = set()
     authorization_directory = root / "objects" / APPEND_AUTHORIZATION_CATEGORY
@@ -2220,7 +3047,7 @@ def validate_authorization_sidecar_inventory(
 
     directory = stage3.SCRIPTS_DIR / AUTHORIZATION_SIDECAR_DIR_NAME
     expected = {
-        f"{int(record.data['sequence']):06d}_{record.data['record_hash']}.json"
+        f"{int(record['sequence']):06d}_{record['record_hash']}.json"
         for record_hash, record in record_by_hash.items()
         if record_hash in authorized_record_hashes
     }
@@ -2232,9 +3059,19 @@ def validate_authorization_sidecar_inventory(
             if path.is_symlink() or not path.is_file() or path.suffix != ".json":
                 raise FirstWeekOperationError(f"unexpected tracked authorization sidecar: {path}")
             actual.add(path.name)
+    ignored = set() if ignored_sidecar_names is None else set(ignored_sidecar_names)
+    if ignored - actual:
+        raise FirstWeekOperationError(
+            f"requested ignored decision sidecars do not exist: {sorted(ignored - actual)}"
+        )
+    if ignored & expected:
+        raise FirstWeekOperationError(
+            f"cannot ignore required decision sidecars: {sorted(ignored & expected)}"
+        )
+    actual -= ignored
     allowed_inventories = {frozenset(expected)}
-    if allow_missing_current_authorized and records:
-        current = records[-1].data
+    if allow_missing_current_authorized and rows:
+        current = rows[-1]
         if current["record_hash"] in authorized_record_hashes:
             current_name = f"{int(current['sequence']):06d}_{current['record_hash']}.json"
             allowed_inventories.add(frozenset(expected - {current_name}))
@@ -2379,13 +3216,23 @@ def validate_authorized_anchor_pair(
     record: Mapping[str, Any],
     *,
     require_pushed: bool,
+    verify_remote: bool = False,
+    inventory_records: Sequence[stage3.LedgerRecord | Mapping[str, Any]] | None = None,
+    ignored_sidecar_names: set[str] | None = None,
+    validate_inventory: bool = True,
 ) -> dict[str, Any]:
     """Require the decision anchor and operator authorization as one commit."""
 
-    validate_authorization_sidecar_inventory(
-        root,
-        stage3.scan_records(root),
-    )
+    if validate_inventory:
+        validate_authorization_sidecar_inventory(
+            root,
+            (
+                stage3.scan_records(root)
+                if inventory_records is None
+                else inventory_records
+            ),
+            ignored_sidecar_names=ignored_sidecar_names,
+        )
     authorization = validate_authorization_sidecar(
         spec,
         root,
@@ -2398,6 +3245,7 @@ def validate_authorized_anchor_pair(
         record,
         require_pushed=require_pushed,
     )
+    remote: dict[str, Any] | None = None
     if require_pushed:
         if authorization["commit"] != anchor["commit"]:
             raise FirstWeekOperationError("decision anchor and operator authorization must share one commit")
@@ -2441,10 +3289,202 @@ def validate_authorized_anchor_pair(
             raise FirstWeekOperationError(
                 "decision evidence commit must contain exactly the matching anchor and authorization sidecar"
             )
+        if verify_remote:
+            remote = validate_actual_remote_branch(
+                repo_root=stage3.REPO_ROOT,
+            )
+            try:
+                _git_output(
+                    stage3.REPO_ROOT,
+                    "merge-base",
+                    "--is-ancestor",
+                    str(anchor["commit"]),
+                    str(remote["remote_head"]),
+                )
+            except FirstWeekOperationError as exc:
+                raise FirstWeekOperationError(
+                    "decision evidence commit is not contained in the freshly verified actual remote head"
+                ) from exc
     return {
         "anchor": anchor,
         "authorization": authorization,
         "commit": anchor["commit"],
+        "remote": remote,
+    }
+
+
+def validate_recovery_evidence_commit(
+    spec: Mapping[str, Any],
+    root: Path,
+    record: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    *,
+    repo_root: Path = stage3.REPO_ROOT,
+) -> dict[str, Any]:
+    """Validate a clean local evidence commit made directly after authorization.
+
+    This is the one recoverable crash window after the atomic evidence files
+    were committed but before the push (or before the local upstream tracking
+    ref observed an already completed push).
+    """
+
+    authorized_git = authorization.get("git")
+    if not isinstance(authorized_git, Mapping):
+        raise FirstWeekOperationError("append authorization has no Git evidence")
+    authorized_head = str(authorized_git.get("head", ""))
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    if head == authorized_head:
+        raise FirstWeekOperationError("recovery evidence candidate is still at the authorized Git head")
+
+    dirty = _git_output(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if dirty:
+        raise FirstWeekOperationError("recovery evidence commit requires a completely clean worktree")
+
+    remote = validate_actual_remote_branch(repo_root=repo_root)
+    authorized_binding = {
+        "branch": authorized_git.get("branch"),
+        "upstream": authorized_git.get("upstream"),
+        "remote_fetch_url": authorized_git.get("remote_fetch_url"),
+        "remote_push_url": authorized_git.get("remote_push_url"),
+    }
+    current_binding = {key: remote[key] for key in authorized_binding}
+    if current_binding != authorized_binding:
+        raise FirstWeekOperationError(
+            "recovery evidence commit branch, upstream or URLs differ from the authorization"
+        )
+    if (
+        authorized_git.get("upstream_head") != authorized_head
+        or authorized_git.get("remote_head") != authorized_head
+        or authorized_git.get("remote_verified") is not True
+        or authorized_git.get("worktree_clean") is not True
+    ):
+        raise FirstWeekOperationError("append authorization did not bind one clean pushed Git head")
+
+    commit_line = _git_output(
+        repo_root,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        head,
+    ).split()
+    if len(commit_line) != 2 or commit_line[0] != head or commit_line[1] != authorized_head:
+        raise FirstWeekOperationError(
+            "recovery evidence commit must be the single-parent child of the authorized Git head"
+        )
+
+    pair = validate_authorized_anchor_pair(
+        spec,
+        root,
+        record,
+        require_pushed=False,
+    )
+    paths = (
+        Path(str(pair["anchor"]["path"])).resolve(),
+        Path(str(pair["authorization"]["path"])).resolve(),
+    )
+    expected_paths = {
+        path.relative_to(repo_root.resolve()).as_posix()
+        for path in paths
+    }
+    changed_paths = set(
+        filter(
+            None,
+            _git_output(
+                repo_root,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                head,
+            ).splitlines(),
+        )
+    )
+    if changed_paths != expected_paths:
+        raise FirstWeekOperationError(
+            "recovery evidence commit must change exactly the matching anchor and authorization sidecar"
+        )
+    for path in paths:
+        relative_path = path.relative_to(repo_root.resolve()).as_posix()
+        expected_bytes = path.read_bytes()
+        committed_bytes = _git_file_bytes_at_commit(
+            repo_root,
+            head,
+            relative_path,
+        )
+        if committed_bytes != expected_bytes:
+            raise FirstWeekOperationError(
+                f"recovery evidence commit bytes differ from the expected evidence: {relative_path}"
+            )
+
+    deadline = _entry_open(str(record["payload"]["entry_dt"]))
+    try:
+        committed_at = datetime.fromisoformat(
+            _git_output(
+                repo_root,
+                "show",
+                "-s",
+                "--format=%cI",
+                head,
+            )
+        )
+    except ValueError as exc:
+        raise FirstWeekOperationError("recovery evidence commit has an invalid commit timestamp") from exc
+    if committed_at >= deadline:
+        raise FirstWeekOperationError(
+            "recovery evidence commit must be strictly before entry open: "
+            f"{committed_at.isoformat()} >= {deadline.isoformat()}"
+        )
+    if (
+        _git_output(repo_root, "rev-parse", "HEAD") != head
+        or _git_output(
+            repo_root,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+    ):
+        raise FirstWeekOperationError(
+            "recovery evidence commit or worktree changed during validation"
+        )
+
+    remote_head = str(remote["remote_head"])
+    if remote_head == authorized_head:
+        remote_contains_commit = False
+    elif remote_head == head:
+        remote_contains_commit = True
+    else:
+        try:
+            _git_output(
+                repo_root,
+                "merge-base",
+                "--is-ancestor",
+                head,
+                remote_head,
+            )
+        except FirstWeekOperationError as exc:
+            raise FirstWeekOperationError(
+                "actual remote contains neither the authorized head nor the exact evidence commit"
+            ) from exc
+        remote_contains_commit = True
+    return {
+        "commit": head,
+        "authorized_head": authorized_head,
+        "committed_at": committed_at,
+        "deadline": deadline,
+        "pair": pair,
+        "git": {
+            **remote,
+            "head": head,
+            "worktree_clean": True,
+            "remote_contains_commit": remote_contains_commit,
+        },
+        "remote_contains_commit": remote_contains_commit,
     }
 
 
@@ -2459,6 +3499,7 @@ def append_first_decision_with_final_guards(
     expected_head: str,
     expected_decision_path_sha256: str,
     final_preflight_report: Mapping[str, Any],
+    context: DecisionOperationContext | None = None,
 ) -> tuple[
     stage3.LedgerRecord,
     dict[str, Any],
@@ -2469,6 +3510,20 @@ def append_first_decision_with_final_guards(
 ]:
     """Append under one ledger lock with a fresh final clock and raw check."""
 
+    operation = context
+    if operation is not None:
+        current_context = derive_decision_operation_context(
+            spec,
+            root,
+            decision_date=decision_date,
+            reference_manifest_path=reference_manifest_path,
+        )
+        if canonical_json(
+            serialize_decision_operation_context_v1(current_context)
+        ) != canonical_json(serialize_decision_operation_context_v1(operation)):
+            raise FirstWeekOperationError("guarded append received a stale decision context")
+        if expected_head != operation.expected_head:
+            raise FirstWeekOperationError("guarded append expected head differs from its decision context")
     manifest = stage3.read_json(reference_manifest_path)
     local_inputs = manifest["local_inputs"]
     closure = stage3._load_content_object(
@@ -2513,11 +3568,41 @@ def append_first_decision_with_final_guards(
         records = stage3.scan_records(root)
         if not records or records[-1].data["record_hash"] != expected_head:
             raise FirstWeekOperationError("ledger head changed before the guarded append")
+        if operation is not None:
+            locked_context = derive_decision_operation_context(
+                spec,
+                root,
+                decision_date=decision_date,
+                reference_manifest_path=reference_manifest_path,
+                records=records,
+            )
+            if canonical_json(
+                serialize_decision_operation_context_v1(locked_context)
+            ) != canonical_json(serialize_decision_operation_context_v1(operation)):
+                raise FirstWeekOperationError("decision context changed inside the guarded append lock")
         validate_authorization_sidecar_inventory(root, records)
         validate_existing_anchor_chain(
             spec,
             root,
             require_pushed=True,
+        )
+        validate_prior_decision_evidence(
+            spec,
+            root,
+            records,
+        )
+        if operation is not None:
+            validate_due_label_evidence(
+                spec,
+                root,
+                records,
+                operation,
+            )
+        validate_global_weekly_label_evidence(
+            spec,
+            root,
+            records,
+            verify_actual_remote=True,
         )
 
         def guarded_append(
@@ -2557,6 +3642,17 @@ def append_first_decision_with_final_guards(
                 or payload.get("decision_path_sha256") != expected_decision_path_sha256
                 or payload.get("reference_manifest_sha256") != reference_manifest_path.stem
                 or ledger_id != current[0].data["ledger_id"]
+                or (
+                    operation is not None
+                    and (
+                        int(payload.get("week_index", -1)) != operation.week_index
+                        or str(payload.get("decision_dt")) != operation.decision_date
+                        or str(payload.get("entry_dt")) != operation.entry_date
+                        or str(payload.get("exit_dt")) != operation.exit_date
+                        or payload.get("previous_decision_record_hash")
+                        != operation.previous_decision_record_hash
+                    )
+                )
             ):
                 raise FirstWeekOperationError("guarded decision append target, head or preflight path changed")
             fresh_git = validate_git_ready(verify_remote=True)
@@ -2589,7 +3685,14 @@ def append_first_decision_with_final_guards(
                 preflight_report_path=preflight_report_path,
                 final_preflight_report=final_preflight_report,
                 fresh_git=fresh_git,
+                context=operation,
             )
+            if operation is not None:
+                stage3.validate_record_semantics(
+                    spec,
+                    [*current, anticipated],
+                    root=root,
+                )
             appended = original_append(
                 append_root,
                 record_type,
@@ -2707,12 +3810,12 @@ def recover_first_decision_anchor(
     data_dir: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Recover only a record exactly anticipated by a durable locked intent."""
+    """Recover only the current-head decision anticipated by a locked intent."""
 
     with operator_lock(root), cache_lock(data_dir), stage3._exclusive_lock(root):
         records = stage3.scan_records(root)
         if (
-            len(records) != 2
+            len(records) < 2
             or records[-1].data["record_hash"] != record_hash
             or records[-1].data["record_type"] != "decision_freeze"
             or records[-1].data["payload"]["decision_dt"] != decision_date
@@ -2732,6 +3835,42 @@ def recover_first_decision_anchor(
             records[-1].data,
             require_current_operator=False,
         )
+        operation: DecisionOperationContext | None = None
+        if "decision_context" in authorization:
+            operation = decision_operation_context_for_record(
+                spec,
+                root,
+                records[-1].data,
+                reference_manifest_path=reference_manifest_path,
+                records=records,
+            )
+            _require_context_evidence(
+                authorization.get("decision_context"),
+                operation,
+                label="recovery authorization",
+            )
+        decision = records[-1].data
+        prefix_pair_evidence = validate_global_weekly_label_evidence(
+            spec,
+            root,
+            records[:-1],
+            verify_actual_remote=True,
+            ignored_decision_sidecar_names=(
+                {_authorization_sidecar_path(decision).name}
+                if sidecar_already_exists
+                else None
+            ),
+        )
+        import xs_chan_stage3_weekly as weekly
+
+        successor_edge = weekly.validate_successor_authorized_head(
+            spec,
+            root,
+            records[:-1],
+            decision,
+            prefix_pair_evidence=prefix_pair_evidence,
+            require_pushed_prefix=True,
+        )
         if (
             Path(str(authorization["state_manifest_path"])).resolve() != state_manifest_path.expanduser().resolve()
             or (root / str(authorization["reference_manifest_object"])).resolve()
@@ -2741,13 +3880,13 @@ def recover_first_decision_anchor(
         ):
             raise FirstWeekOperationError("recovery inputs differ from the pre-record authorization")
 
-        decision = records[-1].data
         try:
             pushed_pair = validate_authorized_anchor_pair(
                 spec,
                 root,
                 decision,
                 require_pushed=True,
+                verify_remote=True,
             )
         except (FirstWeekOperationError, Stage3Error):
             pushed_pair = None
@@ -2767,16 +3906,84 @@ def recover_first_decision_anchor(
                 "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
                 "authorization_sidecar": _read_json(authorization_sidecar_path),
                 "evidence_commit": pushed_pair["commit"],
+                "successor_edge": successor_edge,
                 "current_git": current_git,
                 "formal_ledger_mutated": False,
                 "next_state": "DECISION_AUTHORIZED_WAIT_EXIT",
                 "required_action": "wait for the registered exit label window",
             }
 
-        initial_gate = validate_recovery_deadline(
-            FIRST_WEEK_ENTRY_DATE,
-            now=now,
-        )
+        entry_date = str(decision["payload"]["entry_dt"])
+        evidence_commit: dict[str, Any] | None = None
+        authorized_git = authorization.get("git")
+        if (
+            anchor_already_exists
+            and sidecar_already_exists
+            and isinstance(authorized_git, Mapping)
+            and _git_output(stage3.REPO_ROOT, "rev-parse", "HEAD")
+            != str(authorized_git.get("head", ""))
+        ):
+            evidence_commit = validate_recovery_evidence_commit(
+                spec,
+                root,
+                decision,
+                authorization,
+            )
+            evidence_pair = evidence_commit["pair"]
+            anchor_path = Path(str(evidence_pair["anchor"]["path"]))
+            authorization_sidecar_path = Path(str(evidence_pair["authorization"]["path"]))
+            if evidence_commit["remote_contains_commit"]:
+                return {
+                    "status": "DECISION_EVIDENCE_ALREADY_COMMITTED",
+                    "record_hash": record_hash,
+                    "anchor_path": str(anchor_path),
+                    "anchor_sha256": sha256_file(anchor_path),
+                    "anchor": _read_json(anchor_path),
+                    "authorization_path": str(authorization_path),
+                    "authorization_sha256": authorization_sha,
+                    "authorization_sidecar_path": str(authorization_sidecar_path),
+                    "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
+                    "authorization_sidecar": _read_json(authorization_sidecar_path),
+                    "evidence_commit": evidence_commit["commit"],
+                    "successor_edge": successor_edge,
+                    "current_git": evidence_commit["git"],
+                    "formal_ledger_mutated": False,
+                    "next_state": "DECISION_AUTHORIZED_WAIT_EXIT",
+                    "required_action": "wait for the registered exit label window",
+                }
+        try:
+            initial_gate = validate_recovery_deadline(entry_date, now=now)
+        except FirstWeekOperationError as exc:
+            if evidence_commit is not None:
+                raise FirstWeekOperationError(
+                    "decision evidence commit missed its push deadline; "
+                    "the actual remote still lacks the exact pair commit"
+                ) from exc
+            raise
+        if evidence_commit is not None:
+            anchor_path = Path(str(evidence_commit["pair"]["anchor"]["path"]))
+            authorization_sidecar_path = Path(
+                str(evidence_commit["pair"]["authorization"]["path"])
+            )
+            return {
+                "status": "EVIDENCE_COMMIT_AWAITING_PUSH",
+                "record_hash": record_hash,
+                "anchor_path": str(anchor_path),
+                "anchor_sha256": sha256_file(anchor_path),
+                "anchor": _read_json(anchor_path),
+                "authorization_path": str(authorization_path),
+                "authorization_sha256": authorization_sha,
+                "authorization_sidecar_path": str(authorization_sidecar_path),
+                "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
+                "authorization_sidecar": _read_json(authorization_sidecar_path),
+                "evidence_commit": evidence_commit["commit"],
+                "successor_edge": successor_edge,
+                "current_git": evidence_commit["git"],
+                "initial_time_gate": initial_gate,
+                "formal_ledger_mutated": False,
+                "next_state": "DECISION_EVIDENCE_PUSH_PENDING",
+                "required_action": "push the existing exact evidence commit without rewriting it",
+            }
         authorization, authorization_sha, authorization_path = load_append_authorization(
             spec,
             root,
@@ -2816,6 +4023,7 @@ def recover_first_decision_anchor(
             decision_date,
             state_summary=state,
             raw_summary=raw,
+            context=operation,
         )
         if (
             authorization["raw_audit_sha256"] != raw["audit_sha256"]
@@ -2833,7 +4041,7 @@ def recover_first_decision_anchor(
             authorization,
             allowed_dirty_paths=allowed_dirty_paths,
         )
-        current_gate = validate_recovery_deadline(FIRST_WEEK_ENTRY_DATE)
+        current_gate = validate_recovery_deadline(entry_date)
         with atomic_stage3_writes(root):
             authorization_sidecar, authorization_sidecar_path = export_authorization_sidecar(
                 spec,
@@ -2855,7 +4063,7 @@ def recover_first_decision_anchor(
                 root,
                 require_pushed=False,
             )
-        finished_gate = validate_recovery_deadline(FIRST_WEEK_ENTRY_DATE)
+        finished_gate = validate_recovery_deadline(entry_date)
     return {
         "status": (
             "AUTHORIZED_DECISION_EVIDENCE_REVALIDATED"
@@ -2863,6 +4071,7 @@ def recover_first_decision_anchor(
             else "AUTHORIZED_DECISION_ANCHOR_RECOVERED"
         ),
         "record_hash": record_hash,
+        "decision_context": None if operation is None else serialize_decision_operation_context_v1(operation),
         "anchor_path": str(anchor_path),
         "anchor_sha256": sha256_file(anchor_path),
         "anchor": anchor,
@@ -2871,6 +4080,7 @@ def recover_first_decision_anchor(
         "authorization_sidecar_path": str(authorization_sidecar_path),
         "authorization_sidecar_sha256": sha256_file(authorization_sidecar_path),
         "authorization_sidecar": authorization_sidecar,
+        "successor_edge": successor_edge,
         "recovery_git": recovery_git,
         "final_recovery_git": final_recovery_git,
         "initial_time_gate": initial_gate,
@@ -2884,7 +4094,7 @@ def recover_first_decision_anchor(
 
 def freeze_first_decision(
     *,
-    decision_date: str,
+    decision_date: str | None,
     reference_manifest_path: Path,
     state_manifest_path: Path,
     preflight_report_path: Path,
@@ -2892,18 +4102,21 @@ def freeze_first_decision(
     data_dir: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Run the only formal first-decision append and export its anchor."""
+    """Run the uniquely derived formal decision append and export its anchor."""
 
     spec = stage3.load_and_validate_spec()
-    target = pd.Timestamp(decision_date).date().isoformat()
-    if target != spec["historical_exclusion"]["first_prospective_decision_date"]:
-        raise FirstWeekOperationError("formal first-decision date differs from the registered date")
+    target = (
+        None
+        if decision_date is None
+        else pd.Timestamp(decision_date).date().isoformat()
+    )
     data_dir = validate_frozen_data_dir(data_dir)
     root = stage3.resolve_ledger_root(spec)
     initial_records = stage3.scan_records(root)
     if (
-        len(initial_records) == 2
+        len(initial_records) >= 2
         and initial_records[-1].data["record_type"] == "decision_freeze"
+        and target is not None
         and initial_records[-1].data["payload"]["decision_dt"] == target
         and initial_records[-1].data["previous_hash"] == expected_head
     ):
@@ -2920,9 +4133,19 @@ def freeze_first_decision(
             now=now,
         )
 
+    operation = derive_decision_operation_context(
+        spec,
+        root,
+        decision_date=target,
+        reference_manifest_path=reference_manifest_path,
+        records=initial_records,
+    )
+    target = operation.decision_date
+    if expected_head != operation.expected_head:
+        raise FirstWeekOperationError("formal decision expected head differs from its derived context")
     time_gate = validate_apply_window(
         target,
-        FIRST_WEEK_ENTRY_DATE,
+        operation.entry_date,
         now=now,
     )
     git = validate_git_ready(verify_remote=True)
@@ -2933,6 +4156,7 @@ def freeze_first_decision(
             reference_manifest_path=reference_manifest_path,
             state_manifest_path=state_manifest_path,
             expected_head=expected_head,
+            context=operation,
         )
         current_report = build_preflight_report(
             spec,
@@ -2943,6 +4167,7 @@ def freeze_first_decision(
             data_dir=data_dir,
             verify_remote=True,
             generated_at=now,
+            context=operation,
         )
         if current_report["ledger_before"]["head"] != expected_head:
             raise FirstWeekOperationError("preflight expected head differs immediately before append")
@@ -2966,6 +4191,7 @@ def freeze_first_decision(
             expected_head=expected_head,
             expected_decision_path_sha256=expected_path_sha,
             final_preflight_report=current_report,
+            context=operation,
         )
         finished_at = _as_utc()
         entry_open = _entry_open(record.data["payload"]["entry_dt"]).astimezone(UTC)
@@ -2977,6 +4203,8 @@ def freeze_first_decision(
     return {
         "status": "DECISION_FROZEN_ANCHOR_EXPORTED",
         "decision_date": target,
+        "week_index": operation.week_index,
+        "decision_context": serialize_decision_operation_context_v1(operation),
         "record_hash": record.data["record_hash"],
         "recorded_at_utc": record.data["recorded_at_utc"],
         "anchor_path": str(anchor_path),
@@ -3002,7 +4230,7 @@ def freeze_first_decision(
 
 def status_snapshot(
     *,
-    decision_date: str,
+    decision_date: str | None,
     data_dir: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -3012,10 +4240,6 @@ def status_snapshot(
     spec = stage3.load_and_validate_spec()
     root = stage3.resolve_ledger_root(spec)
     current = _as_utc(now)
-    decision_close = _decision_close(decision_date).astimezone(UTC)
-    daily_release = _daily_release(decision_date).astimezone(UTC)
-    entry_open = _entry_open(FIRST_WEEK_ENTRY_DATE).astimezone(UTC)
-    latest_safe_start = entry_open - ANCHOR_PUSH_RESERVE
     records = stage3.scan_records(root)
     stage3.validate_record_semantics(spec, records, root=root)
     validate_authorization_sidecar_inventory(
@@ -3025,7 +4249,88 @@ def status_snapshot(
     )
     blinded = stage3.status_report(spec, records, root=root)
     inventory = inspect_inventory(data_dir.expanduser().resolve())
-    target = pd.Timestamp(decision_date).strftime("%Y%m%d")
+
+    requested = (
+        None
+        if decision_date is None
+        else _normalized_date(decision_date, label="status decision date")
+    )
+    all_decisions = [
+        record
+        for record in records
+        if record.data["record_type"] == "decision_freeze"
+    ]
+    selected = (
+        []
+        if requested is None
+        else [
+            record
+            for record in all_decisions
+            if record.data["payload"]["decision_dt"] == requested
+        ]
+    )
+    operation: DecisionOperationContext | None = None
+    window_complete = (
+        requested is None
+        and len(all_decisions) == int(spec["accrual"]["window_weeks"])
+    )
+    if window_complete:
+        selected = [all_decisions[-1]]
+        target_date = str(selected[0].data["payload"]["decision_dt"])
+        try:
+            operation = decision_operation_context_for_record(
+                spec,
+                root,
+                selected[0].data,
+                records=records,
+            )
+        except (FirstWeekOperationError, Stage3Error, KeyError, TypeError, ValueError, OSError):
+            operation = None
+    elif requested is None:
+        operation = derive_decision_operation_context(
+            spec,
+            root,
+            records=records,
+        )
+        target_date = operation.decision_date
+    elif selected:
+        target_date = requested
+        try:
+            operation = decision_operation_context_for_record(
+                spec,
+                root,
+                selected[0].data,
+                records=records,
+            )
+        except (FirstWeekOperationError, Stage3Error, KeyError, TypeError, ValueError, OSError):
+            operation = None
+    else:
+        operation = derive_decision_operation_context(
+            spec,
+            root,
+            decision_date=requested,
+            records=records,
+        )
+        target_date = operation.decision_date
+
+    if operation is not None:
+        entry_date = operation.entry_date
+        exit_date = operation.exit_date
+        week_index = operation.week_index
+    elif selected:
+        entry_date = str(selected[0].data["payload"]["entry_dt"])
+        exit_date = str(
+            selected[0].data["payload"].get("exit_dt", FIRST_WEEK_EXIT_DATE)
+        )
+        week_index = int(selected[0].data["payload"].get("week_index", 1))
+    else:
+        raise FirstWeekOperationError("status cannot derive the requested decision operation")
+
+    decision_close = _decision_close(target_date).astimezone(UTC)
+    daily_release = _daily_release(target_date).astimezone(UTC)
+    entry_open = _entry_open(entry_date).astimezone(UTC)
+    latest_safe_start = entry_open - ANCHOR_PUSH_RESERVE
+    target = pd.Timestamp(target_date).strftime("%Y%m%d")
 
     git: dict[str, Any]
     try:
@@ -3037,7 +4342,6 @@ def status_snapshot(
     except FirstWeekOperationError as exc:
         git = {"ready": False, "reason": str(exc)}
 
-    target_date = pd.Timestamp(decision_date).date().isoformat()
     decisions = [
         record
         for record in records
@@ -3055,10 +4359,256 @@ def status_snapshot(
             )
         ]
     )
+    completed_label_decisions = {
+        str(record.data["payload"]["decision_record_hash"])
+        for record in records
+        if record.data["record_type"] == "label_completion"
+    }
+    outstanding_label_count = sum(
+        record.data["record_hash"] not in completed_label_decisions
+        for record in all_decisions
+    )
+    current_decision = (
+        records[-1].data
+        if records and records[-1].data["record_type"] == "decision_freeze"
+        else None
+    )
+    pair_audit_records = records if current_decision is None else records[:-1]
+    current_sidecar_path = (
+        None
+        if current_decision is None
+        else _authorization_sidecar_path(current_decision)
+    )
+    ignored_current_sidecar_names = (
+        {current_sidecar_path.name}
+        if current_sidecar_path is not None and current_sidecar_path.is_file()
+        else None
+    )
+    complete_pair_chain_valid = False
+    prefix_pair_chain_valid = False
+    current_authorization_available: bool | None = None
+    current_successor_edge_valid: bool | None = None
+    current_successor_edge: dict[str, Any] | None = None
+    current_edge_reason: str | None = None
+    try:
+        complete_pair_evidence = validate_global_weekly_label_evidence(
+            spec,
+            root,
+            records,
+            verify_actual_remote=False,
+        )
+    except (
+        FirstWeekOperationError,
+        Stage3Error,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as complete_exc:
+        if current_decision is None:
+            global_label_evidence: dict[str, Any] = {
+                "scope": "LOCAL_TRACKING_ONLY_NO_ACTUAL_REMOTE",
+                "valid": False,
+                "complete_chain_valid": False,
+                "reason": str(complete_exc),
+                "pair_evidence": [],
+                "audited_record_count": len(records),
+                "excluded_current_decision_hash": None,
+            }
+        else:
+            try:
+                prefix_pair_evidence = validate_global_weekly_label_evidence(
+                    spec,
+                    root,
+                    pair_audit_records,
+                    verify_actual_remote=False,
+                    ignored_decision_sidecar_names=ignored_current_sidecar_names,
+                )
+            except (
+                FirstWeekOperationError,
+                Stage3Error,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as prefix_exc:
+                global_label_evidence = {
+                    "scope": "LOCAL_TRACKING_ONLY_NO_ACTUAL_REMOTE",
+                    "valid": False,
+                    "complete_chain_valid": False,
+                    "reason": str(prefix_exc),
+                    "full_chain_reason": str(complete_exc),
+                    "pair_evidence": [],
+                    "audited_record_count": len(pair_audit_records),
+                    "excluded_current_decision_hash": current_decision["record_hash"],
+                }
+            else:
+                prefix_pair_chain_valid = True
+                try:
+                    load_append_authorization(
+                        spec,
+                        root,
+                        current_decision,
+                        require_current_operator=False,
+                    )
+                except (
+                    FirstWeekOperationError,
+                    Stage3Error,
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ):
+                    current_authorization_available = False
+                else:
+                    current_authorization_available = True
+                    try:
+                        import xs_chan_stage3_weekly as weekly
+
+                        current_successor_edge = (
+                            weekly.validate_successor_authorized_head(
+                                spec,
+                                root,
+                                pair_audit_records,
+                                current_decision,
+                                prefix_pair_evidence=prefix_pair_evidence,
+                                require_pushed_prefix=True,
+                            )
+                        )
+                    except (
+                        FirstWeekOperationError,
+                        Stage3Error,
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ) as edge_exc:
+                        current_successor_edge_valid = False
+                        current_edge_reason = str(edge_exc)
+                    else:
+                        current_successor_edge_valid = True
+                        current_edge_reason = None
+                global_label_evidence = {
+                    "scope": "LOCAL_TRACKING_ONLY_NO_ACTUAL_REMOTE",
+                    "valid": current_successor_edge_valid is not False,
+                    "complete_chain_valid": False,
+                    "full_chain_reason": str(complete_exc),
+                    "pair_evidence": prefix_pair_evidence,
+                    "successor_edge": current_successor_edge,
+                    "successor_edge_valid": current_successor_edge_valid,
+                    "successor_edge_reason": (
+                        current_edge_reason
+                        if current_authorization_available
+                        and current_successor_edge_valid is False
+                        else None
+                    ),
+                    "audited_record_count": len(pair_audit_records),
+                    "excluded_current_decision_hash": current_decision["record_hash"],
+                }
+    else:
+        complete_pair_chain_valid = True
+        prefix_pair_chain_valid = True
+        if current_decision is not None:
+            current_authorization_available = True
+            current_successor_edge_valid = True
+        global_label_evidence = {
+            "scope": "LOCAL_TRACKING_ONLY_NO_ACTUAL_REMOTE",
+            "valid": True,
+            "complete_chain_valid": True,
+            "pair_evidence": complete_pair_evidence,
+            "successor_edge": None,
+            "successor_edge_valid": (
+                None if current_decision is None else True
+            ),
+            "audited_record_count": len(records),
+            "excluded_current_decision_hash": None,
+        }
+
+    current_decision_blocking_state: str | None = None
+    if current_decision is not None and not complete_pair_chain_valid:
+        if current_authorization_available is None:
+            try:
+                load_append_authorization(
+                    spec,
+                    root,
+                    current_decision,
+                    require_current_operator=False,
+                )
+            except (
+                FirstWeekOperationError,
+                Stage3Error,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                current_authorization_available = False
+            else:
+                current_authorization_available = True
+        if current_authorization_available is False:
+            current_decision_blocking_state = "UNAUTHORIZED_DECISION_PRESENT"
+        elif not prefix_pair_chain_valid or current_successor_edge_valid is not True:
+            current_decision_blocking_state = "INVALID_DECISION_EVIDENCE_CHAIN"
+        else:
+            try:
+                validate_authorized_anchor_pair(
+                    spec,
+                    root,
+                    current_decision,
+                    require_pushed=True,
+                )
+            except (FirstWeekOperationError, Stage3Error):
+                current_entry_open = _entry_open(
+                    str(current_decision["payload"]["entry_dt"])
+                ).astimezone(UTC)
+                current_decision_blocking_state = (
+                    "INVALID_DECISION_EVIDENCE_DEADLINE"
+                    if current >= current_entry_open
+                    else "DECISION_EVIDENCE_COMMIT_PENDING"
+                )
+            else:
+                current_decision_blocking_state = "INVALID_DECISION_EVIDENCE_CHAIN"
+    current_label_blocks_progress = bool(
+        records
+        and records[-1].data["record_type"] == "label_completion"
+        and not complete_pair_chain_valid
+    )
+    current_label_blocking_state: str | None = None
+    if current_label_blocks_progress:
+        try:
+            import xs_chan_stage3_weekly as weekly
+
+            weekly_label_status = weekly.status_snapshot(
+                decision_date_assertion=None,
+                state_manifest_path=None,
+                data_dir=data_dir,
+                now=current,
+            )
+        except (
+            FirstWeekOperationError,
+            Stage3Error,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            current_label_blocking_state = "INVALID_LABEL_EVIDENCE_CHAIN"
+        else:
+            current_label_blocking_state = (
+                "PRIOR_LABEL_EVIDENCE_PENDING"
+                if isinstance(weekly_label_status, Mapping)
+                and weekly_label_status.get("state")
+                == "LABEL_EVIDENCE_COMMIT_PENDING"
+                else "INVALID_LABEL_EVIDENCE_CHAIN"
+            )
 
     if len(decisions) > 1 or len(labels) > 1:
-        raise FirstWeekOperationError("first-week ledger contains duplicate decision or label events")
-    if labels:
+        raise FirstWeekOperationError("ledger contains duplicate decision or label events for the target")
+    if current_decision_blocking_state is not None:
+        state = current_decision_blocking_state
+    elif current_label_blocking_state is not None:
+        state = current_label_blocking_state
+    elif labels:
         try:
             validate_authorized_anchor_pair(
                 spec,
@@ -3072,7 +4622,11 @@ def status_snapshot(
                 labels[0].data,
                 require_pushed=True,
             )
-            state = "FIRST_WEEK_COMPLETE"
+            state = (
+                "FIRST_WEEK_COMPLETE"
+                if week_index == 1
+                else "DECISION_LABEL_COMPLETE"
+            )
         except (FirstWeekOperationError, Stage3Error):
             try:
                 load_append_authorization(
@@ -3103,13 +4657,20 @@ def status_snapshot(
                     decisions[0].data,
                     require_pushed=True,
                 )
-                state = "DECISION_AUTHORIZED_WAIT_EXIT"
-            except (FirstWeekOperationError, Stage3Error):
                 state = (
-                    "INVALID_DECISION_EVIDENCE_DEADLINE"
-                    if current >= entry_open
-                    else "DECISION_EVIDENCE_COMMIT_PENDING"
+                    "DECISION_AUTHORIZED_WAIT_EXIT"
+                    if complete_pair_chain_valid
+                    else "INVALID_DECISION_EVIDENCE_CHAIN"
                 )
+            except (FirstWeekOperationError, Stage3Error):
+                if not prefix_pair_chain_valid:
+                    state = "INVALID_DECISION_EVIDENCE_CHAIN"
+                else:
+                    state = (
+                        "INVALID_DECISION_EVIDENCE_DEADLINE"
+                        if current >= entry_open
+                        else "DECISION_EVIDENCE_COMMIT_PENDING"
+                    )
     elif current >= entry_open:
         state = "MISSED_DECISION_WINDOW"
     elif current >= latest_safe_start:
@@ -3122,14 +4683,33 @@ def status_snapshot(
         state = "NEEDS_RAW_TARGET"
     else:
         state = "NEEDS_STATE_AND_FINAL_REFERENCE"
+    if window_complete:
+        state = "DECISION_WINDOW_COMPLETE"
+        next_weekly_action = (
+            "COMPLETE_OUTSTANDING_LABELS"
+            if outstanding_label_count
+            else "RUN_FINAL_EVALUATION"
+        )
+    else:
+        next_weekly_action = "OPERATE_DERIVED_DECISION"
     return {
         "schema": "xs_chan_stage3_first_week_status_v1",
         "checked_at_utc": current,
         "market_time": current.astimezone(EXCHANGE_TIMEZONE),
         "study_identity": stage3.study_identity(spec),
-        "decision_date": pd.Timestamp(decision_date).date().isoformat(),
-        "entry_date": FIRST_WEEK_ENTRY_DATE,
-        "exit_date": FIRST_WEEK_EXIT_DATE,
+        "week_index": week_index,
+        "decision_date": target_date,
+        "entry_date": entry_date,
+        "exit_date": exit_date,
+        "decision_context": (
+            None
+            if operation is None
+            else serialize_decision_operation_context_v1(operation)
+        ),
+        "decision_window_complete": window_complete,
+        "outstanding_label_count": outstanding_label_count,
+        "next_weekly_action": next_weekly_action,
+        "global_label_evidence": global_label_evidence,
         "time_gate": {
             "decision_close_utc": decision_close,
             "daily_release_utc": daily_release,
@@ -3154,7 +4734,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--decision-date",
-        default=FIRST_WEEK_REFERENCE_DATES[-1],
+        default=None,
+        help="optional equality assertion; omitted means the unique next scheduled decision",
     )
     parser.add_argument(
         "--data-dir",
@@ -3169,7 +4750,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     preflight = subparsers.add_parser(
         "preflight-decision",
-        help="read-only exact eight-date simulation; never writes the ledger",
+        help="read-only exact derived decision simulation; never writes the ledger",
     )
     preflight.add_argument(
         "--reference-manifest",
@@ -3237,14 +4818,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "preflight-decision":
             spec = stage3.load_and_validate_spec()
             root = stage3.resolve_ledger_root(spec)
+            records = stage3.scan_records(root)
+            context = (
+                derive_decision_operation_context(
+                    spec,
+                    root,
+                    decision_date=args.decision_date,
+                    reference_manifest_path=args.reference_manifest,
+                    records=records,
+                )
+                if records
+                else None
+            )
+            target = (
+                context.decision_date
+                if context is not None
+                else (args.decision_date or FIRST_WEEK_REFERENCE_DATES[-1])
+            )
             report = build_preflight_report(
                 spec,
                 root,
                 args.reference_manifest,
                 args.state_manifest,
-                args.decision_date,
+                target,
                 data_dir=args.data_dir,
                 verify_remote=False,
+                context=context,
             )
             _print_json(
                 {
@@ -3280,14 +4879,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.apply_ledger:
                 spec = stage3.load_and_validate_spec()
                 root = stage3.resolve_ledger_root(spec)
+                records = stage3.scan_records(root)
+                context = (
+                    derive_decision_operation_context(
+                        spec,
+                        root,
+                        decision_date=args.decision_date,
+                        reference_manifest_path=args.reference_manifest,
+                        records=records,
+                    )
+                    if records
+                    else None
+                )
+                target = (
+                    context.decision_date
+                    if context is not None
+                    else (args.decision_date or FIRST_WEEK_REFERENCE_DATES[-1])
+                )
                 report = build_preflight_report(
                     spec,
                     root,
                     args.reference_manifest,
                     args.state_manifest,
-                    args.decision_date,
+                    target,
                     data_dir=args.data_dir,
                     verify_remote=False,
+                    context=context,
                 )
                 _print_json(
                     {
