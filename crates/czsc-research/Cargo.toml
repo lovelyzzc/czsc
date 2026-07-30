@@ -1,0 +1,39 @@
+[package]
+name                    = "czsc-research"
+version.workspace       = true
+edition.workspace       = true
+license.workspace       = true
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+authors.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+publish                 = false
+description             = "Research engine for xs_chan pipeline: parallel state projection, factor surface, portfolio simulation, execution replay, and statistical inference."
+
+[lib]
+name = "czsc_research"
+path = "src/lib.rs"
+
+[dependencies]
+chrono            = { workspace = true }
+czsc-core         = { workspace = true }
+czsc-trend-regime = { workspace = true }
+polars            = { workspace = true, features = ["lazy", "parquet", "strings"] }
+rayon             = { workspace = true }
+rand              = { version = "0.9", features = ["small_rng"] }
+sha2              = "0.10"
+serde             = { workspace = true }
+serde_json        = "1"
+thiserror         = "2"
+pyo3              = { workspace = true, optional = true, features = ["chrono"] }
+pyo3-stub-gen     = { version = "0.22", optional = true }
+
+[features]
+python = ["pyo3", "pyo3-stub-gen", "czsc-core/python", "czsc-trend-regime/python"]
+
+[dev-dependencies]
+chrono   = { workspace = true }
+polars   = { workspace = true }
+tempfile = "3"

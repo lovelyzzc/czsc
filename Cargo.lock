@@ -726,6 +726,7 @@ dependencies = [
  "chrono",
  "czsc-core",
  "czsc-derive",
+ "czsc-research",
  "czsc-signals",
  "czsc-ta",
  "czsc-trader",
@@ -740,6 +741,25 @@ dependencies = [
  "rust_xlsxwriter",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "czsc-research"
+version = "1.0.0-rc.8"
+dependencies = [
+ "chrono",
+ "czsc-core",
+ "czsc-trend-regime",
+ "polars",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rand 0.9.4",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror",
 ]
 

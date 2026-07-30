@@ -50,6 +50,7 @@ czsc-signals   = { workspace = true }
 czsc-trader    = { workspace = true }
 czsc-derive        = { workspace = true }
 czsc-trend-regime  = { workspace = true, features = ["python"] }
+czsc-research      = { workspace = true, features = ["python"] }
 anyhow         = "1"
 chrono         = { workspace = true }
 inventory      = "0.3"
