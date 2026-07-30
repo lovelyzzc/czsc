@@ -10,7 +10,7 @@
 要求决策日仍处于上行家族 5/6/7/8），独立模拟 FULL 退出（SL2 + 18% 跟踪 +
 背驰/破坏次日开盘退出 + 最大持有 60），记录毛收益（成本由下游加）。
 
-与 `surge_regime_backtest.py` 的差异：候选独立模拟、允许同票时间重叠
+候选独立模拟、允许同票时间重叠
 （组合层会强制单票单仓；pair 级分析接受重叠）。
 
 输出：
@@ -56,8 +56,7 @@ def _is_candidate(prev: int, regime: int, prior: list[int], mode: str) -> bool:
 
 
 def _simulate_full(p_dec: int, states: list, regime_by_idx: dict, ind: dict):
-    """从决策 bar p_dec 模拟一笔 FULL 退出交易（与 surge_regime_backtest._simulate_surge
-    同逻辑，去掉 holds 构建以提速）。返回 (entry_idx, entry_price, exit_idx, exit_price, reason)。"""
+    """从决策 bar p_dec 模拟一笔 FULL 退出交易。返回 (entry_idx, entry_price, exit_idx, exit_price, reason)。"""
     n = ind["n"]
     o, c, lo = ind["open"], ind["close"], ind["low"]
     sig = states[p_dec]

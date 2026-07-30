@@ -277,7 +277,7 @@ def _report_default(results, name_map, industry_map, metadata_available):
 def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
     """实验 · 回踩买点 delay5。镜像口径固定（不吃环境变量阈值），仅记录与研究，非默认买入建议。
 
-    口径 = scripts/surge_pullback_entry_research.py 的 state_delay5 变体：
+    口径 = state_delay5 变体（原 scripts/surge_pullback_entry_research.py，已清理）：
     anticipate 信号（信号日门控）后第 5 个交易日收盘决策、次日开盘入场；
     市场状态门 high20_ratio>0.12 & 等权指数>MA20；硬过滤 成交额≥1亿 + 止损带 8-20% + 剔除 ST。
     """

@@ -259,10 +259,8 @@ czsc_obj = CZSC(bars)
 
 ### A 股主升浪策略研究（scripts/，2026-06-10 审计完结）
 
-- **必读交接文档：[`scripts/SURGE_REGIME_AUDIT_2026-06-10.md`](scripts/SURGE_REGIME_AUDIT_2026-06-10.md)**
-  ——实盘镜像回测 + 随机对照判定：当前形态**无选股 alpha**（收益主体为规模/市场 beta）；
-  含已被证据否定的方向清单（勿重做）、下一轮迭代方向（市场状态过滤器/回踩买点）、
-  方法论硬约束（因果、成本、预声明判定标准）与全部复现命令。
+- **审计结论**：实盘镜像回测 + 随机对照判定——当前形态**无选股 alpha**（收益主体为规模/市场 beta）。
+  已结论的研究脚本和审计文档已于 2026-07-29 清理（Git 历史可回溯）。
 - 数据：`~/.ts_data_cache/a_stock_daily_qfq/`（5719 只含退市股，qfq 接缝已清零，
   增量同步 `scripts/_sync_daily_data.py` 自动修平）；改 `surge_onset`/FSM/数据后必须重跑
   `scripts/surge_candidates_dump.py`。

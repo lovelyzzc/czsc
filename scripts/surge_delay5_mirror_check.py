@@ -29,13 +29,23 @@ import pandas as pd
 import surge_live as sl
 import surge_market_state_filter as msf
 import surge_portfolio_backtest as spb
-import surge_pullback_entry_research as spe
 import trend_regime as tr
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output" / "surge_delay5_mirror"
 TAIL = 160  # 与 daily_scan 一致的快路径窗口
 SL_TOL = 0.011  # sl_pct 数值比对容差（双方均 round 2）
 AMT_TOL = 0.0011  # amount_e 容差
+
+
+def _signal_gate(df: pd.DataFrame) -> pd.Series:
+    """Anticipate 信号门控（与 surge_portfolio_backtest.gated_candidates 同口径）。"""
+    g = (
+        (df["sig_vol_ratio"] >= tr.SURGE_GATE_VOL_RATIO)
+        & (df["sig_ma_spread_pct"] >= tr.SURGE_GATE_MA_SPREAD)
+        & (df["sig_above_zg"] == 1)
+        & (df["sig_ret20"] >= tr.SURGE_GATE_RET20)
+    )
+    return g.fillna(False)
 
 
 def _check_one(parquet_path: str, t_list: list[pd.Timestamp]) -> list[dict]:
@@ -65,7 +75,7 @@ def _check_one(parquet_path: str, t_list: list[pd.Timestamp]) -> list[dict]:
 
 def dump_side(cand: pd.DataFrame, t_list: list[pd.Timestamp], st_intervals: dict) -> pd.DataFrame:
     df = cand[(cand["mode"] == "anticipate") & (cand["delay"] == 5) & (cand["dec_dt"].isin(t_list))].copy()
-    df = df[spe._signal_gate(df)]
+    df = df[_signal_gate(df)]
     df["pass_hard"] = (df["amount_e"] >= spb.MIN_AMOUNT_E) & df["sl_pct"].between(spb.STOP_MIN_PCT, spb.STOP_MAX_PCT)
     if st_intervals:
         st_mask = df.apply(lambda r: spb.is_st_on(st_intervals, r["symbol"], r["dec_dt"]), axis=1)

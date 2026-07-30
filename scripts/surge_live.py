@@ -87,7 +87,7 @@ def market_gate_open(state_row: pd.Series | dict) -> bool:
 def detect_delay5(states: list[tr.StateSnapshot]) -> dict | None:
     """今日（states[-1]）是否为某 anticipate 信号的第 5 个交易日决策日。
 
-    条件（与 surge_candidates_dump + surge_pullback_entry_research 的选股口径一致）：
+    条件（与 surge_candidates_dump 的选股口径一致）：
     信号 bar p = 今日-5 处发生 anticipate 启动（含信号日门控，由 surge_onset 内置），
     且今日 regime ∈ {5,6,7,8}。返回决策日（今日）视角的候选字段；不含收益模拟。
     """

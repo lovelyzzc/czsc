@@ -10,7 +10,7 @@
 - **退出矩阵**（回答「此时止损止盈策略是什么」）：
   ``STATE`` 纯状态退出 / ``STATE_SL2`` 状态+SL2 / ``SL2`` 仅SL2 /
   ``ATR`` ATR动态止损 / ``FIXED`` 固定-8% / ``TRAIL`` SL2+跟踪 / ``TP_TRAIL`` SL2+止盈+跟踪。
-  ATR/Wyckoff 逻辑沿用 ``surge_codex_backtest.py``。
+  ATR/Wyckoff 逻辑基于标准 ATR 动态止损。
 - **OOS 防过拟合**：按入场日期切分 train(≤2023-12-31) / test(≥2024-01-01)，两段分别统计；
   全市场汇总，单只票内同时只持一仓（顺序扫描，不重叠）。
 
@@ -66,7 +66,7 @@ MODES = ["STATE", "STATE_SL2", "SL2", "ATR", "FIXED", "TRAIL", "TP_TRAIL"]
 
 
 # --------------------------------------------------------------------------- #
-# ATR / Wyckoff（沿用 surge_codex_backtest.py）
+# ATR / Wyckoff 动态止损
 # --------------------------------------------------------------------------- #
 def _compute_atr(high, low, close, period=ATR_PERIOD):
     n = len(high)

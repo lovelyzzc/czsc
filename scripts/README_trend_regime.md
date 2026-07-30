@@ -1,8 +1,7 @@
 # 缠论走势类型划分（11 态）+ 买卖点回测 + 主升浪特征研究
 
-> **2026-06-10 审计完结**：完整结论、证据与下一轮迭代交接见
-> [`SURGE_REGIME_AUDIT_2026-06-10.md`](SURGE_REGIME_AUDIT_2026-06-10.md)。
-> 一句话判定：实盘镜像 + 随机对照下当前形态**无选股 alpha**。
+> **2026-06-10 审计完结**：实盘镜像 + 随机对照下当前形态**无选股 alpha**。
+> 已结论的研究脚本和审计文档已于 2026-07-29 清理（Git 历史可回溯）。
 
 把个股日线走势划分为 0..10 共 11 个走势类型，标注各状态的买卖点，做样本外（OOS）
 回测对比，并研究主升浪个股的特征与阶段、给出止损止盈策略。**全程不使用未来函数，
@@ -15,7 +14,6 @@
 | `trend_regime.py` | 因果安全的 11 态缠论状态机（核心模块） | `uv run --no-sync python scripts/trend_regime.py --self-check 000636.SZ` |
 | `trend_regime_backtest.py` | 右侧买点 + 止损止盈矩阵 + OOS 回测 | `uv run --no-sync python scripts/trend_regime_backtest.py` |
 | `surge_characteristics.py` | 主升浪特征/阶段研究报告 | `uv run --no-sync python scripts/surge_characteristics.py` |
-| `surge_regime_backtest.py` | 主升浪启动 OOS 回测（全信号等权，**结论已被下行替代**） | `uv run --no-sync python scripts/surge_regime_backtest.py` |
 | `surge_candidates_dump.py` | 门控前候选 × 多延迟模拟一次性抽取（下游共享数据） | `uv run --no-sync python scripts/surge_candidates_dump.py` |
 | `surge_portfolio_backtest.py` | **实盘镜像组合回测**（top-N+硬过滤+成本）+ 随机对照 beta 剥离 | `uv run --no-sync python scripts/surge_portfolio_backtest.py` |
 | `surge_signal_analyses.py` | 新鲜度衰减 + 门控敏感性分析 | `uv run --no-sync python scripts/surge_signal_analyses.py` |
@@ -34,7 +32,7 @@
 `.cursor/skills/surge-delay5-stock-picker/`。优先级排序走 `trend_regime.priority_score`
 （选股与回测单一真源，但只作展示排序，不视为收益预测器）。
 
-**2026-06-10 实盘镜像重测结论（替代旧 surge_regime_backtest 结论）**：top-N 优先级选股 +
+**2026-06-10 实盘镜像重测结论**：top-N 优先级选股 +
 硬过滤 + 成本 + 退市股回补后，两种买点 OOS 超额（vs 同日同成交额十分位随机对照）均不显著
 → **收益主体为规模/市场 beta，未证明选股 alpha**；组合净年化为负。仅 2025 年有显著正超额，
 2024/2026 为负（市场状态依赖）。`priority_score` 选出的交易差于全候选平均，仅作展示排序。

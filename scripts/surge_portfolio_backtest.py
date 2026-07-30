@@ -1,6 +1,6 @@
 """主升浪策略实盘镜像组合回测 + 随机对照 beta 剥离
 
-与 `surge_regime_backtest.py`（全部信号、等权、零 pair 成本）不同，本脚本回测的是
+本脚本回测的是
 **每日选股 skill 实际执行的策略**：
 
 1. 入选 = daily_scan 镜像：默认门控（量比/散度/中枢上方，anticipate 加 ret20）→
