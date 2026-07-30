@@ -7,10 +7,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::{benchmark, execution, features, statistics};
+use crate::{benchmark, execution, features, random_control, slot_backtest, statistics};
 
 // ─── Statistics ─────────────────────────────────────────────────
 
@@ -242,6 +242,615 @@ fn simulate_fc_path<'py>(
     Ok(list.into_any().unbind())
 }
 
+// ─── Slot Backtest ──────────────────────────────────────────────
+
+/// 日频贪心槽位组合回测。
+///
+/// 输入为 candidates（字典列表）和 close panel（三元组列表），
+/// 返回回测结果字典（trades, daily_returns, curve_stats, pair_stats）。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (candidates, close_triples, n_slots=10, fill_mode="strict",
+                    buy_cost=0.0015, sell_cost=0.0025, train_end_year=2023))]
+#[allow(clippy::too_many_arguments)]
+fn simulate_surge_backtest<'py>(
+    py: Python<'py>,
+    candidates: Vec<HashMap<String, Py<PyAny>>>,
+    close_triples: Vec<(String, String, f64)>,
+    n_slots: usize,
+    fill_mode: &str,
+    buy_cost: f64,
+    sell_cost: f64,
+    train_end_year: i32,
+) -> PyResult<Py<PyAny>> {
+    use chrono::NaiveDate;
+    use slot_backtest::{CandidateRow, ClosePanel, FillMode, SlotBacktestConfig};
+
+    let fm = FillMode::from_str(fill_mode)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    let config = SlotBacktestConfig {
+        n_slots,
+        buy_cost,
+        sell_cost,
+        fill_mode: fm,
+    };
+
+    let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {
+        let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad date: {e}")))?;
+        Ok(nd.and_hms_opt(0, 0, 0).unwrap().and_utc())
+    };
+
+    let get_str = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<String> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<String>(py)
+    };
+    let get_f64 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<f64> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<f64>(py)
+    };
+    let get_i32 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<i32> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<i32>(py)
+    };
+    let get_usize = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<usize> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<usize>(py)
+    };
+    let get_u8 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<u8> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<u8>(py)
+    };
+
+    let mut cands = Vec::with_capacity(candidates.len());
+    for d in &candidates {
+        let entry_dt_str = get_str(d, "entry_dt", py)?;
+        let exit_dt_str = get_str(d, "exit_dt", py)?;
+        let gate_level_val = get_u8(d, "gate_level", py).unwrap_or(3);
+
+        cands.push(CandidateRow {
+            symbol: get_str(d, "symbol", py)?,
+            entry_dt: parse_dt(&entry_dt_str)?,
+            exit_dt: parse_dt(&exit_dt_str)?,
+            entry_price: get_f64(d, "entry_price", py)?,
+            exit_price: get_f64(d, "exit_price", py)?,
+            gate_level: czsc_trend_regime::GateLevel::from_u8(gate_level_val),
+            gate_confidence: get_f64(d, "gate_confidence", py).unwrap_or(1.0),
+            priority: get_f64(d, "priority", py)?,
+            ret_gross_pct: get_f64(d, "ret_gross_pct", py)?,
+            hold_days: get_usize(d, "hold_days", py).unwrap_or(0),
+            seg: get_str(d, "seg", py).unwrap_or_default(),
+            year: get_i32(d, "year", py).unwrap_or(0),
+        });
+    }
+
+    let panel_triples: Vec<(String, chrono::DateTime<chrono::Utc>, f64)> = close_triples
+        .into_iter()
+        .map(|(sym, dt_str, close)| {
+            let dt = parse_dt(&dt_str)?;
+            Ok((sym, dt, close))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let panel = ClosePanel::from_triples(&panel_triples);
+
+    let result = slot_backtest::simulate_slots(&cands, &panel, &config)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let segments = slot_backtest::segment_stats(&result, train_end_year);
+
+    let dict = PyDict::new(py);
+
+    // trades as list of dicts
+    let trades_list = PyList::empty(py);
+    for tr in &result.trades {
+        let td = PyDict::new(py);
+        td.set_item("symbol", &tr.symbol)?;
+        td.set_item("entry_dt", tr.entry_dt.format("%Y-%m-%d").to_string())?;
+        td.set_item("exit_dt", tr.exit_dt.format("%Y-%m-%d").to_string())?;
+        td.set_item("entry_price", tr.entry_price)?;
+        td.set_item("exit_price", tr.exit_price)?;
+        td.set_item("ret_gross_pct", tr.ret_gross_pct)?;
+        td.set_item("ret_net_pct", tr.ret_net_pct)?;
+        td.set_item("gate_level", tr.gate_level.as_str())?;
+        td.set_item("gate_confidence", tr.gate_confidence)?;
+        td.set_item("priority", tr.priority)?;
+        td.set_item("hold_days", tr.hold_days)?;
+        td.set_item("seg", &tr.seg)?;
+        td.set_item("year", tr.year)?;
+        td.set_item("position_weight", tr.position_weight)?;
+        trades_list.append(td)?;
+    }
+    dict.set_item("trades", trades_list)?;
+
+    // daily_returns as list of (date_str, return)
+    let dr_list = PyList::empty(py);
+    for (dt, ret) in &result.daily_returns {
+        let pair = PyList::empty(py);
+        pair.append(dt.format("%Y-%m-%d").to_string())?;
+        pair.append(*ret)?;
+        dr_list.append(pair)?;
+    }
+    dict.set_item("daily_returns", dr_list)?;
+
+    // segments as list of dicts
+    let seg_list = PyList::empty(py);
+    for seg in &segments {
+        let sd = PyDict::new(py);
+        sd.set_item("label", &seg.label)?;
+        let cd = PyDict::new(py);
+        cd.set_item("annual_return_pct", seg.curve.annual_return_pct)?;
+        cd.set_item("sharpe", seg.curve.sharpe)?;
+        cd.set_item("max_drawdown_pct", seg.curve.max_drawdown_pct)?;
+        cd.set_item("calmar", seg.curve.calmar)?;
+        cd.set_item("trading_days", seg.curve.trading_days)?;
+        sd.set_item("curve", cd)?;
+        let pd = PyDict::new(py);
+        pd.set_item("n_trades", seg.pair.n_trades)?;
+        pd.set_item("win_rate_pct", seg.pair.win_rate_pct)?;
+        pd.set_item("profit_loss_ratio", seg.pair.profit_loss_ratio)?;
+        pd.set_item("net_mean_pct", seg.pair.net_mean_pct)?;
+        pd.set_item("net_median_pct", seg.pair.net_median_pct)?;
+        pd.set_item("gross_mean_pct", seg.pair.gross_mean_pct)?;
+        pd.set_item("avg_hold_days", seg.pair.avg_hold_days)?;
+        sd.set_item("pair", pd)?;
+        seg_list.append(sd)?;
+    }
+    dict.set_item("segments", seg_list)?;
+
+    Ok(dict.into_any().unbind())
+}
+
+/// Helper: 将 BacktestResult + segments 序列化为 Python dict。
+fn backtest_result_to_pydict<'py>(
+    py: Python<'py>,
+    result: &slot_backtest::BacktestResult,
+    segments: &[slot_backtest::SegmentStats],
+) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+
+    let trades_list = PyList::empty(py);
+    for tr in &result.trades {
+        let td = PyDict::new(py);
+        td.set_item("symbol", &tr.symbol)?;
+        td.set_item("entry_dt", tr.entry_dt.format("%Y-%m-%d").to_string())?;
+        td.set_item("exit_dt", tr.exit_dt.format("%Y-%m-%d").to_string())?;
+        td.set_item("entry_price", tr.entry_price)?;
+        td.set_item("exit_price", tr.exit_price)?;
+        td.set_item("ret_gross_pct", tr.ret_gross_pct)?;
+        td.set_item("ret_net_pct", tr.ret_net_pct)?;
+        td.set_item("gate_level", tr.gate_level.as_str())?;
+        td.set_item("gate_confidence", tr.gate_confidence)?;
+        td.set_item("priority", tr.priority)?;
+        td.set_item("hold_days", tr.hold_days)?;
+        td.set_item("seg", &tr.seg)?;
+        td.set_item("year", tr.year)?;
+        td.set_item("position_weight", tr.position_weight)?;
+        trades_list.append(td)?;
+    }
+    dict.set_item("trades", trades_list)?;
+
+    let dr_list = PyList::empty(py);
+    for (dt, ret) in &result.daily_returns {
+        let pair = PyList::empty(py);
+        pair.append(dt.format("%Y-%m-%d").to_string())?;
+        pair.append(*ret)?;
+        dr_list.append(pair)?;
+    }
+    dict.set_item("daily_returns", dr_list)?;
+
+    let seg_list = PyList::empty(py);
+    for seg in segments {
+        let sd = PyDict::new(py);
+        sd.set_item("label", &seg.label)?;
+        let cd = PyDict::new(py);
+        cd.set_item("annual_return_pct", seg.curve.annual_return_pct)?;
+        cd.set_item("sharpe", seg.curve.sharpe)?;
+        cd.set_item("max_drawdown_pct", seg.curve.max_drawdown_pct)?;
+        cd.set_item("calmar", seg.curve.calmar)?;
+        cd.set_item("trading_days", seg.curve.trading_days)?;
+        sd.set_item("curve", cd)?;
+        let pd = PyDict::new(py);
+        pd.set_item("n_trades", seg.pair.n_trades)?;
+        pd.set_item("win_rate_pct", seg.pair.win_rate_pct)?;
+        pd.set_item("profit_loss_ratio", seg.pair.profit_loss_ratio)?;
+        pd.set_item("net_mean_pct", seg.pair.net_mean_pct)?;
+        pd.set_item("net_median_pct", seg.pair.net_median_pct)?;
+        pd.set_item("gross_mean_pct", seg.pair.gross_mean_pct)?;
+        pd.set_item("avg_hold_days", seg.pair.avg_hold_days)?;
+        sd.set_item("pair", pd)?;
+        seg_list.append(sd)?;
+    }
+    dict.set_item("segments", seg_list)?;
+
+    Ok(dict.into_any().unbind())
+}
+
+/// 日频贪心槽位组合回测（从 parquet 路径读取面板）。
+///
+/// 与 `simulate_surge_backtest` 功能相同，但面板从 parquet 文件路径读取，
+/// 避免 Python→Rust 传递 540 万行三元组的开销。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (candidates, panel_path, n_slots=10, fill_mode="strict",
+                    buy_cost=0.0015, sell_cost=0.0025, train_end_year=2023))]
+#[allow(clippy::too_many_arguments)]
+fn simulate_surge_backtest_parquet<'py>(
+    py: Python<'py>,
+    candidates: Vec<HashMap<String, Py<PyAny>>>,
+    panel_path: &str,
+    n_slots: usize,
+    fill_mode: &str,
+    buy_cost: f64,
+    sell_cost: f64,
+    train_end_year: i32,
+) -> PyResult<Py<PyAny>> {
+    use chrono::NaiveDate;
+    use slot_backtest::{CandidateRow, ClosePanel, FillMode, SlotBacktestConfig};
+
+    let fm = FillMode::from_str(fill_mode)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    let config = SlotBacktestConfig {
+        n_slots,
+        buy_cost,
+        sell_cost,
+        fill_mode: fm,
+    };
+
+    let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {
+        let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad date: {e}")))?;
+        Ok(nd.and_hms_opt(0, 0, 0).unwrap().and_utc())
+    };
+
+    let get_str = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<String> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<String>(py)
+    };
+    let get_f64 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<f64> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<f64>(py)
+    };
+    let get_i32 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<i32> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<i32>(py)
+    };
+    let get_usize = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<usize> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<usize>(py)
+    };
+    let get_u8 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<u8> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<u8>(py)
+    };
+
+    let mut cands = Vec::with_capacity(candidates.len());
+    for d in &candidates {
+        let entry_dt_str = get_str(d, "entry_dt", py)?;
+        let exit_dt_str = get_str(d, "exit_dt", py)?;
+        let gate_level_val = get_u8(d, "gate_level", py).unwrap_or(3);
+
+        cands.push(CandidateRow {
+            symbol: get_str(d, "symbol", py)?,
+            entry_dt: parse_dt(&entry_dt_str)?,
+            exit_dt: parse_dt(&exit_dt_str)?,
+            entry_price: get_f64(d, "entry_price", py)?,
+            exit_price: get_f64(d, "exit_price", py)?,
+            gate_level: czsc_trend_regime::GateLevel::from_u8(gate_level_val),
+            gate_confidence: get_f64(d, "gate_confidence", py).unwrap_or(1.0),
+            priority: get_f64(d, "priority", py)?,
+            ret_gross_pct: get_f64(d, "ret_gross_pct", py)?,
+            hold_days: get_usize(d, "hold_days", py).unwrap_or(0),
+            seg: get_str(d, "seg", py).unwrap_or_default(),
+            year: get_i32(d, "year", py).unwrap_or(0),
+        });
+    }
+
+    let panel_path = std::path::Path::new(panel_path);
+    let panel = ClosePanel::from_parquet(panel_path, "close")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let result = slot_backtest::simulate_slots(&cands, &panel, &config)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let segments = slot_backtest::segment_stats(&result, train_end_year);
+
+    backtest_result_to_pydict(py, &result, &segments)
+}
+
+/// 随机对照 beta 剥离（从 parquet 路径读取面板）。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (trades, panel_path, k=50, min_valid=10, seed=42, min_segment_n=30))]
+#[allow(clippy::too_many_arguments)]
+fn compute_surge_excess_parquet<'py>(
+    py: Python<'py>,
+    trades: Vec<HashMap<String, Py<PyAny>>>,
+    panel_path: &str,
+    k: usize,
+    min_valid: usize,
+    seed: u64,
+    min_segment_n: usize,
+) -> PyResult<Py<PyAny>> {
+    use chrono::NaiveDate;
+    use random_control::{AmountPanel, ClosePanelView, ControlConfig, OpenPanel};
+    use slot_backtest::TradeRecord;
+
+    let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {
+        let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad date: {e}")))?;
+        Ok(nd.and_hms_opt(0, 0, 0).unwrap().and_utc())
+    };
+
+    let get_str = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<String> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<String>(py)
+    };
+    let get_f64 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<f64> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<f64>(py)
+    };
+
+    let mut trade_records = Vec::with_capacity(trades.len());
+    for d in &trades {
+        let entry_dt_str = get_str(d, "entry_dt", py)?;
+        let exit_dt_str = get_str(d, "exit_dt", py)?;
+        trade_records.push(TradeRecord {
+            symbol: get_str(d, "symbol", py)?,
+            entry_dt: parse_dt(&entry_dt_str)?,
+            exit_dt: parse_dt(&exit_dt_str)?,
+            entry_price: get_f64(d, "entry_price", py)?,
+            exit_price: get_f64(d, "exit_price", py)?,
+            ret_gross_pct: get_f64(d, "ret_gross_pct", py)?,
+            ret_net_pct: get_f64(d, "ret_net_pct", py).unwrap_or(0.0),
+            gate_level: czsc_trend_regime::GateLevel::Full,
+            gate_confidence: 1.0,
+            priority: get_f64(d, "priority", py).unwrap_or(0.0),
+            hold_days: d.get("hold_days")
+                .and_then(|v| v.extract::<usize>(py).ok())
+                .unwrap_or(0),
+            seg: get_str(d, "seg", py).unwrap_or_default(),
+            year: d.get("year")
+                .and_then(|v| v.extract::<i32>(py).ok())
+                .unwrap_or(0),
+            position_weight: 1.0,
+        });
+    }
+
+    use polars::prelude::*;
+    let pl_path = PlPath::new(panel_path);
+    let df = LazyFrame::scan_parquet(pl_path, Default::default())
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("scan: {e}")))?
+        .select([col("symbol"), col("dt"), col("open"), col("close"), col("amount_e")])
+        .collect()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("collect: {e}")))?;
+
+    let sym_col = df.column("symbol").unwrap().str().unwrap();
+    let dt_col = df.column("dt").unwrap().datetime().unwrap();
+    let ts_phys = dt_col.physical();
+    let tu = dt_col.time_unit();
+
+    let build_triples = |val_name: &str| -> Vec<(String, chrono::DateTime<chrono::Utc>, f64)> {
+        let val_col = df.column(val_name).unwrap().f64().unwrap();
+        let mut out = Vec::with_capacity(df.height());
+        for i in 0..df.height() {
+            let sym = sym_col.get(i).unwrap_or("").to_string();
+            let ts_raw = ts_phys.get(i).unwrap_or(0);
+            let val = val_col.get(i).unwrap_or(f64::NAN);
+            if val.is_nan() { continue; }
+            let ts_ms = match tu {
+                TimeUnit::Nanoseconds => ts_raw / 1_000_000,
+                TimeUnit::Microseconds => ts_raw / 1_000,
+                TimeUnit::Milliseconds => ts_raw,
+            };
+            let dt = chrono::DateTime::from_timestamp_millis(ts_ms)
+                .unwrap_or_default();
+            out.push((sym, dt, val));
+        }
+        out
+    };
+
+    let open_triples = build_triples("open");
+    let close_triples = build_triples("close");
+    let amount_triples = build_triples("amount_e");
+
+    let open_p = OpenPanel::from_triples(&open_triples);
+    let close_p = ClosePanelView::from_triples(&close_triples);
+    let amount_p = AmountPanel::from_triples(&amount_triples);
+
+    let config = ControlConfig { k, min_valid, seed };
+    let records = random_control::compute_excess(&trade_records, &open_p, &close_p, &amount_p, &config);
+    let segments = random_control::summarize_excess(&records, min_segment_n);
+
+    let dict = PyDict::new(py);
+
+    let rec_list = PyList::empty(py);
+    for r in &records {
+        let rd = PyDict::new(py);
+        rd.set_item("symbol", &r.symbol)?;
+        rd.set_item("entry_dt", r.entry_dt.format("%Y-%m-%d").to_string())?;
+        rd.set_item("ret_gross_pct", r.ret_gross_pct)?;
+        rd.set_item("control_median_pct", r.control_median_pct)?;
+        rd.set_item("excess_pct", r.excess_pct)?;
+        rd.set_item("control_n", r.control_n)?;
+        rd.set_item("seg", &r.seg)?;
+        rd.set_item("year", r.year)?;
+        rec_list.append(rd)?;
+    }
+    dict.set_item("records", rec_list)?;
+
+    let seg_list = PyList::empty(py);
+    for seg in &segments {
+        let sd = PyDict::new(py);
+        sd.set_item("label", &seg.label)?;
+        sd.set_item("n", seg.n)?;
+        sd.set_item("excess_mean_pct", seg.excess_mean_pct)?;
+        sd.set_item("excess_median_pct", seg.excess_median_pct)?;
+        sd.set_item("t_stat", seg.t_stat)?;
+        sd.set_item("positive_rate_pct", seg.positive_rate_pct)?;
+        seg_list.append(sd)?;
+    }
+    dict.set_item("segments", seg_list)?;
+
+    let oos = segments.iter().find(|s| s.label.contains("OOS"));
+    let verdict = match oos {
+        Some(s) if s.excess_mean_pct > 0.0 && s.t_stat.abs() >= 2.0 => {
+            "OOS 超额显著为正 → 有选股 alpha"
+        }
+        _ => "OOS 超额不显著/为负 → 收益主体为规模/市场 beta",
+    };
+    dict.set_item("verdict", verdict)?;
+
+    Ok(dict.into_any().unbind())
+}
+
+/// 随机对照 beta 剥离。
+///
+/// 输入 trades（字典列表）+ open/close/amount 面板（三元组列表），
+/// 返回超额统计字典。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (trades, open_triples, close_triples, amount_triples,
+                    k=50, min_valid=10, seed=42, min_segment_n=30))]
+#[allow(clippy::too_many_arguments)]
+fn compute_surge_excess<'py>(
+    py: Python<'py>,
+    trades: Vec<HashMap<String, Py<PyAny>>>,
+    open_triples: Vec<(String, String, f64)>,
+    close_triples: Vec<(String, String, f64)>,
+    amount_triples: Vec<(String, String, f64)>,
+    k: usize,
+    min_valid: usize,
+    seed: u64,
+    min_segment_n: usize,
+) -> PyResult<Py<PyAny>> {
+    use chrono::NaiveDate;
+    use random_control::{AmountPanel, ClosePanelView, ControlConfig, OpenPanel};
+    use slot_backtest::TradeRecord;
+
+    let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {
+        let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad date: {e}")))?;
+        Ok(nd.and_hms_opt(0, 0, 0).unwrap().and_utc())
+    };
+
+    let get_str = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<String> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<String>(py)
+    };
+    let get_f64 = |d: &HashMap<String, Py<PyAny>>, key: &str, py: Python<'_>| -> PyResult<f64> {
+        d.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?
+            .extract::<f64>(py)
+    };
+
+    let mut trade_records = Vec::with_capacity(trades.len());
+    for d in &trades {
+        let entry_dt_str = get_str(d, "entry_dt", py)?;
+        let exit_dt_str = get_str(d, "exit_dt", py)?;
+        trade_records.push(TradeRecord {
+            symbol: get_str(d, "symbol", py)?,
+            entry_dt: parse_dt(&entry_dt_str)?,
+            exit_dt: parse_dt(&exit_dt_str)?,
+            entry_price: get_f64(d, "entry_price", py)?,
+            exit_price: get_f64(d, "exit_price", py)?,
+            ret_gross_pct: get_f64(d, "ret_gross_pct", py)?,
+            ret_net_pct: get_f64(d, "ret_net_pct", py).unwrap_or(0.0),
+            gate_level: czsc_trend_regime::GateLevel::Full,
+            gate_confidence: 1.0,
+            priority: get_f64(d, "priority", py).unwrap_or(0.0),
+            hold_days: d.get("hold_days")
+                .and_then(|v| v.extract::<usize>(py).ok())
+                .unwrap_or(0),
+            seg: get_str(d, "seg", py).unwrap_or_default(),
+            year: d.get("year")
+                .and_then(|v| v.extract::<i32>(py).ok())
+                .unwrap_or(0),
+            position_weight: 1.0,
+        });
+    }
+
+    let to_panel_triples = |triples: Vec<(String, String, f64)>| -> PyResult<Vec<(String, chrono::DateTime<chrono::Utc>, f64)>> {
+        triples
+            .into_iter()
+            .map(|(sym, dt_str, val)| {
+                let dt = parse_dt(&dt_str)?;
+                Ok((sym, dt, val))
+            })
+            .collect()
+    };
+
+    let open_p = OpenPanel::from_triples(&to_panel_triples(open_triples)?);
+    let close_p = ClosePanelView::from_triples(&to_panel_triples(close_triples)?);
+    let amount_p = AmountPanel::from_triples(&to_panel_triples(amount_triples)?);
+
+    let config = ControlConfig { k, min_valid, seed };
+    let records = random_control::compute_excess(&trade_records, &open_p, &close_p, &amount_p, &config);
+    let segments = random_control::summarize_excess(&records, min_segment_n);
+
+    let dict = PyDict::new(py);
+
+    // individual excess records
+    let rec_list = PyList::empty(py);
+    for r in &records {
+        let rd = PyDict::new(py);
+        rd.set_item("symbol", &r.symbol)?;
+        rd.set_item("entry_dt", r.entry_dt.format("%Y-%m-%d").to_string())?;
+        rd.set_item("ret_gross_pct", r.ret_gross_pct)?;
+        rd.set_item("control_median_pct", r.control_median_pct)?;
+        rd.set_item("excess_pct", r.excess_pct)?;
+        rd.set_item("control_n", r.control_n)?;
+        rd.set_item("seg", &r.seg)?;
+        rd.set_item("year", r.year)?;
+        rec_list.append(rd)?;
+    }
+    dict.set_item("records", rec_list)?;
+
+    // segment summaries
+    let seg_list = PyList::empty(py);
+    for seg in &segments {
+        let sd = PyDict::new(py);
+        sd.set_item("label", &seg.label)?;
+        sd.set_item("n", seg.n)?;
+        sd.set_item("excess_mean_pct", seg.excess_mean_pct)?;
+        sd.set_item("excess_median_pct", seg.excess_median_pct)?;
+        sd.set_item("t_stat", seg.t_stat)?;
+        sd.set_item("positive_rate_pct", seg.positive_rate_pct)?;
+        seg_list.append(sd)?;
+    }
+    dict.set_item("segments", seg_list)?;
+
+    // verdict
+    let oos = segments.iter().find(|s| s.label.contains("OOS"));
+    let verdict = match oos {
+        Some(s) if s.excess_mean_pct > 0.0 && s.t_stat.abs() >= 2.0 => {
+            "OOS 超额显著为正 → 有选股 alpha"
+        }
+        _ => "OOS 超额不显著/为负 → 收益主体为规模/市场 beta",
+    };
+    dict.set_item("verdict", verdict)?;
+
+    Ok(dict.into_any().unbind())
+}
+
 // ─── Module Registration ────────────────────────────────────────
 
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -268,6 +877,14 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Portfolio
     research.add_function(wrap_pyfunction!(simulate_fc_path, &research)?)?;
+
+    // Slot Backtest
+    research.add_function(wrap_pyfunction!(simulate_surge_backtest, &research)?)?;
+    research.add_function(wrap_pyfunction!(simulate_surge_backtest_parquet, &research)?)?;
+
+    // Random Control / Excess
+    research.add_function(wrap_pyfunction!(compute_surge_excess, &research)?)?;
+    research.add_function(wrap_pyfunction!(compute_surge_excess_parquet, &research)?)?;
 
     let sys = py.import("sys")?;
     let py_modules = sys.getattr("modules")?;

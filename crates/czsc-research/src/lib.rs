@@ -7,11 +7,15 @@
 //! - `execution`: 开盘竞价/成交/NAV/公司行为
 //! - `statistics`: HAC + circular block bootstrap
 //! - `benchmark`: EW 市场基准
+//! - `slot_backtest`: 日频贪心槽位回测引擎
+//! - `random_control`: 随机对照 beta 剥离
 
 pub mod benchmark;
 pub mod execution;
 pub mod features;
 pub mod portfolio;
+pub mod random_control;
+pub mod slot_backtest;
 pub mod state_cache;
 pub mod statistics;
 

@@ -41,6 +41,45 @@ fn py_surge_onset(
     trend_regime::surge_onset(prev, regime, feats.as_ref(), &prior_regimes, mode)
 }
 
+/// 因果「主升浪启动」检测，支持可配置的最低门控层级。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (prev, regime, feats=None, prior_regimes=vec![], mode="confirm", min_level="full"))]
+fn py_surge_onset_with_level(
+    prev: u8,
+    regime: u8,
+    feats: Option<trend_regime::FeatureSnapshot>,
+    prior_regimes: Vec<u8>,
+    mode: &str,
+    min_level: &str,
+) -> bool {
+    let level = trend_regime::GateLevel::from_str(min_level);
+    trend_regime::surge_onset_with_level(
+        prev,
+        regime,
+        feats.as_ref(),
+        &prior_regimes,
+        mode,
+        level,
+    )
+}
+
+/// 三维门控分层：返回 "full" / "partial" / "weak" / "none"。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (feats,))]
+fn py_classify_gate_level(feats: &trend_regime::FeatureSnapshot) -> &'static str {
+    trend_regime::classify_gate_level(feats).as_str()
+}
+
+/// 连续门控置信度 0.0–1.0。
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (feats,))]
+fn py_gate_confidence(feats: &trend_regime::FeatureSnapshot) -> f64 {
+    trend_regime::gate_confidence(feats)
+}
+
 /// 主升浪强度打分 0..100。
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -76,6 +115,9 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     tr.add_class::<trend_regime::FeatureSnapshot>()?;
     tr.add_function(wrap_pyfunction!(iter_regime_states, &tr)?)?;
     tr.add_function(wrap_pyfunction!(py_surge_onset, &tr)?)?;
+    tr.add_function(wrap_pyfunction!(py_surge_onset_with_level, &tr)?)?;
+    tr.add_function(wrap_pyfunction!(py_classify_gate_level, &tr)?)?;
+    tr.add_function(wrap_pyfunction!(py_gate_confidence, &tr)?)?;
     tr.add_function(wrap_pyfunction!(py_surge_score, &tr)?)?;
     tr.add_function(wrap_pyfunction!(py_priority_score, &tr)?)?;
 

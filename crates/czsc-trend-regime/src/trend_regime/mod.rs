@@ -11,7 +11,10 @@ mod scoring;
 pub use features::{compute_features, FeatureSnapshot};
 pub use fsm::{classify_fsm, extract_zs_list, seed_regime};
 pub use indicators::TrendIndicators;
-pub use scoring::{gates_pass, priority_score, surge_onset, surge_score};
+pub use scoring::{
+    classify_gate_level, gate_confidence, gates_pass, priority_score, surge_onset,
+    surge_onset_with_level, surge_score, GateLevel,
+};
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "python")]
@@ -414,5 +417,128 @@ mod tests {
             ..f.clone()
         };
         assert!(!gates_pass(&f_low_vol));
+    }
+
+    #[test]
+    fn test_classify_gate_level() {
+        let full = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 1.5,
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+        assert_eq!(classify_gate_level(&full), GateLevel::Full);
+        assert!(gates_pass(&full));
+
+        // 2/3: low vol → Partial
+        let partial = FeatureSnapshot { vol_ratio: 0.5, ..full.clone() };
+        assert_eq!(classify_gate_level(&partial), GateLevel::Partial);
+        assert!(!gates_pass(&partial));
+
+        // 1/3: low vol + low spread → Weak
+        let weak = FeatureSnapshot {
+            vol_ratio: 0.5,
+            ma_spread_pct: 1.0,
+            ..full.clone()
+        };
+        assert_eq!(classify_gate_level(&weak), GateLevel::Weak);
+
+        // 0/3: everything fails → None
+        let none = FeatureSnapshot {
+            vol_ratio: 0.5,
+            ma_spread_pct: 1.0,
+            above_zg: false,
+            ..full.clone()
+        };
+        assert_eq!(classify_gate_level(&none), GateLevel::None);
+    }
+
+    #[test]
+    fn test_gate_level_ordering() {
+        assert!(GateLevel::Full > GateLevel::Partial);
+        assert!(GateLevel::Partial > GateLevel::Weak);
+        assert!(GateLevel::Weak > GateLevel::None);
+    }
+
+    #[test]
+    fn test_gate_confidence_range() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 1.5,
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+        let c = gate_confidence(&f);
+        assert!(c > 0.0 && c <= 1.0, "confidence={c}");
+
+        let f_zero = FeatureSnapshot {
+            vol_ratio: 0.0,
+            ma_spread_pct: 0.0,
+            above_zg: false,
+            ..f.clone()
+        };
+        assert_eq!(gate_confidence(&f_zero), 0.0);
+
+        // NaN fields should yield 0 contribution
+        let f_nan = FeatureSnapshot {
+            vol_ratio: f64::NAN,
+            ma_spread_pct: f64::NAN,
+            above_zg: false,
+            ..f
+        };
+        assert_eq!(gate_confidence(&f_nan), 0.0);
+    }
+
+    #[test]
+    fn test_gate_level_str_roundtrip() {
+        for level in [GateLevel::None, GateLevel::Weak, GateLevel::Partial, GateLevel::Full] {
+            assert_eq!(GateLevel::from_str(level.as_str()), level);
+        }
+    }
+
+    #[test]
+    fn test_surge_onset_with_level_relaxed() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 0.8, // below threshold → only Partial
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+        let prior = vec![
+            Regime::PivotBuilding as u8,
+            Regime::UpwardDeparture as u8,
+        ];
+        // Full level should reject (vol_ratio < 1.2)
+        assert!(!surge_onset(
+            Regime::UpwardDeparture as u8,
+            Regime::MainUptrend as u8,
+            Some(&f),
+            &prior,
+            "confirm",
+        ));
+        // Partial level should accept
+        assert!(surge_onset_with_level(
+            Regime::UpwardDeparture as u8,
+            Regime::MainUptrend as u8,
+            Some(&f),
+            &prior,
+            "confirm",
+            GateLevel::Partial,
+        ));
     }
 }
