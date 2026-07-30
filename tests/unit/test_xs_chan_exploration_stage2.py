@@ -61,6 +61,81 @@ def test_stage2_spec_discloses_reuse_and_locks_all_inputs():
     assert spec["design_provenance"]["stage2_is_preregistered_confirmation"] is False
     assert [row["id"] for row in spec["planned_experiments"]] == list(stage2.EXPECTED_EXPERIMENT_IDS)
     assert len(spec["frozen_stage1_inputs"]) == 10
+    assert spec["revision_history"][-1]["revision"] == 5
+    assert (
+        spec["revision_history"][-1]["superseded_identity"]
+        == "314726dd5a8acf88e272e86bf3fef982ca8c50bb05208fcb117c58bdd1e91d7c"
+    )
+
+
+def _algorithm_revision_inputs() -> tuple[dict, dict, dict]:
+    spec = _spec()
+    audit = stage2.read_json(stage2.SCRIPTS_DIR / "xs_chan_exploration_stage1_algorithm_revision_audit_20260729.json")
+    stage1_spec = stage2.read_json(stage2.SCRIPTS_DIR / "xs_chan_exploration_stage1.json")
+    return spec, audit, stage1_spec
+
+
+def test_stage1_algorithm_revision_claims_are_frozen():
+    spec, audit, stage1_spec = _algorithm_revision_inputs()
+
+    required, revision, prior, comparison = stage2._validate_stage1_algorithm_revision_claims(
+        spec,
+        audit,
+        stage1_spec,
+    )
+
+    assert required["required_regime_mismatches"] == 51_531
+    assert revision["source_commit"] == "89ae4fe1fc81f0bfe038bbd0d11b9bf24edb2c5e"
+    assert prior["carry_forward"] is True
+    assert comparison["keys"] == ["symbol", "dt"]
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement", "message"),
+    [
+        (("confirmation_chain",), "STARTED", "cannot start a confirmation chain"),
+        (("overall_conclusion", "alpha_confirmation"), "SUPPORTED", "conclusion changed"),
+        (("prior_semantic_audit", "carry_forward"), False, "not carried forward"),
+        (("prior_semantic_audit", "findings"), [], "finding set changed"),
+        (("algorithm_revision", "source_commit"), "89ae4fe", "field changed: source_commit"),
+        (("algorithm_revision", "regime_mismatch_rate"), 0.0, "mismatch rate is inconsistent"),
+        (("algorithm_revision", "comparison", "keys"), ["dt"], "comparison contract changed: keys"),
+    ],
+)
+def test_stage1_algorithm_revision_claims_fail_closed(
+    path: tuple[str, ...],
+    replacement: object,
+    message: str,
+):
+    spec, audit, stage1_spec = _algorithm_revision_inputs()
+    target = audit
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+
+    with pytest.raises(stage2.Stage2Error, match=message):
+        stage2._validate_stage1_algorithm_revision_claims(spec, audit, stage1_spec)
+
+
+def test_state_revision_counts_use_exact_symbol_date_inner_join(tmp_path: Path):
+    old_path = tmp_path / "old.parquet"
+    new_path = tmp_path / "new.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["A", "A", "B"],
+            "dt": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-01"]),
+            "regime": [1, 2, 3],
+        }
+    ).to_parquet(old_path, index=False)
+    pd.DataFrame(
+        {
+            "symbol": ["A", "A", "B", "C"],
+            "dt": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-01", "2024-01-01"]),
+            "regime": [1, 7, 3, 9],
+        }
+    ).to_parquet(new_path, index=False)
+
+    assert stage2._state_revision_counts(old_path, new_path, ("symbol", "dt")) == (3, 1)
 
 
 def test_study_identity_binds_spec_and_source(tmp_path: Path):

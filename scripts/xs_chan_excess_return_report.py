@@ -33,10 +33,12 @@ SOURCE_PATH = Path(__file__).resolve()
 REPO_ROOT = SOURCE_PATH.parents[1]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "scripts/_output/xs_chan_excess_return_report"
 REPORT_SCHEMA = "xs_chan_excess_return_report_v1"
+MARKET_ADDON_SCHEMA = "xs_chan_market_excess_report_v1"
 REGISTERED_METRIC = "paired_net_return_40bps"
 WEEKS_PER_YEAR = 52.0
 TARGET_SLOTS = 50.0
 DERIVED_OUTPUT_FILES = {"excess_curve.csv", "excess_metrics.csv", "report.md"}
+MARKET_OUTPUT_FILES = {"market_excess_curve.csv", "market_excess_metrics.csv", "market_benchmark_report.md"}
 
 MARKET_PAIR_SPECS: dict[str, dict[str, str]] = {
     "FC_minus_EW": {
@@ -49,7 +51,7 @@ MARKET_PAIR_SPECS: dict[str, dict[str, str]] = {
         "strategy": "F",
         "benchmark": "ew_all_return",
         "name": "F − EW-All · 纯因子相对全A等权",
-        "comparison_role": "FACTOR_MARKET_ALPHA",
+        "comparison_role": "FACTOR_MARKET_RELATIVE",
     },
     "FC_minus_CSI1000": {
         "strategy": "FC",
@@ -107,6 +109,29 @@ REQUIRED_WEEKLY_COLUMNS = {
 
 class ExcessReportError(RuntimeError):
     """Raised when a source or derived-report invariant is violated."""
+
+
+def configure_from_stage2_spec(spec: Mapping[str, Any]) -> int:
+    """Set report segments from the verified Stage 2 split and return total weeks."""
+
+    global SEGMENTS
+    split = spec["time_split"]
+    expected_weeks = int(split["expected_development_weeks"]) + int(split["expected_historical_validation_weeks"])
+    SEGMENTS = {
+        "FULL": (
+            pd.Timestamp(split["development_start"]),
+            pd.Timestamp(split["historical_validation_end"]),
+        ),
+        "DEVELOPMENT": (
+            pd.Timestamp(split["development_start"]),
+            pd.Timestamp(split["development_end"]),
+        ),
+        "HISTORICAL_VALIDATION": (
+            pd.Timestamp(split["historical_validation_start"]),
+            pd.Timestamp(split["historical_validation_end"]),
+        ),
+    }
+    return expected_weeks
 
 
 def sha256_file(path: Path) -> str:
@@ -383,6 +408,9 @@ def render_markdown(metrics: pd.DataFrame, curves: pd.DataFrame, *, identity: st
     primary_curve = curves[curves["segment"].eq("HISTORICAL_VALIDATION") & curves["pair"].eq("FC_minus_F")].sort_values(
         "decision_dt"
     )
+    validation_start = pd.Timestamp(primary["start"]).date().isoformat()
+    validation_end = pd.Timestamp(primary["end"]).date().isoformat()
+    full_weeks = int(metrics[metrics["segment"].eq("FULL") & metrics["pair"].eq("FC_minus_F")]["weeks"].iloc[0])
     cost_rows = []
     for label, column in (
         ("0 bps", "relative_nav_0bps"),
@@ -409,7 +437,7 @@ def render_markdown(metrics: pd.DataFrame, curves: pd.DataFrame, *, identity: st
 F 与 FMA 都是冻结研究对照，不是市场指数；因此这里的“超额”不是市场 alpha。
 FC − F 衡量门控总机制，包含候选选择、欠配、现金暴露和差异成本。
 
-## Historical validation（2024-01-05 至 2026-06-05）
+## Historical validation（{validation_start} 至 {validation_end}）
 
 {_metrics_table(metrics, "HISTORICAL_VALIDATION")}
 
@@ -439,7 +467,7 @@ HAC t 为 `{_num(primary["hac_t"])}`。点估计在经济上不利，但区间�
 较高成本会让 FC 相对 F 看起来稍好，因为 F 换手更高；这不表示 FC 的绝对净值随成本
 增加而改善。
 
-## 全样本（224周）
+## 全样本（{full_weeks}周）
 
 {_metrics_table(metrics, "FULL")}
 
@@ -447,7 +475,7 @@ HAC t 为 `{_num(primary["hac_t"])}`。点估计在经济上不利，但区间�
 
 - 历史验证段已被研究过程看过，不是独立 OOS。
 - qfq 开盘只是路径代理，缺少完整集合竞价、停复牌、公司行为、退市终值和逐日账户会计。
-- 当前资产没有沪深 300、中证 500/1000 等外部全收益指数，禁止写成“市场超额”。
+- 本报告主体只评价冻结研究对照；外部市场基准必须单列为“相对市场基准收益”，不能写成回归 alpha。
 - Stage 3 正式前瞻样本仍为 0/52；本报告不修改 Stage 2/3 身份、账本或授权状态。
 """
 
@@ -506,6 +534,7 @@ def generate_report(*, output_root: Path = DEFAULT_OUTPUT_ROOT) -> Path:
     """Generate a verified derived report from the current Stage 2 publication."""
 
     spec = stage2.load_and_validate_spec()
+    expected_weeks = configure_from_stage2_spec(spec)
     stage2_dir = stage2.output_path_for(spec)
     verification = stage2.verify_published_directory(stage2_dir, spec=spec)
     if verification["status"] != "VERIFIED_CURRENT":
@@ -515,7 +544,11 @@ def generate_report(*, output_root: Path = DEFAULT_OUTPUT_ROOT) -> Path:
     summary_path = stage2_dir / "path_summary.parquet"
     weekly = pd.read_parquet(weekly_path)
     registered_summary = pd.read_parquet(summary_path)
-    curves, metrics = build_excess_tables(weekly, registered_summary)
+    curves, metrics = build_excess_tables(
+        weekly,
+        registered_summary,
+        expected_weeks=expected_weeks,
+    )
 
     identity = str(verification["study_identity"])
     output_dir = output_root / f"EXCESS_{identity}"
@@ -541,6 +574,14 @@ def generate_report(*, output_root: Path = DEFAULT_OUTPUT_ROOT) -> Path:
         "external_market_benchmark": None,
         "active_return_formula": "net_return_FC - net_return_comparator",
         "relative_nav_formula": "NAV_FC / NAV_comparator",
+        "expected_weeks_per_arm": expected_weeks,
+        "segments": {
+            name: {
+                "start": start.date().isoformat(),
+                "end": end.date().isoformat(),
+            }
+            for name, (start, end) in SEGMENTS.items()
+        },
         "report_source_sha256": sha256_file(SOURCE_PATH),
         "stage2_verification": verification,
         "inputs": {
@@ -575,6 +616,7 @@ def verify_report(path: Path) -> dict[str, Any]:
     files_verified = _verify_output_files(path, manifest)
 
     spec = stage2.load_and_validate_spec()
+    configure_from_stage2_spec(spec)
     stage2_dir = stage2.output_path_for(spec)
     verification = stage2.verify_published_directory(stage2_dir, spec=spec)
     if verification["study_identity"] != manifest["stage2_verification"]["study_identity"]:
@@ -689,6 +731,8 @@ def build_market_excess_tables(
     weekly["decision_dt"] = pd.to_datetime(weekly["decision_dt"])
     benchmark_weekly = benchmark_weekly.copy()
     benchmark_weekly["decision_dt"] = pd.to_datetime(benchmark_weekly["decision_dt"])
+    if benchmark_weekly.duplicated("decision_dt").any():
+        raise ExcessReportError("market benchmark contains duplicate decision dates")
 
     curve_frames: list[pd.DataFrame] = []
     metric_rows: list[dict[str, Any]] = []
@@ -701,19 +745,29 @@ def build_market_excess_tables(
             continue
 
         arm_data = weekly[weekly["arm"].eq(arm_name)].sort_values("decision_dt").reset_index(drop=True)
-        merged = arm_data.merge(benchmark_weekly[["decision_dt", bench_col]], on="decision_dt", how="inner")
+        benchmark_columns = ["decision_dt", bench_col]
+        if bench_col == "ew_all_return":
+            benchmark_columns.extend(
+                column
+                for column in ("tradable_count", "observable_exit_count", "observable_exit_rate")
+                if column in benchmark_weekly.columns
+            )
+        merged = arm_data.merge(
+            benchmark_weekly[benchmark_columns],
+            on="decision_dt",
+            how="left",
+            validate="one_to_one",
+        )
 
-        if merged.empty:
-            continue
+        missing_dates = merged.loc[~np.isfinite(merged[bench_col]), "decision_dt"]
+        if not missing_dates.empty:
+            raise ExcessReportError(
+                f"{pair} market benchmark coverage is incomplete: {len(missing_dates)} missing dates"
+            )
 
         strategy_returns = merged["net_return_40bps"].astype(float)
         bench_returns = merged[bench_col].astype(float)
         decision_dates = pd.DatetimeIndex(merged["decision_dt"])
-
-        valid = np.isfinite(strategy_returns) & np.isfinite(bench_returns)
-        strategy_returns = strategy_returns[valid].reset_index(drop=True)
-        bench_returns = bench_returns[valid].reset_index(drop=True)
-        decision_dates = decision_dates[valid]
 
         for segment in SEGMENTS:
             curve = _market_segment_curve(strategy_returns, bench_returns, decision_dates, pair, segment)
@@ -721,6 +775,33 @@ def build_market_excess_tables(
                 continue
             metrics = _market_segment_metrics(curve)
             if metrics:
+                if bench_col == "ew_all_return" and {
+                    "tradable_count",
+                    "observable_exit_count",
+                    "observable_exit_rate",
+                } <= set(merged.columns):
+                    lo, hi = SEGMENTS[segment]
+                    coverage = merged[merged["decision_dt"].between(lo, hi)]
+                    worst_index = coverage["observable_exit_rate"].astype(float).idxmin()
+                    metrics.update(
+                        {
+                            "benchmark_observable_exit_rate_mean": float(
+                                coverage["observable_exit_rate"].astype(float).mean()
+                            ),
+                            "benchmark_observable_exit_rate_min": float(
+                                coverage["observable_exit_rate"].astype(float).min()
+                            ),
+                            "benchmark_missing_exit_observations": int(
+                                (
+                                    coverage["tradable_count"].astype(int)
+                                    - coverage["observable_exit_count"].astype(int)
+                                ).sum()
+                            ),
+                            "benchmark_worst_exit_coverage_week": pd.Timestamp(
+                                coverage.loc[worst_index, "decision_dt"]
+                            ),
+                        }
+                    )
                 curve_frames.append(curve)
                 metric_rows.append(metrics)
 
@@ -765,24 +846,25 @@ def render_market_benchmark_section(market_metrics: pd.DataFrame) -> str:
     if market_metrics.empty:
         return "\n## 市场超额收益\n\n市场基准数据不可用。请先运行：\n```\nuv run --no-sync python scripts/xs_chan_market_benchmark.py generate\n```\n"
 
+    validation = market_metrics[market_metrics["segment"].eq("HISTORICAL_VALIDATION")]
+    validation_period = (
+        f"{pd.Timestamp(validation['start'].min()).date()} 至 {pd.Timestamp(validation['end'].max()).date()}"
+        if not validation.empty
+        else "数据不可用"
+    )
     lines = [
         "",
-        "## 市场超额收益",
+        "## 相对市场基准收益",
         "",
-        "以下使用外部市场基准衡量策略的绝对 alpha。「全A等权」是最公平的 null hypothesis：",
-        "如果等权随机持有全部可交易A股，收益如何。中证1000 是小盘市值加权参照。",
+        "以下使用外部市场基准衡量相对收益。「全A等权」回答同一持有窗口内，",
+        "等权持有可交易 A 股的收益如何；中证1000 是小盘市值加权参照。",
+        "这些差值没有经过因子回归，不能称为 alpha。",
         "",
-        "**注意**：「F − EW-All」衡量的是纯因子选股本身的市场超额；「FC − F」（上文）衡量",
-        "缠论门控在因子基础上的增量。三层归因：",
+        "**注意**：「F − EW-All」衡量纯因子路径相对等权市场参照的收益差；",
+        "「FC − F」（上文）衡量缠论门控在因子基础上的增量。两者是不同问题，不能相加成",
+        "因果归因。",
         "",
-        "```",
-        "策略总收益 = 市场 beta + 因子 alpha + 门控增量",
-        "市场 beta  ≈ EW-All 收益",
-        "因子 alpha ≈ F − EW-All",
-        "门控增量   ≈ FC − F",
-        "```",
-        "",
-        "### Historical validation（2024-01-05 至 2026-06-05）",
+        f"### Historical validation（{validation_period}）",
         "",
     ]
 
@@ -790,6 +872,31 @@ def render_market_benchmark_section(market_metrics: pd.DataFrame) -> str:
         lines.append(_market_metrics_table(market_metrics, "HISTORICAL_VALIDATION"))
     else:
         lines.append("（验证段数据不可用）")
+
+    ew_validation = validation[validation["pair"].isin(["FC_minus_EW", "F_minus_EW"])]
+    if (
+        not ew_validation.empty
+        and "benchmark_observable_exit_rate_mean" in ew_validation
+        and pd.notna(ew_validation.iloc[0]["benchmark_observable_exit_rate_mean"])
+    ):
+        coverage = ew_validation.iloc[0]
+        lines.extend(
+            [
+                "",
+                "EW-All 退出开盘覆盖（验证段）："
+                f"平均 {_pct(coverage['benchmark_observable_exit_rate_mean'])}，"
+                f"最低 {_pct(coverage['benchmark_observable_exit_rate_min'])}，"
+                f"缺失退出观测 {int(coverage['benchmark_missing_exit_observations']):,} 个；"
+                "缺失项按 0 收益代理。",
+            ]
+        )
+    if not market_metrics["pair"].astype(str).str.contains("CSI1000").any():
+        lines.extend(
+            [
+                "",
+                "**CSI1000 本轮不可用：未计算、未展示，也未声称报告包含该指数结果。**",
+            ]
+        )
 
     lines.extend(["", "### 全样本", ""])
     if "FULL" in market_metrics["segment"].values:
@@ -802,14 +909,71 @@ def render_market_benchmark_section(market_metrics: pd.DataFrame) -> str:
             "",
             "### 口径说明",
             "",
-            "- 全A等权(EW-All)：每周所有可交易A股（开盘价>1元、有成交）的等权 5-session open-to-open 收益均值",
-            "- 中证1000(CSI1000)：官方指数同窗口 close-to-close 收益",
+            "- 全A等权(EW-All)：按 D+1 入场日可观测性固定股票池；缺失 D+6 退出开盘按 0 收益代理并披露覆盖率",
+            "- 中证1000(CSI1000)：官方指数同一 D+1 至 D+6 窗口的 open-to-open 收益",
             "- 策略使用 net_return_40bps（含买 15bps + 卖 25bps 成本），基准为零成本",
             "- 基准不扣除分红再投资，策略侧也无分红调整，二者口径一致",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def _market_output_inventory(output_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    for name in sorted(MARKET_OUTPUT_FILES):
+        path = output_dir / name
+        row: dict[str, Any] = {
+            "path": name,
+            "size": int(path.stat().st_size),
+            "sha256": sha256_file(path),
+        }
+        if path.suffix == ".csv":
+            row["rows"] = int(len(pd.read_csv(path)))
+        rows.append(row)
+    return rows
+
+
+def _import_market_module() -> Any:
+    try:
+        import xs_chan_market_benchmark as market_module
+
+        return market_module
+    except ImportError:
+        import importlib.util
+
+        spec_obj = importlib.util.spec_from_file_location(
+            "xs_chan_market_benchmark",
+            Path(__file__).resolve().parent / "xs_chan_market_benchmark.py",
+        )
+        if spec_obj is None or spec_obj.loader is None:
+            raise ExcessReportError("xs_chan_market_benchmark module is unavailable") from None
+        market_module = importlib.util.module_from_spec(spec_obj)
+        spec_obj.loader.exec_module(market_module)
+        return market_module
+
+
+def _verify_market_output_files(path: Path, manifest: Mapping[str, Any]) -> int:
+    output_rows = manifest.get("outputs")
+    if not isinstance(output_rows, list):
+        raise ExcessReportError("market report manifest outputs must be a list")
+    expected_names = {str(row.get("path")) for row in output_rows if isinstance(row, Mapping)}
+    if expected_names != MARKET_OUTPUT_FILES or len(output_rows) != len(MARKET_OUTPUT_FILES):
+        raise ExcessReportError(f"market report manifest output set mismatch: {sorted(expected_names)}")
+    actual_names = {item.relative_to(path).as_posix() for item in path.rglob("*") if item.is_file()}
+    expected_all = MARKET_OUTPUT_FILES | {"manifest.json"}
+    if actual_names != expected_all:
+        raise ExcessReportError(
+            f"market report output set changed: missing={sorted(expected_all - actual_names)} "
+            f"extra={sorted(actual_names - expected_all)}"
+        )
+    for row in output_rows:
+        output = path / str(row["path"])
+        if int(output.stat().st_size) != int(row["size"]):
+            raise ExcessReportError(f"market report output size mismatch: {output}")
+        if sha256_file(output) != row["sha256"]:
+            raise ExcessReportError(f"market report output hash mismatch: {output}")
+    return len(output_rows)
 
 
 def generate_market_report(
@@ -823,24 +987,8 @@ def generate_market_report(
     the main generate_report() or independently.
     """
 
-    try:
-        import xs_chan_market_benchmark as mkt
-    except ImportError:
-        import importlib.util
-
-        spec_obj = importlib.util.spec_from_file_location(
-            "xs_chan_market_benchmark",
-            Path(__file__).resolve().parent / "xs_chan_market_benchmark.py",
-        )
-        if spec_obj is None or spec_obj.loader is None:
-            return {"status": "MARKET_BENCHMARK_MODULE_NOT_FOUND"}
-        mkt = importlib.util.module_from_spec(spec_obj)
-        spec_obj.loader.exec_module(mkt)
-
-    try:
-        benchmark_weekly = mkt.load_benchmark_weekly()
-    except FileNotFoundError:
-        return {"status": "MARKET_BENCHMARK_NOT_GENERATED"}
+    mkt = _import_market_module()
+    benchmark_weekly = mkt.load_benchmark_weekly()
 
     market_curves, market_metrics = build_market_excess_tables(weekly, benchmark_weekly)
 
@@ -850,18 +998,120 @@ def generate_market_report(
     if output_dir is None:
         output_dir = DEFAULT_OUTPUT_ROOT / "market_benchmark"
     output_dir.mkdir(parents=True, exist_ok=True)
+    existing_names = {item.name for item in output_dir.iterdir() if item.is_file()}
+    allowed_names = MARKET_OUTPUT_FILES | {"manifest.json"}
+    if unexpected := existing_names - allowed_names:
+        raise ExcessReportError(f"refusing to overwrite market report with unexpected files: {sorted(unexpected)}")
 
-    market_curves.to_csv(output_dir / "market_excess_curve.csv", index=False)
-    market_metrics.to_csv(output_dir / "market_excess_metrics.csv", index=False)
+    _atomic_write_csv(output_dir / "market_excess_curve.csv", market_curves)
+    _atomic_write_csv(output_dir / "market_excess_metrics.csv", market_metrics)
 
     report_text = render_market_benchmark_section(market_metrics)
-    (output_dir / "market_benchmark_report.md").write_text(report_text, encoding="utf-8")
+    _atomic_write_text(output_dir / "market_benchmark_report.md", report_text)
+
+    spec = stage2.load_and_validate_spec()
+    configure_from_stage2_spec(spec)
+    stage2_dir = stage2.output_path_for(spec)
+    stage2_verification = stage2.verify_published_directory(stage2_dir, spec=spec)
+    if stage2_verification["status"] != "VERIFIED_CURRENT":
+        raise ExcessReportError(f"Stage 2 publication is not current: {stage2_verification}")
+    current_weekly_path = stage2_dir / "path_weekly.parquet"
+    current_weekly = pd.read_parquet(current_weekly_path)
+    compare_columns = sorted(set(current_weekly.columns) & set(weekly.columns))
+    if (
+        not current_weekly[compare_columns]
+        .reset_index(drop=True)
+        .equals(weekly[compare_columns].reset_index(drop=True))
+    ):
+        raise ExcessReportError("market report weekly input is not the current Stage 2 path_weekly")
+
+    benchmark_manifest_path = mkt.OUTPUT_DIR / "manifest.json"
+    benchmark_weekly_path = mkt.OUTPUT_DIR / "market_benchmark_weekly.parquet"
+    benchmark_manifest = mkt.verify_benchmark(mkt.OUTPUT_DIR)
+    manifest = {
+        "schema": MARKET_ADDON_SCHEMA,
+        "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "study_boundary": "RETROSPECTIVE_FALSIFICATION_ONLY",
+        "live_trading_authorized": False,
+        "claim": "RELATIVE_MARKET_RETURN_NOT_REGRESSION_ALPHA",
+        "report_source_sha256": sha256_file(SOURCE_PATH),
+        "stage2_verification": stage2_verification,
+        "inputs": {
+            "path_weekly": {
+                "path": str(current_weekly_path),
+                "sha256": sha256_file(current_weekly_path),
+                "rows": int(len(current_weekly)),
+            },
+            "market_benchmark": {
+                "manifest_path": str(benchmark_manifest_path),
+                "manifest_sha256": sha256_file(benchmark_manifest_path),
+                "weekly_path": str(benchmark_weekly_path),
+                "weekly_sha256": sha256_file(benchmark_weekly_path),
+                "generator_sha256": benchmark_manifest["generator_sha256"],
+                "available_index_codes": benchmark_manifest["available_index_codes"],
+                "unavailable_index_codes": [
+                    entry["code"] for entry in benchmark_manifest["index_inputs"] if not entry["available"]
+                ],
+            },
+        },
+        "pairs": sorted(market_metrics["pair"].astype(str).unique().tolist()),
+        "outputs": _market_output_inventory(output_dir),
+    }
+    _atomic_write_text(
+        output_dir / "manifest.json",
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    verification = verify_market_report(output_dir)
 
     return {
-        "status": "GENERATED",
+        "status": "GENERATED_AND_VERIFIED",
         "output_dir": str(output_dir),
         "weeks_matched": int(market_metrics["weeks"].max()) if not market_metrics.empty else 0,
         "pairs": list(market_metrics["pair"].unique()),
+        "verification": verification,
+    }
+
+
+def verify_market_report(path: Path) -> dict[str, Any]:
+    """Verify market-addon identity, inputs, and its exact output set."""
+
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ExcessReportError(f"missing market report manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema") != MARKET_ADDON_SCHEMA:
+        raise ExcessReportError(f"unexpected market report schema: {manifest.get('schema')}")
+    if manifest.get("live_trading_authorized") is not False:
+        raise ExcessReportError("market report must not authorize live trading")
+    if manifest.get("report_source_sha256") != sha256_file(SOURCE_PATH):
+        raise ExcessReportError("market report generator source changed")
+    files_verified = _verify_market_output_files(path, manifest)
+
+    spec = stage2.load_and_validate_spec()
+    configure_from_stage2_spec(spec)
+    stage2_dir = stage2.output_path_for(spec)
+    stage2_verification = stage2.verify_published_directory(stage2_dir, spec=spec)
+    if stage2_verification["study_identity"] != manifest["stage2_verification"]["study_identity"]:
+        raise ExcessReportError("market report Stage 2 identity is not current")
+    weekly_path = stage2_dir / "path_weekly.parquet"
+    if sha256_file(weekly_path) != manifest["inputs"]["path_weekly"]["sha256"]:
+        raise ExcessReportError("market report Stage 2 weekly input changed")
+
+    mkt = _import_market_module()
+    mkt.verify_benchmark(mkt.OUTPUT_DIR)
+    benchmark_manifest_path = mkt.OUTPUT_DIR / "manifest.json"
+    benchmark_weekly_path = mkt.OUTPUT_DIR / "market_benchmark_weekly.parquet"
+    benchmark_input = manifest["inputs"]["market_benchmark"]
+    if sha256_file(benchmark_manifest_path) != benchmark_input["manifest_sha256"]:
+        raise ExcessReportError("market benchmark manifest changed")
+    if sha256_file(benchmark_weekly_path) != benchmark_input["weekly_sha256"]:
+        raise ExcessReportError("market benchmark weekly data changed")
+    return {
+        "status": "VERIFIED_MARKET_EXCESS_REPORT",
+        "path": str(path),
+        "stage2_identity": stage2_verification["study_identity"],
+        "files_verified": files_verified + 3,
+        "live_trading_authorized": False,
     }
 
 
@@ -876,6 +1126,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     market = subparsers.add_parser("market", help="Generate market-benchmark-only report")
     market.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    verify_market = subparsers.add_parser("verify-market", help="Verify a market-benchmark addon report")
+    verify_market.add_argument("--path", type=Path)
+    verify_market.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     return parser
 
 
@@ -886,15 +1139,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = verify_report(path)
         if getattr(args, "with_market", False):
             spec = stage2.load_and_validate_spec()
+            configure_from_stage2_spec(spec)
             stage2_dir = stage2.output_path_for(spec)
             weekly = pd.read_parquet(stage2_dir / "path_weekly.parquet")
-            market_result = generate_market_report(weekly, output_dir=path / "market_benchmark")
+            market_result = generate_market_report(
+                weekly,
+                output_dir=args.output_root / f"MARKET_{stage2.study_identity(spec)}",
+            )
             result["market_benchmark"] = market_result
     elif args.command == "market":
         spec = stage2.load_and_validate_spec()
+        configure_from_stage2_spec(spec)
         stage2_dir = stage2.output_path_for(spec)
         weekly = pd.read_parquet(stage2_dir / "path_weekly.parquet")
         result = generate_market_report(weekly, output_dir=args.output_root / "market_benchmark")
+    elif args.command == "verify-market":
+        if args.path is None:
+            spec = stage2.load_and_validate_spec()
+            args.path = args.output_root / f"MARKET_{stage2.study_identity(spec)}"
+        result = verify_market_report(args.path)
     else:
         if args.path is None:
             spec = stage2.load_and_validate_spec()

@@ -36,6 +36,8 @@ except ImportError:
 DATA_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
 INDEX_CACHE_DIR = Path.home() / ".ts_data_cache" / "index_daily"
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output" / "xs_chan_market_benchmark"
+SOURCE_PATH = Path(__file__).resolve()
+MANIFEST_SCHEMA = "xs_chan_market_benchmark_v2"
 HOLDING_SESSIONS = 5
 MIN_TRADABLE_STOCKS = 200
 MIN_OPEN_PRICE = 1.0
@@ -52,6 +54,27 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _physical_data_closure() -> dict[str, int | str]:
+    """Bind every raw parquet by name, size, and physical SHA-256."""
+
+    paths = sorted(DATA_DIR.glob("*.parquet"))
+    if not paths:
+        raise RuntimeError(f"no raw market parquet files found under {DATA_DIR}")
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for path in paths:
+        size = path.stat().st_size
+        physical_sha256 = _sha256_file(path)
+        digest.update(f"{path.name}\0{size}\0{physical_sha256}\n".encode())
+        total_bytes += size
+    return {
+        "algorithm": "sha256_of_sorted_name_nul_size_nul_physical_sha256_lines",
+        "file_count": len(paths),
+        "total_bytes": total_bytes,
+        "digest_sha256": digest.hexdigest(),
+    }
 
 
 def load_market_calendar(end_date: str | None = None) -> pd.DatetimeIndex:
@@ -153,6 +176,10 @@ def compute_ew_weekly_returns(
       exit_open  = open at session D+1+HOLDING_SESSIONS = D+6
       stock_return = exit_open / entry_open - 1
       ew_return = mean(stock_return) across all tradable stocks
+
+    The weekly universe is fixed using entry-session observability only.
+    Missing exit opens receive the same zero-return proxy used by the Stage 2
+    fixed-slot stress path and are disclosed through ``observable_exit_rate``.
     """
 
     session_lookup = pd.Series(np.arange(len(calendar), dtype=np.int32), index=calendar)
@@ -174,9 +201,7 @@ def compute_ew_weekly_returns(
         entry_opens = pivot_open.loc[entry_session]
         exit_opens = pivot_open.loc[exit_session]
 
-        tradable = (
-            entry_opens.notna() & exit_opens.notna() & (entry_opens > MIN_OPEN_PRICE) & (exit_opens > MIN_OPEN_PRICE)
-        )
+        tradable = entry_opens.notna() & (entry_opens > MIN_OPEN_PRICE)
         if pivot_amount is not None and entry_session in pivot_amount.index:
             entry_amounts = pivot_amount.loc[entry_session]
             tradable = tradable & entry_amounts.notna() & (entry_amounts > MIN_AMOUNT)
@@ -184,19 +209,21 @@ def compute_ew_weekly_returns(
         if tradable.sum() < MIN_TRADABLE_STOCKS:
             continue
 
-        returns = exit_opens[tradable] / entry_opens[tradable] - 1.0
-        valid_returns = returns[np.isfinite(returns)]
-
-        if len(valid_returns) < MIN_TRADABLE_STOCKS:
-            continue
+        selected_entry = entry_opens[tradable]
+        selected_exit = exit_opens.reindex(selected_entry.index)
+        observable_exit = selected_exit.notna() & np.isfinite(selected_exit) & (selected_exit > 0)
+        returns = pd.Series(0.0, index=selected_entry.index, dtype=float)
+        returns.loc[observable_exit] = selected_exit.loc[observable_exit] / selected_entry.loc[observable_exit] - 1.0
 
         rows.append(
             {
                 "decision_dt": dec_dt,
-                "ew_all_return": float(valid_returns.mean()),
-                "ew_all_median_return": float(valid_returns.median()),
-                "ew_all_std": float(valid_returns.std()),
-                "tradable_count": int(len(valid_returns)),
+                "ew_all_return": float(returns.mean()),
+                "ew_all_median_return": float(returns.median()),
+                "ew_all_std": float(returns.std()),
+                "tradable_count": int(len(returns)),
+                "observable_exit_count": int(observable_exit.sum()),
+                "observable_exit_rate": float(observable_exit.mean()),
             }
         )
 
@@ -262,10 +289,11 @@ def compute_index_weekly_returns(
     decision_dates: pd.DatetimeIndex,
     ts_code: str,
 ) -> pd.DataFrame:
-    """Compute index returns over the same 5-session windows as the strategy.
+    """Compute index open-to-open returns over the strategy's exact window.
 
-    Uses close-to-close for the index: close[D] → close[D+5] where D is decision session.
-    This approximates the same holding period as open-to-open for individual stocks.
+    Entry is the official index open at ``D+1`` and exit is the open at
+    ``D+1+HOLDING_SESSIONS``. This matches the strategy proxy instead of
+    silently adding the decision-day close-to-next-open interval.
     """
 
     session_lookup = pd.Series(np.arange(len(calendar), dtype=np.int32), index=calendar)
@@ -275,7 +303,9 @@ def compute_index_weekly_returns(
     index_daily = index_daily.dropna(subset=["session_no"]).sort_values("session_no")
     index_daily["session_no"] = index_daily["session_no"].astype(np.int32)
 
-    close_by_session = index_daily.set_index("session_no")["close"]
+    if "open" not in index_daily:
+        raise RuntimeError(f"index data for {ts_code} does not contain open")
+    open_by_session = index_daily.set_index("session_no")["open"]
 
     col_name = f"{ts_code.split('.')[0].lower()}_return"
     rows = []
@@ -284,21 +314,22 @@ def compute_index_weekly_returns(
         if pd.isna(dec_session):
             continue
         dec_session = int(dec_session)
-        exit_session = dec_session + 1 + HOLDING_SESSIONS
+        entry_session = dec_session + 1
+        exit_session = entry_session + HOLDING_SESSIONS
 
-        if dec_session not in close_by_session.index or exit_session not in close_by_session.index:
+        if entry_session not in open_by_session.index or exit_session not in open_by_session.index:
             continue
 
-        entry_close = close_by_session.loc[dec_session]
-        exit_close = close_by_session.loc[exit_session]
+        entry_open = open_by_session.loc[entry_session]
+        exit_open = open_by_session.loc[exit_session]
 
-        if not (np.isfinite(entry_close) and np.isfinite(exit_close) and entry_close > 0):
+        if not (np.isfinite(entry_open) and np.isfinite(exit_open) and entry_open > 0):
             continue
 
         rows.append(
             {
                 "decision_dt": dec_dt,
-                col_name: float(exit_close / entry_close - 1.0),
+                col_name: float(exit_open / entry_open - 1.0),
             }
         )
 
@@ -317,22 +348,76 @@ def generate_benchmarks(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("[benchmark] Building market calendar...", flush=True)
-    calendar = load_market_calendar(end_date)
+    # ``end_date`` limits decision dates, not input sessions. The strategy
+    # still needs D+1 entry and D+6 exit sessions after the last decision.
+    calendar = load_market_calendar()
     decision_dates = build_decision_dates(calendar, start_date=start_date, end_date=end_date)
+    session_lookup = pd.Series(np.arange(len(calendar), dtype=np.int32), index=calendar)
+    decision_sessions = decision_dates.map(lambda dt: session_lookup.get(dt))
+    complete_mask = np.asarray(
+        [
+            pd.notna(session_no) and int(session_no) + 1 + HOLDING_SESSIONS < len(calendar)
+            for session_no in decision_sessions
+        ],
+        dtype=bool,
+    )
+    incomplete_dates = decision_dates[~complete_mask]
+    if end_date is not None and len(incomplete_dates):
+        raise RuntimeError(
+            "requested decision range lacks D+6 market data for "
+            f"{len(incomplete_dates)} dates; last={incomplete_dates[-1].date()}"
+        )
+    decision_dates = decision_dates[complete_mask]
     print(f"[benchmark] Calendar: {len(calendar)} sessions, {len(decision_dates)} decision weeks", flush=True)
 
     panel = load_daily_panel(calendar)
     ew_weekly = compute_ew_weekly_returns(panel, calendar, decision_dates)
     del panel
+    if len(ew_weekly) != len(decision_dates) or set(ew_weekly["decision_dt"]) != set(decision_dates):
+        raise RuntimeError(
+            "EW-All benchmark does not cover every complete decision date: "
+            f"expected={len(decision_dates)} observed={len(ew_weekly)}"
+        )
 
     index_frames = []
+    index_inputs: list[dict[str, object]] = []
+    index_data_end = calendar.max().strftime("%Y%m%d")
     for code in INDEX_CODES:
         try:
-            index_daily = fetch_index_daily(code, start_date=start_date, end_date=end_date, refresh=refresh_index)
+            index_daily = fetch_index_daily(
+                code,
+                start_date=start_date,
+                end_date=index_data_end,
+                refresh=refresh_index,
+            )
             idx_weekly = compute_index_weekly_returns(index_daily, calendar, decision_dates, code)
+            if len(idx_weekly) != len(decision_dates) or set(idx_weekly["decision_dt"]) != set(decision_dates):
+                raise RuntimeError(
+                    f"{code} does not cover every requested decision date: "
+                    f"expected={len(decision_dates)} observed={len(idx_weekly)}"
+                )
             index_frames.append(idx_weekly)
+            cache_path = INDEX_CACHE_DIR / f"{code.replace('.', '_')}.parquet"
+            index_inputs.append(
+                {
+                    "code": code,
+                    "available": True,
+                    "output_column": f"{code.split('.')[0].lower()}_return",
+                    "weekly_rows": len(idx_weekly),
+                    "cache_path": str(cache_path.resolve()),
+                    "cache_sha256": _sha256_file(cache_path),
+                }
+            )
         except Exception as exc:
             print(f"[benchmark] WARNING: Failed to fetch {code}: {exc}", flush=True)
+            index_inputs.append(
+                {
+                    "code": code,
+                    "available": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
 
     result = ew_weekly.copy()
     for idx_df in index_frames:
@@ -342,36 +427,100 @@ def generate_benchmarks(
     result.to_parquet(output_path, index=False)
 
     manifest = {
-        "schema": "xs_chan_market_benchmark_v1",
+        "schema": MANIFEST_SCHEMA,
         "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "start_date": start_date,
-        "end_date": end_date or str(calendar.max().date()),
+        "requested_decision_end_date": end_date,
+        "decision_start_date": result["decision_dt"].min().date().isoformat(),
+        "decision_end_date": result["decision_dt"].max().date().isoformat(),
+        "market_data_end_date": calendar.max().date().isoformat(),
         "calendar_sessions": int(len(calendar)),
         "decision_weeks": int(len(decision_dates)),
+        "incomplete_decision_dates_excluded": [dt.date().isoformat() for dt in incomplete_dates],
         "output_weeks": int(len(result)),
         "holding_sessions": HOLDING_SESSIONS,
         "ew_all_mean_tradable_count": int(result["tradable_count"].mean()) if "tradable_count" in result else 0,
+        "ew_all_mean_observable_exit_rate": (
+            float(result["observable_exit_rate"].mean()) if "observable_exit_rate" in result else None
+        ),
+        "ew_all_min_observable_exit_rate": (
+            float(result["observable_exit_rate"].min()) if "observable_exit_rate" in result else None
+        ),
+        "ew_all_missing_exit_observations": (
+            int((result["tradable_count"] - result["observable_exit_count"]).sum())
+            if {"tradable_count", "observable_exit_count"} <= set(result.columns)
+            else None
+        ),
         "columns": list(result.columns),
         "output_sha256": _sha256_file(output_path),
-        "index_codes": INDEX_CODES,
+        "generator_path": str(SOURCE_PATH),
+        "generator_sha256": _sha256_file(SOURCE_PATH),
+        "raw_data_closure": _physical_data_closure(),
+        "requested_index_codes": INDEX_CODES,
+        "available_index_codes": [entry["code"] for entry in index_inputs if entry["available"]],
+        "index_inputs": index_inputs,
     }
     manifest_path = OUTPUT_DIR / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
+    verify_benchmark(OUTPUT_DIR)
     print(f"[benchmark] Output: {output_path} ({len(result)} rows)", flush=True)
     print(f"[benchmark] Manifest: {manifest_path}", flush=True)
     return output_path
 
 
-def load_benchmark_weekly(output_dir: Path = OUTPUT_DIR) -> pd.DataFrame:
-    """Load the pre-computed market benchmark weekly table."""
+def verify_benchmark(output_dir: Path = OUTPUT_DIR) -> dict[str, object]:
+    """Fail closed on stale source, raw inputs, index caches, or output bytes."""
 
     path = output_dir / "market_benchmark_weekly.parquet"
-    if not path.exists():
+    manifest_path = output_dir / "manifest.json"
+    if not path.is_file():
         raise FileNotFoundError(
             f"Market benchmark not found at {path}. Run: "
             "uv run --no-sync python scripts/xs_chan_market_benchmark.py generate"
         )
+    if not manifest_path.is_file():
+        raise RuntimeError(f"market benchmark manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise RuntimeError(
+            f"unsupported market benchmark manifest schema: {manifest.get('schema')!r}; regenerate benchmark"
+        )
+    if manifest.get("generator_sha256") != _sha256_file(SOURCE_PATH):
+        raise RuntimeError("market benchmark generator changed; regenerate benchmark")
+    if manifest.get("output_sha256") != _sha256_file(path):
+        raise RuntimeError("market benchmark parquet hash does not match its manifest")
+    observed_closure = _physical_data_closure()
+    if manifest.get("raw_data_closure") != observed_closure:
+        raise RuntimeError("raw A-share input closure changed; regenerate market benchmark")
+    for entry in manifest.get("index_inputs", []):
+        if not entry.get("available"):
+            continue
+        cache_path = Path(str(entry.get("cache_path", "")))
+        if not cache_path.is_file() or _sha256_file(cache_path) != entry.get("cache_sha256"):
+            raise RuntimeError(f"index cache changed or is missing for {entry.get('code')}")
+
+    frame = pd.read_parquet(path)
+    if frame.empty:
+        raise RuntimeError("market benchmark is empty")
+    if frame.duplicated("decision_dt").any():
+        raise RuntimeError("market benchmark contains duplicate decision dates")
+    if list(frame.columns) != manifest.get("columns"):
+        raise RuntimeError("market benchmark columns do not match its manifest")
+    if len(frame) != int(manifest.get("output_weeks", -1)):
+        raise RuntimeError("market benchmark row count does not match its manifest")
+    observed_start = pd.Timestamp(frame["decision_dt"].min()).date().isoformat()
+    observed_end = pd.Timestamp(frame["decision_dt"].max()).date().isoformat()
+    if observed_start != manifest.get("decision_start_date") or observed_end != manifest.get("decision_end_date"):
+        raise RuntimeError("market benchmark date range does not match its manifest")
+    return manifest
+
+
+def load_benchmark_weekly(output_dir: Path = OUTPUT_DIR) -> pd.DataFrame:
+    """Load a fully verified pre-computed market benchmark weekly table."""
+
+    verify_benchmark(output_dir)
+    path = output_dir / "market_benchmark_weekly.parquet"
     df = pd.read_parquet(path)
     df["decision_dt"] = pd.to_datetime(df["decision_dt"])
     return df
@@ -387,6 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--refresh-index", action="store_true", help="Re-fetch index data from Tushare")
 
     subparsers.add_parser("info", help="Show benchmark info from manifest")
+    subparsers.add_parser("verify", help="Verify benchmark source, inputs, and output bytes")
     return parser
 
 
@@ -405,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
             print("No benchmark generated yet. Run 'generate' first.")
             return 1
         print(manifest_path.read_text())
+    elif args.command == "verify":
+        print(json.dumps(verify_benchmark(OUTPUT_DIR), ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 

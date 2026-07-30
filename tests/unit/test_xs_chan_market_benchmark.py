@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ SCRIPTS_DIR = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import xs_chan_excess_return_report as report  # noqa: E402
+import xs_chan_market_benchmark as market  # noqa: E402
 
 
 def _synthetic_weekly_paths(n_weeks: int = 20) -> pd.DataFrame:
@@ -49,13 +51,18 @@ def _synthetic_benchmark(weekly: pd.DataFrame) -> pd.DataFrame:
 
     np.random.seed(123)
     dates = sorted(weekly["decision_dt"].unique())
+    tradable_count = np.random.randint(3000, 5000, len(dates))
+    missing_exit_count = np.random.randint(0, 10, len(dates))
+    observable_exit_count = tradable_count - missing_exit_count
     return pd.DataFrame(
         {
             "decision_dt": pd.to_datetime(dates),
             "ew_all_return": np.random.normal(0.003, 0.025, len(dates)),
             "ew_all_median_return": np.random.normal(0.002, 0.02, len(dates)),
             "ew_all_std": np.abs(np.random.normal(0.04, 0.01, len(dates))),
-            "tradable_count": np.random.randint(3000, 5000, len(dates)),
+            "tradable_count": tradable_count,
+            "observable_exit_count": observable_exit_count,
+            "observable_exit_rate": observable_exit_count / tradable_count,
             "000852_return": np.random.normal(0.004, 0.03, len(dates)),
             "000905_return": np.random.normal(0.003, 0.028, len(dates)),
         }
@@ -85,7 +92,7 @@ class TestBuildMarketExcessTables:
         assert "FC_minus_EW" in present_pairs
         assert "F_minus_EW" in present_pairs
 
-    def test_returns_empty_when_no_date_overlap(self):
+    def test_rejects_incomplete_date_coverage(self):
         weekly = _synthetic_weekly_paths(n_weeks=5)
         benchmark = pd.DataFrame(
             {
@@ -93,9 +100,8 @@ class TestBuildMarketExcessTables:
                 "ew_all_return": [0.01] * 5,
             }
         )
-        curves, metrics = report.build_market_excess_tables(weekly, benchmark)
-        assert curves.empty
-        assert metrics.empty
+        with pytest.raises(report.ExcessReportError, match="coverage is incomplete"):
+            report.build_market_excess_tables(weekly, benchmark)
 
     def test_relative_nav_is_exact_ratio_not_compounded_active(self):
         weekly = _synthetic_weekly_paths(n_weeks=20)
@@ -154,6 +160,18 @@ class TestBuildMarketExcessTables:
 
             assert fc_ew_mean == pytest.approx(f_ew_mean + fc_minus_f_mean, abs=1e-10)
 
+    def test_ew_exit_coverage_is_carried_into_metrics(self):
+        weekly = _synthetic_weekly_paths(n_weeks=20)
+        benchmark = _synthetic_benchmark(weekly)
+        _, metrics = report.build_market_excess_tables(weekly, benchmark)
+
+        ew = metrics[(metrics["segment"] == "FULL") & (metrics["pair"] == "FC_minus_EW")].iloc[0]
+        assert ew["benchmark_observable_exit_rate_mean"] == pytest.approx(benchmark["observable_exit_rate"].mean())
+        assert ew["benchmark_observable_exit_rate_min"] == pytest.approx(benchmark["observable_exit_rate"].min())
+        assert int(ew["benchmark_missing_exit_observations"]) == int(
+            (benchmark["tradable_count"] - benchmark["observable_exit_count"]).sum()
+        )
+
 
 class TestRenderMarketBenchmarkSection:
     def test_render_empty_produces_fallback_message(self):
@@ -161,18 +179,18 @@ class TestRenderMarketBenchmarkSection:
         assert "市场基准数据不可用" in text
 
     def test_render_with_data_contains_key_sections(self):
-        weekly = _synthetic_weekly_paths(n_weeks=20)
+        weekly = _synthetic_weekly_paths(n_weeks=200)
         benchmark = _synthetic_benchmark(weekly)
         _, metrics = report.build_market_excess_tables(weekly, benchmark)
 
         text = report.render_market_benchmark_section(metrics)
-        assert "市场超额收益" in text
-        assert "三层归因" in text
-        assert "因子 alpha" in text
-        assert "门控增量" in text
+        assert "相对市场基准收益" in text
+        assert "不能称为 alpha" in text
+        assert "因果归因" in text
         assert "全A等权" in text
         assert "中证1000" in text
         assert "口径说明" in text
+        assert "退出开盘覆盖" in text
 
     def test_render_includes_both_segments(self):
         weekly = _synthetic_weekly_paths(n_weeks=200)
@@ -182,6 +200,15 @@ class TestRenderMarketBenchmarkSection:
         text = report.render_market_benchmark_section(metrics)
         assert "Historical validation" in text
         assert "全样本" in text
+
+    def test_render_explicitly_discloses_unavailable_csi1000(self):
+        weekly = _synthetic_weekly_paths(n_weeks=20)
+        benchmark = _synthetic_benchmark(weekly).drop(columns=["000852_return", "000905_return"])
+        _, metrics = report.build_market_excess_tables(weekly, benchmark)
+
+        text = report.render_market_benchmark_section(metrics)
+        assert "CSI1000 本轮不可用" in text
+        assert "未计算、未展示" in text
 
 
 class TestMarketPairSpecsComplete:
@@ -195,4 +222,70 @@ class TestMarketPairSpecsComplete:
 
     def test_f_minus_ew_pair_exists_for_factor_alpha_decomposition(self):
         assert "F_minus_EW" in report.MARKET_PAIR_SPECS
-        assert report.MARKET_PAIR_SPECS["F_minus_EW"]["comparison_role"] == "FACTOR_MARKET_ALPHA"
+        assert report.MARKET_PAIR_SPECS["F_minus_EW"]["comparison_role"] == "FACTOR_MARKET_RELATIVE"
+
+
+def test_index_benchmark_uses_exact_strategy_open_window():
+    calendar = pd.bdate_range("2024-01-01", periods=10)
+    decision_dates = pd.DatetimeIndex([calendar[1]])
+    index_daily = pd.DataFrame(
+        {
+            "trade_date": calendar.strftime("%Y%m%d"),
+            "open": np.arange(10, 20, dtype=float),
+            "close": np.arange(100, 110, dtype=float),
+        }
+    )
+
+    result = market.compute_index_weekly_returns(
+        index_daily,
+        calendar,
+        decision_dates,
+        "000852.SH",
+    )
+
+    expected = index_daily.loc[7, "open"] / index_daily.loc[2, "open"] - 1.0
+    assert result["000852_return"].iloc[0] == pytest.approx(expected)
+
+
+def test_benchmark_verifier_rejects_output_and_raw_input_tampering(tmp_path, monkeypatch):
+    raw_dir = tmp_path / "raw"
+    output_dir = tmp_path / "benchmark"
+    raw_dir.mkdir()
+    output_dir.mkdir()
+    raw_path = raw_dir / "000001.SZ.parquet"
+    pd.DataFrame({"trade_date": ["20240101"], "open": [10.0]}).to_parquet(raw_path, index=False)
+    monkeypatch.setattr(market, "DATA_DIR", raw_dir)
+
+    weekly_path = output_dir / "market_benchmark_weekly.parquet"
+    weekly = pd.DataFrame(
+        {
+            "decision_dt": pd.to_datetime(["2024-01-05"]),
+            "ew_all_return": [0.01],
+            "tradable_count": [1000],
+            "observable_exit_count": [999],
+            "observable_exit_rate": [0.999],
+        }
+    )
+    weekly.to_parquet(weekly_path, index=False)
+    manifest = {
+        "schema": market.MANIFEST_SCHEMA,
+        "generator_sha256": market._sha256_file(market.SOURCE_PATH),
+        "output_sha256": market._sha256_file(weekly_path),
+        "raw_data_closure": market._physical_data_closure(),
+        "index_inputs": [],
+        "columns": list(weekly.columns),
+        "output_weeks": len(weekly),
+        "decision_start_date": "2024-01-05",
+        "decision_end_date": "2024-01-05",
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest))
+    market.verify_benchmark(output_dir)
+
+    weekly.assign(ew_all_return=0.02).to_parquet(weekly_path, index=False)
+    with pytest.raises(RuntimeError, match="parquet hash"):
+        market.verify_benchmark(output_dir)
+
+    weekly.to_parquet(weekly_path, index=False)
+    pd.DataFrame({"trade_date": ["20240101"], "open": [11.0]}).to_parquet(raw_path, index=False)
+    with pytest.raises(RuntimeError, match="input closure"):
+        market.verify_benchmark(output_dir)

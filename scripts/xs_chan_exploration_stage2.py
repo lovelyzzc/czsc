@@ -33,6 +33,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 import xs_chan_exploration_stage1 as stage1
 from numpy.random import PCG64DXSM, Generator
@@ -413,8 +414,16 @@ def load_input_bundle(spec: Mapping[str, Any]) -> InputBundle:
     if failure.duplicated(["decision_dt", "symbol"]).any():
         raise Stage2Error("failure_sample has duplicate identities")
     dates = pd.DatetimeIndex(sorted(ranked["decision_dt"].unique()))
-    if len(dates) != 220 or dates[0] != pd.Timestamp("2022-01-14") or dates[-1] != pd.Timestamp("2026-05-08"):
-        raise Stage2Error("Stage 1 analyzed date identity changed")
+    split = spec["time_split"]
+    expected_dates = int(split["expected_development_weeks"]) + int(split["expected_historical_validation_weeks"])
+    expected_start = pd.Timestamp(split["development_start"])
+    expected_end = pd.Timestamp(split["historical_validation_end"])
+    if len(dates) != expected_dates or dates[0] != expected_start or dates[-1] != expected_end:
+        raise Stage2Error(
+            "Stage 1 analyzed date identity changed: "
+            f"expected={expected_dates}/{expected_start.date()}/{expected_end.date()} "
+            f"actual={len(dates)}/{dates[0].date()}/{dates[-1].date()}"
+        )
     if not pd.DatetimeIndex(sorted(attribution["decision_dt"].unique())).equals(dates):
         raise Stage2Error("attribution dates differ from ranked dates")
     return InputBundle(
@@ -650,6 +659,213 @@ def write_registry(
     )
 
 
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    """Return a mapping or fail with a Stage 2 integrity error."""
+
+    if not isinstance(value, Mapping):
+        raise Stage2Error(f"{label} must be an object")
+    return value
+
+
+def _repo_relative_file(raw_path: Any, label: str) -> Path:
+    """Resolve an existing repository-relative audit input without traversal."""
+
+    relative = Path(str(raw_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise Stage2Error(f"{label} must be repository-relative")
+    resolved = REPO_ROOT / relative
+    if not resolved.is_file():
+        raise Stage2Error(f"{label} is missing: {resolved}")
+    return resolved
+
+
+def _validate_stage1_algorithm_revision_claims(
+    spec: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    stage1_spec: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Validate every semantic claim that permits the revised Stage 1 artifacts."""
+
+    required = _require_mapping(spec.get("stage1_algorithm_revision"), "Stage 1 algorithm-revision contract")
+    if audit.get("audit_id") != required.get("required_audit_id"):
+        raise Stage2Error("Stage 1 algorithm-revision audit ID changed")
+    if audit.get("audit_type") != required.get("required_audit_type"):
+        raise Stage2Error("Stage 1 algorithm-revision audit type changed")
+    if audit.get("audited_study_id") != stage1_spec.get("study_id"):
+        raise Stage2Error("Stage 1 algorithm-revision audit study ID changed")
+    if audit.get("confirmation_chain") != "NOT_STARTED":
+        raise Stage2Error("Stage 1 algorithm-revision audit cannot start a confirmation chain")
+
+    conclusion = _require_mapping(audit.get("overall_conclusion"), "Stage 1 algorithm-revision conclusion")
+    required_conclusion = {
+        "alpha_confirmation": "NOT_SUPPORTED",
+        "direction_of_stage1_negative_conclusion": "REQUIRES_STAGE2_RECALCULATION",
+        "stage1_result_status": "SUPERSEDED_IN_PART",
+    }
+    observed_conclusion = {key: conclusion.get(key) for key in required_conclusion}
+    if observed_conclusion != required_conclusion:
+        raise Stage2Error(f"Stage 1 algorithm-revision conclusion changed: {observed_conclusion}")
+
+    prior = _require_mapping(audit.get("prior_semantic_audit"), "prior Stage 1 semantic audit")
+    if prior.get("carry_forward") is not True:
+        raise Stage2Error("prior Stage 1 semantic findings are not carried forward")
+    if prior.get("path") != required.get("required_prior_audit_path"):
+        raise Stage2Error("prior Stage 1 semantic audit path changed")
+    if prior.get("sha256") != required.get("required_prior_audit_sha256"):
+        raise Stage2Error("prior Stage 1 semantic audit hash changed")
+    if prior.get("findings") != required.get("required_prior_findings"):
+        raise Stage2Error("prior Stage 1 semantic finding set changed")
+
+    revision = _require_mapping(audit.get("algorithm_revision"), "Stage 1 algorithm revision")
+    exact_revision_fields = {
+        "source_commit": "required_source_commit",
+        "old_state_cache_identity": "required_old_state_cache_identity",
+        "old_state_sha256": "required_old_state_sha256",
+        "old_state_manifest_sha256": "required_old_state_manifest_sha256",
+        "new_state_cache_identity": "required_new_state_cache_identity",
+        "new_state_sha256": "required_new_state_sha256",
+        "new_state_manifest_sha256": "required_new_state_manifest_sha256",
+        "native_extension_sha256": "required_native_extension_sha256",
+        "old_source_files": "required_old_source_files",
+        "new_source_files": "required_new_source_files",
+        "overlap_rows": "required_overlap_rows",
+        "regime_mismatches": "required_regime_mismatches",
+        "new_state_rows": "required_new_state_rows",
+        "prefix_causality_audit": "required_prefix_causality_audit",
+    }
+    for audit_key, required_key in exact_revision_fields.items():
+        if revision.get(audit_key) != required.get(required_key):
+            raise Stage2Error(
+                f"Stage 1 algorithm-revision field changed: {audit_key} "
+                f"expected={required.get(required_key)} actual={revision.get(audit_key)}"
+            )
+    overlap_rows = int(revision["overlap_rows"])
+    regime_mismatches = int(revision["regime_mismatches"])
+    expected_rate = regime_mismatches / overlap_rows
+    if not math.isclose(float(revision.get("regime_mismatch_rate", math.nan)), expected_rate, rel_tol=0, abs_tol=1e-15):
+        raise Stage2Error("Stage 1 algorithm-revision mismatch rate is inconsistent")
+
+    comparison = _require_mapping(revision.get("comparison"), "Stage 1 state comparison")
+    comparison_requirements = {
+        "keys": "required_comparison_keys",
+        "join": "required_comparison_join",
+        "mismatch_predicate": "required_mismatch_predicate",
+        "method": "required_comparison_method",
+    }
+    for audit_key, required_key in comparison_requirements.items():
+        if comparison.get(audit_key) != required.get(required_key):
+            raise Stage2Error(f"Stage 1 state-comparison contract changed: {audit_key}")
+    if comparison.get("new_state_path_source") != "stage1_data_manifest.inputs.state_path":
+        raise Stage2Error("Stage 1 new-state path source changed")
+    return required, revision, prior, comparison
+
+
+def _state_revision_counts(
+    old_state_path: Path,
+    new_state_path: Path,
+    keys: Sequence[str],
+) -> tuple[int, int]:
+    """Recompute the exact overlapping rows and regime mismatches."""
+
+    old = pl.scan_parquet(str(old_state_path)).select(
+        *keys,
+        pl.col("regime").alias("old_regime"),
+    )
+    new = pl.scan_parquet(str(new_state_path)).select(
+        *keys,
+        pl.col("regime").alias("new_regime"),
+    )
+    result = (
+        old.join(new, on=list(keys), how="inner")
+        .select(
+            pl.len().alias("overlap_rows"),
+            (pl.col("old_regime") != pl.col("new_regime")).sum().alias("regime_mismatches"),
+        )
+        .collect(engine="streaming")
+    )
+    return int(result["overlap_rows"][0]), int(result["regime_mismatches"][0])
+
+
+def _verify_stage1_algorithm_revision_files(
+    bundle: InputBundle,
+    required: Mapping[str, Any],
+    revision: Mapping[str, Any],
+    prior: Mapping[str, Any],
+    comparison: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Verify both state-cache generations and independently recompute their difference."""
+
+    prior_path = _repo_relative_file(prior["path"], "prior Stage 1 semantic audit")
+    if sha256_file(prior_path) != prior["sha256"]:
+        raise Stage2Error("prior Stage 1 semantic audit file changed")
+
+    old_state_path = _repo_relative_file(comparison.get("old_state_path"), "old Stage 1 state projection")
+    old_manifest_path = _repo_relative_file(
+        comparison.get("old_state_manifest_path"),
+        "old Stage 1 state manifest",
+    )
+    if sha256_file(old_state_path) != revision["old_state_sha256"]:
+        raise Stage2Error("old Stage 1 state projection changed")
+    if sha256_file(old_manifest_path) != revision["old_state_manifest_sha256"]:
+        raise Stage2Error("old Stage 1 state manifest changed")
+    old_manifest = read_json(old_manifest_path)
+    old_projection = _require_mapping(old_manifest.get("projection"), "old state projection manifest")
+    if old_manifest.get("cache_id") != revision["old_state_cache_identity"]:
+        raise Stage2Error("old Stage 1 state-cache identity changed")
+    if old_projection.get("sha256") != revision["old_state_sha256"]:
+        raise Stage2Error("old Stage 1 state manifest does not bind its projection")
+    if len(old_manifest.get("sources", [])) != int(revision["old_source_files"]):
+        raise Stage2Error("old Stage 1 state-cache source count changed")
+
+    stage1_manifest = read_json(bundle.paths["stage1_data_manifest"])
+    stage1_inputs = _require_mapping(stage1_manifest.get("inputs"), "Stage 1 manifest inputs")
+    new_state_path = Path(str(stage1_inputs.get("state_path", "")))
+    new_manifest_path = new_state_path.with_name("source_manifest.json")
+    if not new_state_path.is_file() or not new_manifest_path.is_file():
+        raise Stage2Error("new Stage 1 state-cache files are missing")
+    if stage1_inputs.get("state_sha256") != revision["new_state_sha256"]:
+        raise Stage2Error("Stage 1 manifest does not bind the audited new state projection")
+    if stage1_inputs.get("state_manifest_sha256") != revision["new_state_manifest_sha256"]:
+        raise Stage2Error("Stage 1 manifest does not bind the audited new state manifest")
+    if sha256_file(new_state_path) != revision["new_state_sha256"]:
+        raise Stage2Error("new Stage 1 state projection changed")
+    if sha256_file(new_manifest_path) != revision["new_state_manifest_sha256"]:
+        raise Stage2Error("new Stage 1 state manifest changed")
+
+    new_manifest = read_json(new_manifest_path)
+    new_projection = _require_mapping(new_manifest.get("projection"), "new state projection manifest")
+    new_engine = _require_mapping(new_manifest.get("engine"), "new state-cache engine")
+    new_native = _require_mapping(new_engine.get("native_extension"), "new state-cache native engine")
+    if new_manifest.get("cache_id") != revision["new_state_cache_identity"]:
+        raise Stage2Error("new Stage 1 state-cache identity changed")
+    if new_projection.get("sha256") != revision["new_state_sha256"]:
+        raise Stage2Error("new Stage 1 state manifest does not bind its projection")
+    if int(new_projection.get("rows", -1)) != int(revision["new_state_rows"]):
+        raise Stage2Error("new Stage 1 state row count changed")
+    if len(new_manifest.get("sources", [])) != int(revision["new_source_files"]):
+        raise Stage2Error("new Stage 1 state-cache source count changed")
+    if new_native.get("sha256") != revision["native_extension_sha256"]:
+        raise Stage2Error("new Stage 1 native-extension identity changed")
+    state_audit_entry = _require_mapping(new_manifest.get("state_audit"), "new state-cache causality audit")
+    state_audit_path = new_manifest_path.parent / str(state_audit_entry.get("path", ""))
+    if not state_audit_path.is_file() or sha256_file(state_audit_path) != state_audit_entry.get("sha256"):
+        raise Stage2Error("new Stage 1 state-cache causality audit changed")
+    state_audit = read_json(state_audit_path)
+    if state_audit.get("passed") is not True or int(state_audit.get("mismatch_count", -1)) != 0:
+        raise Stage2Error("new Stage 1 state-cache causality audit did not pass")
+
+    overlap_rows, regime_mismatches = _state_revision_counts(
+        old_state_path,
+        new_state_path,
+        tuple(str(key) for key in comparison["keys"]),
+    )
+    if overlap_rows != int(required["required_overlap_rows"]):
+        raise Stage2Error(f"Stage 1 state overlap changed: {overlap_rows}")
+    if regime_mismatches != int(required["required_regime_mismatches"]):
+        raise Stage2Error(f"Stage 1 state mismatch count changed: {regime_mismatches}")
+    return overlap_rows, regime_mismatches
+
+
 def run_input_audit(spec: Mapping[str, Any], bundle: InputBundle) -> dict[str, Any]:
     """Prove frozen time coverage and quantify genuinely unused complete weeks."""
 
@@ -681,12 +897,56 @@ def run_input_audit(spec: Mapping[str, Any], bundle: InputBundle) -> dict[str, A
     primary_complete = unused[unused + primary_offset < len(calendar)]
     diagnostic_complete = unused[unused + diagnostic_offset < len(calendar)]
     audit = read_json(bundle.paths["stage1_audit"])
-    if audit.get("overall_conclusion", {}).get("stage1_result_status") != "SUPERSEDED_IN_PART":
-        raise Stage2Error("Stage 1 semantic audit status changed")
+    required_revision, revision, prior_audit, comparison = _validate_stage1_algorithm_revision_claims(
+        spec,
+        audit,
+        stage1_spec,
+    )
+    audited_artifacts = audit.get("audited_artifacts")
+    if not isinstance(audited_artifacts, Mapping):
+        raise Stage2Error("Stage 1 semantic audit artifact inventory is missing")
+    audit_bindings = {
+        "stage1_spec_sha256": "stage1_spec",
+        "stage1_source_sha256": "stage1_source",
+        "data_manifest_sha256": "stage1_data_manifest",
+        "next_hypotheses_sha256": "stage1_next_hypotheses",
+        "ranked_surface_sha256": "ranked_surface",
+        "buffered_memberships_sha256": "buffered_memberships",
+        "gate_proposals_sha256": "gate_proposals",
+        "attribution_weekly_sha256": "attribution_weekly",
+        "failure_sample_sha256": "failure_sample",
+    }
+    for audit_key, path_key in audit_bindings.items():
+        expected_digest = str(audited_artifacts.get(audit_key, ""))
+        actual_digest = sha256_file(bundle.paths[path_key])
+        if expected_digest != actual_digest:
+            raise Stage2Error(
+                f"Stage 1 semantic audit does not bind current {path_key}: "
+                f"expected={expected_digest or 'MISSING'} actual={actual_digest}"
+            )
+    overlap_rows, regime_mismatches = _verify_stage1_algorithm_revision_files(
+        bundle,
+        required_revision,
+        revision,
+        prior_audit,
+        comparison,
+    )
     return {
         "study_id": spec["study_id"],
         "integrity_status": "PASSED",
         "stage1_semantic_status": "SUPERSEDED_IN_PART",
+        "stage1_algorithm_revision": {
+            "source_commit": revision["source_commit"],
+            "old_state_cache_identity": revision["old_state_cache_identity"],
+            "new_state_cache_identity": revision["new_state_cache_identity"],
+            "comparison_keys": list(comparison["keys"]),
+            "comparison_join": comparison["join"],
+            "overlap_rows": overlap_rows,
+            "regime_mismatches": regime_mismatches,
+            "regime_mismatch_rate": regime_mismatches / overlap_rows,
+            "prefix_causality_audit": revision["prefix_causality_audit"],
+            "status": "VERIFIED_ALGORITHM_REVISION",
+        },
         "decision_dates": {
             "rows": int(len(bundle.decision_dates)),
             "start": bundle.decision_dates[0].date().isoformat(),
