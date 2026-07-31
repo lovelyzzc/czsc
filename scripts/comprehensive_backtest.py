@@ -383,18 +383,13 @@ def main():
     ], ignore_index=True)
     results["strategies"]["S4c_Adaptive_S2c"] = simulate_portfolio(s4c_entries, panel_fwd)
 
-    # ─── S7: Layered S2b-core + S2c-increment (bull only) ──────
-    print("[S7] Layered: S2b全天候核心 + S2c增量(仅牛市) ...")
-    s7_core = s2b_entries.copy()
-    s7_core["priority"] = s7_core["priority"] + 100
-    incr_mask = s2c_mask & ~s2b_mask
-    incr_entries = d0.loc[incr_mask, ["symbol", "entry_dt", "score"]].rename(
-        columns={"entry_dt": "dt", "score": "priority"}
-    )
-    incr_entries["market"] = incr_entries["dt"].map(mkt_map)
-    incr_bull = incr_entries[incr_entries["market"] == "bull"][["symbol", "dt", "priority"]].copy()
-    s7_entries = pd.concat([s7_core[["symbol", "dt", "priority"]], incr_bull], ignore_index=True)
-    results["strategies"]["S7_Layered"] = simulate_portfolio(s7_entries, panel_fwd)
+    # ─── S7 已废弃（2026-07-31）────────────────────────────────
+    # S2c 牛市增量补位在 s2c_incremental_validation.py 里被判死：卫星 44 笔实现 -89.6%，
+    # 同时挤掉 49 笔 S2b（实际机会成本 +206.2%），净边际 -313.4%，Sharpe 0.332 vs S2b 1.049。
+    # 后续 s8_incremental_validation.py 进一步证明：即使取消牛市过滤、并保证 S2b 交易集合
+    # 逐笔不变（强制替换 / 独立预算），S2c 增量在 walk-forward 上仍不显著
+    # （ΔSharpe -0.03~-0.10，卫星 pair 级净超额中位数 -1.0%~-1.3%）。
+    # 详见 scripts/S8_INCREMENTAL_VALIDATION_2026-07-31.md
 
     # ─── S5: Combined Pool ───────────────────────────────────────
     print("[S5] Combined: S0+S3 候选合并，综合优先级 ...")
@@ -426,18 +421,16 @@ def main():
     results["strategies"]["BM_Random"] = simulate_portfolio(random_df, panel_fwd)
 
     # ─── 容量分析 ──────────────────────────────────────────────────
-    print("\n[容量] 分析 S0/S2b/S4b/S7 的槽位利用率 ...")
+    print("\n[容量] 分析 S0/S2b/S4b 的槽位利用率 ...")
     cap_s0 = analyze_capacity(s0_entries, panel_fwd, "S0_NewDefault")
     cap_s2b = analyze_capacity(s2b_entries, panel_fwd, "S2b_vr08_sp12")
     cap_s4b = analyze_capacity(s4b_entries, panel_fwd, "S4b_Adaptive_S2b")
-    cap_s7 = analyze_capacity(s7_entries, panel_fwd, "S7_Layered")
     results["capacity_analysis"] = {
         "S0_NewDefault": cap_s0,
         "S2b_vr08_sp12": cap_s2b,
         "S4b_Adaptive_S2b": cap_s4b,
-        "S7_Layered": cap_s7,
     }
-    for cap in [cap_s0, cap_s2b, cap_s4b, cap_s7]:
+    for cap in [cap_s0, cap_s2b, cap_s4b]:
         print(f"  {cap['label']}: 利用率={cap.get('avg_utilization_pct', 0)}%, "
               f"空仓={cap.get('empty_days', 0)}天({cap.get('empty_pct', 0)}%), "
               f"日均持仓={cap.get('avg_occupied_slots', 0)}槽")

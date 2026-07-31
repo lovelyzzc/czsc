@@ -3,14 +3,17 @@
 基于 `trend_regime` 的 11 态走势状态机，用因果「主升浪启动」信号（`surge_onset`）
 扫描全 A 股最新一根 K 线，输出当日处于主升浪启动/追入窗口的标的 + 推荐止损。
 
-支持四种策略模式（--strategy 参数）：
+支持三种策略模式（--strategy 参数）：
   s0   — 只报告主升浪候选（默认，当前行为不变）
   s4   — 环境自适应：牛市用 S0 追涨，熊市/震荡用均值回复
-  s7   — 分层策略：S2b 核心(sp>=12) 全天候 + S2c 增量(sp>=10) 仅牛市，无回复
   all  — 同时报告 surge + reversion 两类信号
 
 用法：
-    PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python daily_scan.py [--strategy s0|s4|s7|all]
+    PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python daily_scan.py [--strategy s0|s4|all]
+
+注：s7（S2b 核心 + S2c 牛市增量）已于 2026-07-31 废弃 —— S2c 增量补位挤占 S2b 槽位，
+净边际 -313.4%；取消牛市过滤并保证 S2b 集合逐笔不变后，增量在 walk-forward 上仍不显著。
+详见 czsc/scripts/S8_INCREMENTAL_VALIDATION_2026-07-31.md
 """
 
 from __future__ import annotations
@@ -287,9 +290,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="主升浪 + 均值回复每日选股扫描")
     parser.add_argument(
         "--strategy",
-        choices=["s0", "s4", "s7", "all"],
+        choices=["s0", "s4", "all"],
         default="s0",
-        help="策略模式：s0=仅surge（默认）, s4=环境自适应, s7=S2b核心+S2c牛市增量, all=同时报告两类",
+        help="策略模式：s0=仅surge（默认）, s4=环境自适应, all=同时报告两类",
     )
     return parser.parse_args()
 
@@ -301,7 +304,6 @@ def main():
     title = {
         "s0": "主升浪启动 (S0 — 追涨)",
         "s4": "环境自适应 (S4 — 牛市追涨/熊市-震荡回复)",
-        "s7": "分层策略 (S7 — S2b核心 + S2c牛市增量)",
         "all": "全信号扫描 (Surge + Reversion)",
     }[strategy]
     print("=" * 70)
@@ -318,7 +320,7 @@ def main():
         name_map, industry_map = {}, {}
 
     market_regime = "sideways"
-    if strategy in ("s4", "s7", "all"):
+    if strategy in ("s4", "all"):
         print("[市场环境] 计算中 ...")
         market_regime = _compute_market_regime()
         print(f"  当前市场环境：{REGIME_CN_MARKET.get(market_regime, market_regime)}")
@@ -355,17 +357,14 @@ def main():
         else:
             print("使用 Reversion 均值回复信号")
 
-    if strategy == "s7":
-        _report_s7(surge_results, name_map, industry_map, metadata_available, market_regime)
-    else:
-        if show_surge:
-            if surge_results:
-                _report_default(surge_results, name_map, industry_map, metadata_available)
-            else:
-                print("\n今日无处于主升浪启动/追入窗口的标的")
+    if show_surge:
+        if surge_results:
+            _report_default(surge_results, name_map, industry_map, metadata_available)
+        else:
+            print("\n今日无处于主升浪启动/追入窗口的标的")
 
-        if show_rev:
-            _report_reversion(rev_results, name_map, industry_map, metadata_available)
+    if show_rev:
+        _report_reversion(rev_results, name_map, industry_map, metadata_available)
 
     if strategy in ("s0", "all"):
         _report_experimental(exp_raw, name_map, industry_map, metadata_available)
@@ -450,95 +449,6 @@ def _report_default(results, name_map, industry_map, metadata_available):
         "止盈规则",
     ]
     pd.DataFrame(results)[cols].to_parquet(out, index=False)
-    print(f"\n[文件] {out}")
-
-
-def _report_s7(results, name_map, industry_map, metadata_available, market_regime: str):
-    """S7 分层策略报告：S2b 核心（sp>=12 全天候）+ S2c 增量（10<=sp<12 仅牛市）。"""
-    if not results:
-        print("\n今日无处于主升浪启动/追入窗口的标的")
-        return
-
-    for r in results:
-        r["名称"] = name_map.get(r["代码"], "")
-        r["行业"] = industry_map.get(r["代码"], "")
-        r["优先级"] = _priority(r)
-        sl_pct = r.get("止损幅度%")
-        reasons = _filter_reasons(r, check_name=metadata_available)
-        r["过滤原因"] = "|".join(reasons)
-        r["可操作"] = not reasons
-        sp = r.get("MA散度%") or 0
-        if sp >= tr.S2B_GATE_MA_SPREAD:
-            r["层级"] = "核心"
-            r["等级"] = (
-                "C"
-                if (sl_pct is None or sl_pct <= 0 or reasons)
-                else ("A" if r["优先级"] >= 75 else "B" if r["优先级"] >= 60 else "C")
-            )
-        elif sp >= tr.S2C_GATE_MA_SPREAD:
-            r["层级"] = "增量"
-            r["等级"] = (
-                "C"
-                if (sl_pct is None or sl_pct <= 0 or reasons)
-                else ("B" if r["优先级"] >= 60 else "C")
-            )
-        else:
-            r["层级"] = "—"
-            r["等级"] = "C"
-
-    is_bull = market_regime == "bull"
-    core = [r for r in results if r["层级"] == "核心"]
-    incr = [r for r in results if r["层级"] == "增量"] if is_bull else []
-    display = core + incr
-    display.sort(key=lambda x: (-{"核心": 1, "增量": 0}.get(x["层级"], -1), -x["优先级"]))
-
-    scan_date = results[0]["日期"]
-    actionable = [r for r in display if r["可操作"]]
-    n_core = sum(1 for r in actionable if r["层级"] == "核心")
-    n_incr = sum(1 for r in actionable if r["层级"] == "增量")
-
-    regime_cn = REGIME_CN_MARKET.get(market_regime, market_regime)
-    print(f"\n{'=' * 160}")
-    print(
-        f"  {scan_date} S7 分层策略 | 市场环境={regime_cn} | "
-        f"核心(sp≥{tr.S2B_GATE_MA_SPREAD}) {n_core} 只 | "
-        f"增量(sp≥{tr.S2C_GATE_MA_SPREAD}) {n_incr if is_bull else 0} 只{'(牛市启用)' if is_bull else '(非牛市-不展示)'} | "
-        f"止损止盈：{TP_RULE}"
-    )
-    st_filter = "剔除 ST/退市风险、" if metadata_available else "ST过滤未启用（缺少名称/行业元数据）、"
-    print(f"  硬过滤：{st_filter}成交额<{MIN_AMOUNT_E:g}亿、止损幅度不在{STOP_MIN_PCT:g}-{STOP_MAX_PCT:g}%")
-    print("  核心=S2b(vr≤0.8,sp≥12) 全天候 | 增量=S2c(sp≥10,sp<12) 仅牛市补位 | 无均值回复")
-    print(f"{'=' * 160}")
-    header = (
-        f"{'序':>3} {'层':>4} {'级':>2} {'代码':>11} {'名称':<8} {'行业':<7} {'收盘':>7} {'状态':<7} "
-        f"{'方式':<5} {'优先级':>5} {'score':>5} {'量比':>5} {'散度%':>6} {'ret20':>6} {'额亿':>5} {'止损':>7} {'幅度%':>6} {'新鲜':>4}"
-    )
-    print(header)
-    print("-" * 160)
-    show = actionable[:20] if actionable else display[:20]
-    for i, r in enumerate(show, 1):
-        print(
-            f"{i:>3} {r['层级']:>4} {r['等级']:>2} {r['代码']:>11} {r['名称'][:6]:<8} {r['行业'][:6]:<7} {r['收盘价']:>7.2f} "
-            f"{r['当前状态']:<7} {r['启动方式']:<5} {r['优先级']:>5} {r['score']:>5} "
-            f"{(r['量比'] or 0):>5.2f} {(r['MA散度%'] or 0):>6.2f} {(r['ret20%'] or 0):>6.1f} "
-            f"{r['成交额亿']:>5.2f} {(r['推荐止损'] or 0):>7.2f} "
-            f"{(r['止损幅度%'] if r['止损幅度%'] is not None else 0):>6.1f} {r['新鲜度']:>4}"
-        )
-    if len(actionable) > 20:
-        print(f"\n  ... 另有 {len(actionable) - 20} 只可操作结构候选未显示（优先级较低）")
-    if not actionable:
-        print("\n  今日无通过硬过滤的可操作标的，上表为前 20。")
-
-    out = OUTPUT_DIR / f"picks_s7_{scan_date}.parquet"
-    for r in display:
-        r["止盈规则"] = TP_RULE
-    cols = [
-        "代码", "名称", "行业", "层级", "等级", "优先级", "日期", "收盘价",
-        "当前状态", "启动方式", "启动日", "新鲜度", "score",
-        "量比", "MA散度%", "ret20%", "成交额亿",
-        "推荐止损", "止损幅度%", "可操作", "过滤原因", "止盈规则",
-    ]
-    pd.DataFrame(display)[cols].to_parquet(out, index=False)
     print(f"\n[文件] {out}")
 
 
