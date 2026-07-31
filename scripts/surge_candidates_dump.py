@@ -42,17 +42,19 @@ SELL_SET = tr.SELL_REGIMES  # {9, 10}
 UPTREND_FAMILY = {int(Regime.UpwardDeparture), int(Regime.ThirdBuy), int(Regime.MainUptrend), int(Regime.Acceleration)}
 
 
+_MAIN_UP_OR_ACCEL = {int(Regime.MainUptrend), int(Regime.Acceleration)}
+_PIVOT_BUILDING = int(Regime.PivotBuilding)
+_UPWARD_DEPARTURE = int(Regime.UpwardDeparture)
+
+
 def _is_candidate(prev: int, regime: int, prior: list[int], mode: str) -> bool:
     """门控前候选：仅状态跳变 + 路径条件（surge_onset 去掉特征门控的部分）。"""
     prior_set = set(prior)
     if mode == "confirm":
-        entered = prev not in (Regime.MainUptrend, Regime.Acceleration) and regime in (
-            Regime.MainUptrend,
-            Regime.Acceleration,
-        )
-        return entered and Regime.PivotBuilding in prior_set and Regime.UpwardDeparture in prior_set
-    entered = prev != Regime.UpwardDeparture and regime == Regime.UpwardDeparture
-    return entered and Regime.PivotBuilding in prior_set
+        entered = prev not in _MAIN_UP_OR_ACCEL and regime in _MAIN_UP_OR_ACCEL
+        return entered and _PIVOT_BUILDING in prior_set and _UPWARD_DEPARTURE in prior_set
+    entered = prev != _UPWARD_DEPARTURE and regime == _UPWARD_DEPARTURE
+    return entered and _PIVOT_BUILDING in prior_set
 
 
 def _simulate_full(p_dec: int, states: list, regime_by_idx: dict, ind: dict):
@@ -193,6 +195,9 @@ def main():
                 print(f"  [{i}/{len(files)}] 候选行 {len(all_rows)} | {time.time() - t0:.0f}s")
 
     cand = pd.DataFrame(all_rows)
+    if cand.empty:
+        print("[错误] 未找到任何候选信号，请检查 iter_states / _is_candidate 逻辑")
+        return
     cand["seg"] = np.where(cand["dec_dt"] <= TRAIN_END, "train", "test")
     cand["year"] = cand["dec_dt"].dt.year
     cand.to_parquet(OUTPUT_DIR / "candidates.parquet", index=False)
