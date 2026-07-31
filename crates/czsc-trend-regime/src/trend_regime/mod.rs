@@ -12,8 +12,10 @@ pub use features::{compute_features, FeatureSnapshot};
 pub use fsm::{classify_fsm, extract_zs_list, seed_regime};
 pub use indicators::TrendIndicators;
 pub use scoring::{
-    classify_gate_level, gate_confidence, gates_pass, priority_score, surge_onset,
-    surge_onset_with_level, surge_score, GateLevel,
+    classify_gate_level, classify_gate_level_with_config, classify_market_regime,
+    classify_market_regime_series, gate_confidence, gate_confidence_with_config, gates_pass,
+    priority_score, reversion_onset, reversion_score, surge_onset, surge_onset_with_config,
+    surge_onset_with_level, surge_score, GateConfig, GateDirection, GateLevel, MarketRegime,
 };
 
 use chrono::{DateTime, Utc};
@@ -540,5 +542,371 @@ mod tests {
             "confirm",
             GateLevel::Partial,
         ));
+    }
+
+    // ─── GateConfig / GateDirection 测试 ─────────────────────────
+
+    #[test]
+    fn test_gate_direction_roundtrip() {
+        assert_eq!(GateDirection::from_str("gte").as_str(), "gte");
+        assert_eq!(GateDirection::from_str("lte").as_str(), "lte");
+        assert_eq!(GateDirection::from_str("<=").as_str(), "lte");
+        assert_eq!(GateDirection::from_str("unknown").as_str(), "gte");
+    }
+
+    #[test]
+    fn test_gate_direction_passes() {
+        assert!(GateDirection::Gte.passes(1.5, 1.2));
+        assert!(!GateDirection::Gte.passes(0.8, 1.2));
+        assert!(GateDirection::Lte.passes(0.8, 1.2));
+        assert!(!GateDirection::Lte.passes(1.5, 1.2));
+    }
+
+    #[test]
+    fn test_classify_gate_level_with_config_flipped_vol() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 0.8, // low vol → default Gte rejects, Lte accepts
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+
+        assert_eq!(classify_gate_level(&f), GateLevel::Partial);
+
+        let cfg = GateConfig {
+            vol_ratio_threshold: 1.2,
+            vol_ratio_direction: GateDirection::Lte, // flip: low vol is good
+            ..GateConfig::default()
+        };
+        assert_eq!(classify_gate_level_with_config(&f, &cfg), GateLevel::Full);
+    }
+
+    #[test]
+    fn test_classify_gate_level_with_config_no_above_zg() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 1.5,
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: false, // would fail default above_zg gate
+        };
+        assert_eq!(classify_gate_level(&f), GateLevel::Partial);
+
+        let cfg = GateConfig {
+            use_above_zg: false,
+            ..GateConfig::default()
+        };
+        assert_eq!(classify_gate_level_with_config(&f, &cfg), GateLevel::Full);
+    }
+
+    #[test]
+    fn test_gate_confidence_with_config_flipped() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 1.0,
+            dif: 0.5,
+            vol_ratio: 0.5,
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+        let default_conf = gate_confidence(&f);
+
+        let cfg = GateConfig {
+            vol_ratio_threshold: 1.2,
+            vol_ratio_direction: GateDirection::Lte,
+            ..GateConfig::default()
+        };
+        let flipped_conf = gate_confidence_with_config(&f, &cfg);
+
+        assert!(
+            flipped_conf > default_conf,
+            "flipped vol direction should give higher confidence for low vol: {} vs {}",
+            flipped_conf,
+            default_conf
+        );
+    }
+
+    #[test]
+    fn test_surge_onset_with_config() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 1.5,
+            last_up_angle: 30.0,
+            ma_spread_pct: 5.0,
+            dif: 0.5,
+            vol_ratio: 0.6, // low vol, fails default Gte
+            n_pivots: 2,
+            pivot_width_pct: 5.0,
+            ret20: 15.0,
+            above_zg: true,
+        };
+        let prior = vec![
+            Regime::PivotBuilding as u8,
+            Regime::UpwardDeparture as u8,
+        ];
+
+        assert!(!surge_onset(
+            Regime::UpwardDeparture as u8,
+            Regime::MainUptrend as u8,
+            Some(&f),
+            &prior,
+            "confirm",
+        ));
+
+        let cfg = GateConfig {
+            vol_ratio_threshold: 1.2,
+            vol_ratio_direction: GateDirection::Lte,
+            ..GateConfig::default()
+        };
+        assert!(surge_onset_with_config(
+            Regime::UpwardDeparture as u8,
+            Regime::MainUptrend as u8,
+            Some(&f),
+            &prior,
+            "confirm",
+            GateLevel::Full,
+            &cfg,
+        ));
+    }
+
+    // ─── 均值回复信号测试 ────────────────────────────────────────
+
+    #[test]
+    fn test_reversion_onset_basic() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 0.8,
+            last_up_angle: 10.0,
+            ma_spread_pct: -3.0,
+            dif: -0.3,
+            vol_ratio: 0.7,
+            n_pivots: 1,
+            pivot_width_pct: 3.0,
+            ret20: -10.0,
+            above_zg: false,
+        };
+
+        let prior = vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1]; // 10 days downtrend
+
+        assert!(reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::PivotBuilding as u8,
+            Some(&f),
+            &prior,
+            5,
+            20,
+        ));
+
+        // FirstBuy also triggers
+        assert!(reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::FirstBuy as u8,
+            Some(&f),
+            &prior,
+            5,
+            20,
+        ));
+
+        // SecondBuy also triggers
+        assert!(reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::SecondBuy as u8,
+            Some(&f),
+            &prior,
+            5,
+            20,
+        ));
+    }
+
+    #[test]
+    fn test_reversion_onset_wrong_transition() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 0.8,
+            last_up_angle: 10.0,
+            ma_spread_pct: -3.0,
+            dif: -0.3,
+            vol_ratio: 0.7,
+            n_pivots: 1,
+            pivot_width_pct: 3.0,
+            ret20: -10.0,
+            above_zg: false,
+        };
+        let prior = vec![1; 10];
+
+        // Not from downtrend
+        assert!(!reversion_onset(
+            Regime::MainUptrend as u8,
+            Regime::PivotBuilding as u8,
+            Some(&f),
+            &prior,
+            5,
+            20,
+        ));
+
+        // Not to recovery regime
+        assert!(!reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::MainUptrend as u8,
+            Some(&f),
+            &prior,
+            5,
+            20,
+        ));
+    }
+
+    #[test]
+    fn test_reversion_onset_duration_filter() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 0.8,
+            last_up_angle: 10.0,
+            ma_spread_pct: -3.0,
+            dif: -0.3,
+            vol_ratio: 0.7,
+            n_pivots: 1,
+            pivot_width_pct: 3.0,
+            ret20: -10.0,
+            above_zg: false,
+        };
+
+        // Too short (3 days < min 5)
+        let short_prior = vec![1, 1, 1];
+        assert!(!reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::PivotBuilding as u8,
+            Some(&f),
+            &short_prior,
+            5,
+            20,
+        ));
+
+        // Too long (25 days > max 20)
+        let long_prior = vec![1; 25];
+        assert!(!reversion_onset(
+            Regime::Downtrend as u8,
+            Regime::PivotBuilding as u8,
+            Some(&f),
+            &long_prior,
+            5,
+            20,
+        ));
+    }
+
+    #[test]
+    fn test_reversion_score_basic() {
+        let f = FeatureSnapshot {
+            up_dn_power_ratio: 0.8,
+            last_up_angle: 10.0,
+            ma_spread_pct: -5.0,
+            dif: -0.3,
+            vol_ratio: 0.5,
+            n_pivots: 1,
+            pivot_width_pct: 3.0,
+            ret20: -15.0,
+            above_zg: false,
+        };
+        let s = reversion_score(Some(&f), 10);
+        assert!(s > 0.0 && s <= 100.0, "reversion_score={s}");
+
+        assert_eq!(reversion_score(None, 10), 0.0);
+    }
+
+    #[test]
+    fn test_reversion_score_low_vol_preferred() {
+        let base = FeatureSnapshot {
+            up_dn_power_ratio: 0.8,
+            last_up_angle: 10.0,
+            ma_spread_pct: -5.0,
+            dif: -0.3,
+            vol_ratio: 0.5,
+            n_pivots: 1,
+            pivot_width_pct: 3.0,
+            ret20: -15.0,
+            above_zg: false,
+        };
+        let high_vol = FeatureSnapshot {
+            vol_ratio: 2.0,
+            ..base.clone()
+        };
+        let low_score = reversion_score(Some(&base), 10);
+        let high_score = reversion_score(Some(&high_vol), 10);
+        assert!(
+            low_score > high_score,
+            "low vol should score higher: {} vs {}",
+            low_score,
+            high_score
+        );
+    }
+
+    #[test]
+    fn test_gate_config_default_matches_constants() {
+        let cfg = GateConfig::default();
+        assert_eq!(cfg.vol_ratio_threshold, SURGE_GATE_VOL_RATIO);
+        assert_eq!(cfg.ma_spread_threshold, SURGE_GATE_MA_SPREAD);
+        assert_eq!(cfg.ret20_threshold, SURGE_GATE_RET20);
+        assert_eq!(cfg.vol_ratio_direction, GateDirection::Gte);
+        assert_eq!(cfg.ma_spread_direction, GateDirection::Gte);
+        assert!(cfg.use_above_zg);
+    }
+
+    // ─── MarketRegime 测试 ──────────────────────────────────────
+
+    #[test]
+    fn test_market_regime_roundtrip() {
+        for (v, expected) in [(0, MarketRegime::Bull), (1, MarketRegime::Sideways), (2, MarketRegime::Bear)] {
+            assert_eq!(MarketRegime::from_u8(v), expected);
+            assert_eq!(MarketRegime::from_str(expected.as_str()), expected);
+        }
+    }
+
+    #[test]
+    fn test_classify_market_regime_basic() {
+        let mut closes = vec![100.0; 70];
+        for i in 60..70 {
+            closes[i] = 100.0 + (i - 60) as f64 * 2.0;
+        }
+        closes[69] = 112.0; // 60 日收益 12% → bull
+
+        let regimes = classify_market_regime(&closes, 60, 10.0, -10.0);
+        assert_eq!(regimes.len(), closes.len());
+        assert_eq!(regimes[69], MarketRegime::Bull);
+
+        for i in 0..60 {
+            assert_eq!(regimes[i], MarketRegime::Sideways, "pre-lookback should be sideways");
+        }
+    }
+
+    #[test]
+    fn test_classify_market_regime_bear() {
+        let mut closes = vec![100.0; 70];
+        closes[69] = 85.0; // 60 日收益 -15% → bear
+
+        let regimes = classify_market_regime(&closes, 60, 10.0, -10.0);
+        assert_eq!(regimes[69], MarketRegime::Bear);
+    }
+
+    #[test]
+    fn test_classify_market_regime_sideways() {
+        let mut closes = vec![100.0; 70];
+        closes[69] = 105.0; // 60 日收益 5% → sideways
+
+        let regimes = classify_market_regime(&closes, 60, 10.0, -10.0);
+        assert_eq!(regimes[69], MarketRegime::Sideways);
+    }
+
+    #[test]
+    fn test_classify_market_regime_short() {
+        let closes = vec![100.0; 30];
+        let regimes = classify_market_regime(&closes, 60, 10.0, -10.0);
+        assert!(regimes.iter().all(|r| *r == MarketRegime::Sideways));
     }
 }

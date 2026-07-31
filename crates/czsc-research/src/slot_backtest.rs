@@ -66,6 +66,34 @@ impl FillMode {
 
 // ─── 配置 & 输入 ─────────────────────────────────────────────────
 
+/// 按入场 regime 配置不同持仓周期上限。
+///
+/// 键为 regime u8 值，值为最大持仓天数。
+/// 如果 regime 不在映射中，使用 `default_hold_days`。
+#[derive(Debug, Clone)]
+pub struct HoldingPeriodConfig {
+    pub regime_hold_days: HashMap<u8, usize>,
+    pub default_hold_days: usize,
+}
+
+impl Default for HoldingPeriodConfig {
+    fn default() -> Self {
+        Self {
+            regime_hold_days: HashMap::new(),
+            default_hold_days: 60,
+        }
+    }
+}
+
+impl HoldingPeriodConfig {
+    pub fn hold_days_for(&self, entry_regime: u8) -> usize {
+        self.regime_hold_days
+            .get(&entry_regime)
+            .copied()
+            .unwrap_or(self.default_hold_days)
+    }
+}
+
 /// 槽位回测配置。
 #[derive(Debug, Clone)]
 pub struct SlotBacktestConfig {
@@ -73,6 +101,7 @@ pub struct SlotBacktestConfig {
     pub buy_cost: f64,
     pub sell_cost: f64,
     pub fill_mode: FillMode,
+    pub holding_period: HoldingPeriodConfig,
 }
 
 impl Default for SlotBacktestConfig {
@@ -82,6 +111,7 @@ impl Default for SlotBacktestConfig {
             buy_cost: 0.0015,
             sell_cost: 0.0025,
             fill_mode: FillMode::Strict,
+            holding_period: HoldingPeriodConfig::default(),
         }
     }
 }
@@ -101,6 +131,8 @@ pub struct CandidateRow {
     pub hold_days: usize,
     pub seg: String,
     pub year: i32,
+    /// 入场时的 FSM regime（用于 regime-dependent 持仓周期）。
+    pub entry_regime: u8,
 }
 
 /// 收盘价面板：symbol × date → close。
@@ -267,6 +299,7 @@ pub struct TradeRecord {
     pub seg: String,
     pub year: i32,
     pub position_weight: f64,
+    pub entry_regime: u8,
 }
 
 /// 组合权益统计。
@@ -387,6 +420,7 @@ pub fn simulate_slots(
                 seg: c.seg.clone(),
                 year: c.year,
                 position_weight: weight,
+                entry_regime: c.entry_regime,
             });
             open_until.insert(c.symbol.clone(), c.exit_dt);
             free -= 1;
@@ -679,6 +713,7 @@ mod tests {
             hold_days: 3,
             seg: "train".into(),
             year: 2023,
+            entry_regime: 7, // MainUptrend
         }
     }
 
@@ -827,6 +862,7 @@ mod tests {
                 seg: "train".into(),
                 year: 2023,
                 position_weight: 1.0,
+                entry_regime: 7,
             },
             TradeRecord {
                 symbol: "B".into(),
@@ -843,6 +879,7 @@ mod tests {
                 seg: "train".into(),
                 year: 2023,
                 position_weight: 1.0,
+                entry_regime: 7,
             },
         ];
         let stats = compute_pair_stats(&trades);
@@ -857,5 +894,23 @@ mod tests {
             let parsed = FillMode::from_str(mode.as_str()).unwrap();
             assert_eq!(parsed, mode);
         }
+    }
+
+    #[test]
+    fn test_holding_period_config_default() {
+        let cfg = HoldingPeriodConfig::default();
+        assert_eq!(cfg.default_hold_days, 60);
+        assert_eq!(cfg.hold_days_for(7), 60);
+        assert_eq!(cfg.hold_days_for(1), 60);
+    }
+
+    #[test]
+    fn test_holding_period_config_per_regime() {
+        let mut cfg = HoldingPeriodConfig::default();
+        cfg.regime_hold_days.insert(1, 20); // Downtrend → 20 days
+        cfg.regime_hold_days.insert(7, 5);  // MainUptrend → 5 days
+        assert_eq!(cfg.hold_days_for(1), 20);
+        assert_eq!(cfg.hold_days_for(7), 5);
+        assert_eq!(cfg.hold_days_for(4), 60); // PivotBuilding → default
     }
 }

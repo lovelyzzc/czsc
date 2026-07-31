@@ -10,7 +10,7 @@ use pyo3_stub_gen::derive::gen_stub_pyfunction;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::{benchmark, execution, features, random_control, slot_backtest, statistics};
+use crate::{benchmark, execution, features, random_control, slot_backtest, state_cache, statistics};
 
 // ─── Statistics ─────────────────────────────────────────────────
 
@@ -328,6 +328,7 @@ fn simulate_surge_backtest<'py>(
             hold_days: get_usize(d, "hold_days", py).unwrap_or(0),
             seg: get_str(d, "seg", py).unwrap_or_default(),
             year: get_i32(d, "year", py).unwrap_or(0),
+            entry_regime: get_u8(d, "entry_regime", py).unwrap_or(0),
         });
     }
 
@@ -365,6 +366,7 @@ fn simulate_surge_backtest<'py>(
         td.set_item("seg", &tr.seg)?;
         td.set_item("year", tr.year)?;
         td.set_item("position_weight", tr.position_weight)?;
+        td.set_item("entry_regime", tr.entry_regime)?;
         trades_list.append(td)?;
     }
     dict.set_item("trades", trades_list)?;
@@ -432,6 +434,7 @@ fn backtest_result_to_pydict<'py>(
         td.set_item("seg", &tr.seg)?;
         td.set_item("year", tr.year)?;
         td.set_item("position_weight", tr.position_weight)?;
+        td.set_item("entry_regime", tr.entry_regime)?;
         trades_list.append(td)?;
     }
     dict.set_item("trades", trades_list)?;
@@ -556,6 +559,7 @@ fn simulate_surge_backtest_parquet<'py>(
             hold_days: get_usize(d, "hold_days", py).unwrap_or(0),
             seg: get_str(d, "seg", py).unwrap_or_default(),
             year: get_i32(d, "year", py).unwrap_or(0),
+            entry_regime: get_u8(d, "entry_regime", py).unwrap_or(0),
         });
     }
 
@@ -630,6 +634,9 @@ fn compute_surge_excess_parquet<'py>(
                 .and_then(|v| v.extract::<i32>(py).ok())
                 .unwrap_or(0),
             position_weight: 1.0,
+            entry_regime: d.get("entry_regime")
+                .and_then(|v| v.extract::<u8>(py).ok())
+                .unwrap_or(0),
         });
     }
 
@@ -785,6 +792,9 @@ fn compute_surge_excess<'py>(
                 .and_then(|v| v.extract::<i32>(py).ok())
                 .unwrap_or(0),
             position_weight: 1.0,
+            entry_regime: d.get("entry_regime")
+                .and_then(|v| v.extract::<u8>(py).ok())
+                .unwrap_or(0),
         });
     }
 
@@ -851,6 +861,111 @@ fn compute_surge_excess<'py>(
     Ok(dict.into_any().unbind())
 }
 
+// ─── State Cache ────────────────────────────────────────────────
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (raw_dir, output_path, warmup_bars=120, batch_size=200))]
+fn build_state_cache<'py>(
+    py: Python<'py>,
+    raw_dir: &str,
+    output_path: &str,
+    warmup_bars: usize,
+    batch_size: usize,
+) -> PyResult<Py<PyAny>> {
+    use polars::prelude::*;
+    use std::fs;
+    use std::path::Path;
+
+    let raw_path = Path::new(raw_dir);
+    let out_path = Path::new(output_path);
+
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("cannot create output dir: {e}")))?;
+    }
+
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(raw_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("cannot read dir: {e}")))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err("no parquet files found"));
+    }
+
+    let batch_sz = batch_size.max(1);
+    let mut all_parts: Vec<DataFrame> = Vec::new();
+    let mut total_rows = 0usize;
+    let mut source_count = 0usize;
+    let mut regime_counts = std::collections::HashMap::<u8, usize>::new();
+    for r in 0..=10u8 {
+        regime_counts.insert(r, 0);
+    }
+
+    for chunk in paths.chunks(batch_sz) {
+        let chunk_paths: Vec<std::path::PathBuf> = chunk.to_vec();
+        let chunk_result: std::result::Result<Vec<_>, _> = chunk_paths
+            .iter()
+            .map(|p| {
+                let frame = state_cache::load_source_parquet(p)
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                let bars = state_cache::bars_from_source_frame(&frame)
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                state_cache::project_single_stock(&bars, warmup_bars)
+                    .map_err(|e| format!("{}: {e}", p.display()))
+            })
+            .collect();
+
+        let parts = chunk_result
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        for part in parts {
+            let n = part.height();
+            total_rows += n;
+            source_count += 1;
+            if let Ok(regimes) = part.column("regime").and_then(|c| c.i8()) {
+                for i in 0..regimes.len() {
+                    if let Some(r) = regimes.get(i) {
+                        *regime_counts.entry(r as u8).or_insert(0) += 1;
+                    }
+                }
+            }
+            all_parts.push(part);
+        }
+    }
+
+    let mut merged = all_parts[0].clone();
+    for part in all_parts.into_iter().skip(1) {
+        merged = merged.vstack(&part)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("vstack: {e}")))?;
+    }
+    merged = merged.sort(["symbol", "dt"], SortMultipleOptions::default())
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("sort: {e}")))?;
+
+    let mut file = fs::File::create(out_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("cannot create output: {e}")))?;
+    ParquetWriter::new(&mut file)
+        .finish(&mut merged)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("parquet write: {e}")))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("output_path", output_path)?;
+    dict.set_item("source_count", source_count)?;
+    dict.set_item("total_rows", total_rows)?;
+    dict.set_item("schema_version", state_cache::SCHEMA_VERSION)?;
+
+    let regime_dict = PyDict::new(py);
+    for (regime, count) in &regime_counts {
+        regime_dict.set_item(*regime, *count)?;
+    }
+    dict.set_item("regime_counts", regime_dict)?;
+    Ok(dict.into_any().unbind())
+}
+
 // ─── Module Registration ────────────────────────────────────────
 
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -885,6 +1000,9 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // Random Control / Excess
     research.add_function(wrap_pyfunction!(compute_surge_excess, &research)?)?;
     research.add_function(wrap_pyfunction!(compute_surge_excess_parquet, &research)?)?;
+
+    // State Cache
+    research.add_function(wrap_pyfunction!(build_state_cache, &research)?)?;
 
     let sys = py.import("sys")?;
     let py_modules = sys.getattr("modules")?;

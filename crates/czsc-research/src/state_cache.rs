@@ -307,6 +307,7 @@ pub fn build_state_cache_parallel(
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers.unwrap_or_else(rayon::current_num_threads))
+        .stack_size(64 * 1024 * 1024)
         .build()
         .map_err(|err| StateCacheError::Input(format!("failed to build rayon pool: {err}")))?;
 
@@ -442,7 +443,7 @@ fn process_source_file(path: &Path, warmup_bars: usize) -> Result<ProcessedSourc
     let frame = load_source_parquet(path)?;
     let symbol = source_symbol(&frame)?;
     let rows = frame.height();
-    let bars = bars_from_frame(&frame)?;
+    let bars = bars_from_source_frame(&frame)?;
     let projection = project_single_stock(&bars, warmup_bars)?;
     validate_projection_frame(&projection, false)?;
     let regime_counts = regime_counts_from_projection(&projection);
@@ -460,11 +461,11 @@ fn generate_projection_from_frame(frame: &DataFrame, warmup_bars: usize) -> Resu
     if frame.is_empty() {
         return build_projection_frame(&[], &[], &[]);
     }
-    let bars = bars_from_frame(frame)?;
+    let bars = bars_from_source_frame(frame)?;
     project_single_stock(&bars, warmup_bars)
 }
 
-fn bars_from_frame(frame: &DataFrame) -> Result<Vec<RawBar>> {
+pub fn bars_from_source_frame(frame: &DataFrame) -> Result<Vec<RawBar>> {
     format_standard_kline(frame.clone(), Freq::D).map_err(|err| {
         StateCacheError::Projection(format!("failed to convert frame to RawBar: {err}"))
     })

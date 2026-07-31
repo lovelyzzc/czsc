@@ -455,6 +455,7 @@ mod tests {
             seg: "train".into(),
             year: 2023,
             position_weight: 1.0,
+            entry_regime: 7,
         }
     }
 
