@@ -27,11 +27,26 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/sc
 ### Step 2: 运行每日扫描
 
 ```bash
+# S7 分层策略（推荐）— S2b 核心(sp≥12) 全天候 + S2c 增量(sp≥10) 仅牛市
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy s7
+
+# 默认 S0 模式 — 仅主升浪候选
 PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py
+
+# S4 环境自适应 — 牛市用 surge 追涨，熊/震荡用 reversion 均值回复
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy s4
+
+# 全信号模式 — 同时报告 surge + reversion
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy all
 ```
 
-扫描全 A 股，输出最近 10 个交易日内出现主升浪启动信号、当前仍处于 5/6/7/8 主升家族，
-并通过实盘硬过滤的标的。硬过滤默认剔除 ST/退市风险、近一日成交额 < 1 亿、止损幅度不在 8%-20% 的标的；
+`--strategy s7`（推荐）分层策略：S2b 核心（vr≤0.8, sp≥12）全天候展示 + S2c 增量（sp≥10）
+仅在牛市补位，不使用均值回复信号。回测 OOS 5d +2.70%, Sharpe 1.775, 最大回撤 -6.94%。
+报告含"层级"列（核心/增量），牛市展示两层，非牛市仅展示核心层。
+
+`--strategy s4` 环境自适应：牛市 surge 追涨 + 熊/震荡 reversion 均值回复。
+
+硬过滤默认剔除 ST/退市风险、近一日成交额 < 1 亿、止损幅度不在 8%-20% 的标的；
 可用环境变量 `SURGE_PICKER_MIN_AMOUNT_E` / `SURGE_PICKER_STOP_MIN_PCT` / `SURGE_PICKER_STOP_MAX_PCT` 调整。
 
 ### Step 3: 汇报结果
@@ -63,5 +78,6 @@ S1 笔力加速、S2 力度比、S3 脱离中枢、S4 低点抬升、S5 MA 扩�
 
 ## 输出文件
 
-主推荐扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`。
-旧 S1-S7 对照结果保存在 `.cursor/scripts/_output/surge_wave_picks/picks_YYYY-MM-DD.parquet`。
+- S0/S4/all 扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`
+- S7 扫描结果保存在 `scripts/_output/surge_regime_picks/picks_s7_YYYY-MM-DD.parquet`（含"层级"列）
+- 旧 S1-S7 对照结果保存在 `.cursor/scripts/_output/surge_wave_picks/picks_YYYY-MM-DD.parquet`

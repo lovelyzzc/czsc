@@ -199,7 +199,7 @@ fn py_reversion_score(feats: Option<trend_regime::FeatureSnapshot>, down_days: u
 /// 返回与 `index_closes` 等长的字符串列表。
 #[gen_stub_pyfunction]
 #[pyfunction]
-#[pyo3(signature = (index_closes, lookback=60, bull_threshold=10.0, bear_threshold=-10.0))]
+#[pyo3(signature = (index_closes, lookback=30, bull_threshold=8.0, bear_threshold=-8.0))]
 fn py_classify_market_regime(
     index_closes: Vec<f64>,
     lookback: usize,

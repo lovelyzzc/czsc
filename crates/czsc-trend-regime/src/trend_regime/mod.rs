@@ -31,7 +31,7 @@ pub const MIN_BIS: usize = 6;
 pub const ZS_MIN_BIS: usize = 3;
 pub const ACCEL_SPREAD: f64 = 15.0;
 pub const ACCEL_RET20: f64 = 15.0;
-pub const SURGE_GATE_VOL_RATIO: f64 = 1.2;
+pub const SURGE_GATE_VOL_RATIO: f64 = 0.8;
 pub const SURGE_GATE_MA_SPREAD: f64 = 3.0;
 pub const SURGE_GATE_RET20: f64 = 8.0;
 
@@ -406,7 +406,7 @@ mod tests {
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 1.5,
+            vol_ratio: 0.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
@@ -414,11 +414,11 @@ mod tests {
         };
         assert!(gates_pass(&f));
 
-        let f_low_vol = FeatureSnapshot {
-            vol_ratio: 0.5,
+        let f_high_vol = FeatureSnapshot {
+            vol_ratio: 1.5,
             ..f.clone()
         };
-        assert!(!gates_pass(&f_low_vol));
+        assert!(!gates_pass(&f_high_vol));
     }
 
     #[test]
@@ -428,36 +428,27 @@ mod tests {
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 1.5,
+            vol_ratio: 0.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
-            above_zg: true,
+            above_zg: false,
         };
         assert_eq!(classify_gate_level(&full), GateLevel::Full);
         assert!(gates_pass(&full));
 
-        // 2/3: low vol → Partial
-        let partial = FeatureSnapshot { vol_ratio: 0.5, ..full.clone() };
+        // 2/3: high vol fails Lte → Partial
+        let partial = FeatureSnapshot { vol_ratio: 1.5, ..full.clone() };
         assert_eq!(classify_gate_level(&partial), GateLevel::Partial);
         assert!(!gates_pass(&partial));
 
-        // 1/3: low vol + low spread → Weak
+        // 1/3: high vol + low spread → Weak (zg always passes with use_above_zg=false)
         let weak = FeatureSnapshot {
-            vol_ratio: 0.5,
+            vol_ratio: 1.5,
             ma_spread_pct: 1.0,
             ..full.clone()
         };
         assert_eq!(classify_gate_level(&weak), GateLevel::Weak);
-
-        // 0/3: everything fails → None
-        let none = FeatureSnapshot {
-            vol_ratio: 0.5,
-            ma_spread_pct: 1.0,
-            above_zg: false,
-            ..full.clone()
-        };
-        assert_eq!(classify_gate_level(&none), GateLevel::None);
     }
 
     #[test]
@@ -515,7 +506,7 @@ mod tests {
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 0.8, // below threshold → only Partial
+            vol_ratio: 1.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
@@ -525,7 +516,7 @@ mod tests {
             Regime::PivotBuilding as u8,
             Regime::UpwardDeparture as u8,
         ];
-        // Full level should reject (vol_ratio < 1.2)
+        // Full level should reject (vol_ratio 1.5 > Lte threshold 0.8)
         assert!(!surge_onset(
             Regime::UpwardDeparture as u8,
             Regime::MainUptrend as u8,
@@ -533,7 +524,7 @@ mod tests {
             &prior,
             "confirm",
         ));
-        // Partial level should accept
+        // Partial level should accept (2/3: sp + zg pass)
         assert!(surge_onset_with_level(
             Regime::UpwardDeparture as u8,
             Regime::MainUptrend as u8,
@@ -569,43 +560,48 @@ mod tests {
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 0.8, // low vol → default Gte rejects, Lte accepts
+            vol_ratio: 1.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
             above_zg: true,
         };
 
+        // Default Lte(0.8): 1.5 > 0.8 fails → Partial (sp + zg pass)
         assert_eq!(classify_gate_level(&f), GateLevel::Partial);
 
+        // With Gte direction (old behavior): 1.5 >= 1.2 passes → Full
         let cfg = GateConfig {
             vol_ratio_threshold: 1.2,
-            vol_ratio_direction: GateDirection::Lte, // flip: low vol is good
+            vol_ratio_direction: GateDirection::Gte,
+            use_above_zg: false,
             ..GateConfig::default()
         };
         assert_eq!(classify_gate_level_with_config(&f, &cfg), GateLevel::Full);
     }
 
     #[test]
-    fn test_classify_gate_level_with_config_no_above_zg() {
+    fn test_classify_gate_level_with_config_above_zg_enabled() {
         let f = FeatureSnapshot {
             up_dn_power_ratio: 1.5,
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 1.5,
+            vol_ratio: 0.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
-            above_zg: false, // would fail default above_zg gate
+            above_zg: false,
         };
-        assert_eq!(classify_gate_level(&f), GateLevel::Partial);
+        // Default (use_above_zg=false): zg auto-passes → Full (vr + sp + zg)
+        assert_eq!(classify_gate_level(&f), GateLevel::Full);
 
+        // With use_above_zg=true: above_zg=false fails → Partial
         let cfg = GateConfig {
-            use_above_zg: false,
+            use_above_zg: true,
             ..GateConfig::default()
         };
-        assert_eq!(classify_gate_level_with_config(&f, &cfg), GateLevel::Full);
+        assert_eq!(classify_gate_level_with_config(&f, &cfg), GateLevel::Partial);
     }
 
     #[test]
@@ -645,7 +641,7 @@ mod tests {
             last_up_angle: 30.0,
             ma_spread_pct: 5.0,
             dif: 0.5,
-            vol_ratio: 0.6, // low vol, fails default Gte
+            vol_ratio: 1.5,
             n_pivots: 2,
             pivot_width_pct: 5.0,
             ret20: 15.0,
@@ -656,6 +652,7 @@ mod tests {
             Regime::UpwardDeparture as u8,
         ];
 
+        // Default Lte(0.8): vol 1.5 > 0.8 fails Full gate
         assert!(!surge_onset(
             Regime::UpwardDeparture as u8,
             Regime::MainUptrend as u8,
@@ -664,9 +661,11 @@ mod tests {
             "confirm",
         ));
 
+        // Custom Gte config restores old behavior: 1.5 >= 1.2 passes
         let cfg = GateConfig {
             vol_ratio_threshold: 1.2,
-            vol_ratio_direction: GateDirection::Lte,
+            vol_ratio_direction: GateDirection::Gte,
+            use_above_zg: false,
             ..GateConfig::default()
         };
         assert!(surge_onset_with_config(
@@ -853,9 +852,9 @@ mod tests {
         assert_eq!(cfg.vol_ratio_threshold, SURGE_GATE_VOL_RATIO);
         assert_eq!(cfg.ma_spread_threshold, SURGE_GATE_MA_SPREAD);
         assert_eq!(cfg.ret20_threshold, SURGE_GATE_RET20);
-        assert_eq!(cfg.vol_ratio_direction, GateDirection::Gte);
+        assert_eq!(cfg.vol_ratio_direction, GateDirection::Lte);
         assert_eq!(cfg.ma_spread_direction, GateDirection::Gte);
-        assert!(cfg.use_above_zg);
+        assert!(!cfg.use_above_zg);
     }
 
     // ─── MarketRegime 测试 ──────────────────────────────────────

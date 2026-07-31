@@ -18,7 +18,7 @@ description: >-
 7 主升延续 · 8 加速主升 · 9 背驰衰竭 · 10 结构破坏`
 
 - **主升浪启动（买点）**：
-  - **确认追入**：状态跳变进入 `7/8` + 门控（量比≥1.2、MA5-MA20 散度≥3%、立于中枢上方）+ 启动前走过 `4→5`；
+  - **确认追入**：状态跳变进入 `7/8` + 门控（量比≤0.8、MA5-MA20 散度≥3%）+ 启动前走过 `4→5`；
   - **启动埋伏**：状态跳变进入 `5` + 更强门控（再加 20 日涨幅≥8%）+ 走过 `4`。
 - **卖点（统一）**：进入 `9 背驰`（减仓）/ `10 结构破坏`（清仓），叠加笔结构止损 SL2。
 
@@ -35,12 +35,28 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/sc
 ### Step 2: 运行每日扫描
 
 ```bash
+# S0 模式（默认）— 仅主升浪候选
 PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py
+
+# S7 分层策略（推荐）— S2b 核心(sp≥12) 全天候 + S2c 增量(sp≥10) 仅牛市，无均值回复
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy s7
+
+# S4 环境自适应模式 — 牛市用 surge，熊/震荡用 reversion
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy s4
+
+# 全信号模式 — 同时报告 surge + reversion 两类
+PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-regime-stock-picker/scripts/daily_scan.py --strategy all
 ```
 
-全 A 股流式因果扫描约 1-2 分钟，输出最近 10 个交易日内出现主升浪启动信号、且当前仍处于
-主升浪家族（5/6/7/8、未破坏）的结构观察池。硬过滤会剔除 ST/退市风险、
-最近一日成交额 < 1 亿、止损幅度不在 8%-20% 的标的；阈值可用
+全 A 股流式因果扫描约 1-2 分钟。
+
+- `--strategy s0`（默认）：输出全部主升浪候选
+- `--strategy s7`（推荐）：分层策略，S2b 核心（vr≤0.8, sp≥12）全天候展示，S2c 增量（sp≥10）仅在牛市补位。
+  回测验证 OOS 5d +2.70%, Sharpe 1.775, 最大回撤 -6.94%（三种备选中最小）。报告含"层级"列（核心/增量）。
+- `--strategy s4`：根据市场环境自动切换：牛市 = surge 追涨，熊/震荡 = reversion 均值回复
+- `--strategy all`：同时报告 surge + reversion 两类信号
+
+硬过滤会剔除 ST/退市风险、最近一日成交额 < 1 亿、止损幅度不在 8%-20% 的标的；阈值可用
 `SURGE_PICKER_MIN_AMOUNT_E` / `SURGE_PICKER_STOP_MIN_PCT` / `SURGE_PICKER_STOP_MAX_PCT` 调整。
 
 ### Step 3: 汇报结果
@@ -81,6 +97,7 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 
 ## 输出文件
 
-扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`。
-策略候选和前向日志由 delay5 skill 写入同目录的 `picks_exp_delay5_YYYY-MM-DD.parquet` 与
-`market_state_live.parquet`。
+- S0/S4/all 扫描结果保存在 `scripts/_output/surge_regime_picks/picks_YYYY-MM-DD.parquet`
+- S7 扫描结果保存在 `scripts/_output/surge_regime_picks/picks_s7_YYYY-MM-DD.parquet`（含"层级"列）
+- 策略候选和前向日志由 delay5 skill 写入同目录的 `picks_exp_delay5_YYYY-MM-DD.parquet` 与
+  `market_state_live.parquet`

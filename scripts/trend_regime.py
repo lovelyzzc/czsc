@@ -37,12 +37,23 @@ from czsc._native.trend_regime import (
     Regime,
     StateSnapshot,
     iter_regime_states,
+    py_classify_market_regime as classify_market_regime,
     py_priority_score as priority_score,
+    py_reversion_onset as reversion_onset,
+    py_reversion_score as reversion_score,
     py_surge_onset as surge_onset,
     py_surge_score as surge_score,
 )
 
 ALL_REGIMES = tuple(Regime.from_int(i) for i in range(11))
+
+SURGE_GATE_VOL_RATIO = 0.8
+SURGE_GATE_MA_SPREAD = 3.0
+SURGE_GATE_RET20 = 8.0
+
+S2B_GATE_MA_SPREAD = 12.0
+S2C_GATE_MA_SPREAD = 10.0
+S2C_GATE_VOL_RATIO = 0.9
 
 DATA_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
 

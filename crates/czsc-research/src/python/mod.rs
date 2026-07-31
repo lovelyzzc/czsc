@@ -274,6 +274,7 @@ fn simulate_surge_backtest<'py>(
         buy_cost,
         sell_cost,
         fill_mode: fm,
+        holding_period: slot_backtest::HoldingPeriodConfig::default(),
     };
 
     let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {
@@ -505,6 +506,7 @@ fn simulate_surge_backtest_parquet<'py>(
         buy_cost,
         sell_cost,
         fill_mode: fm,
+        holding_period: slot_backtest::HoldingPeriodConfig::default(),
     };
 
     let parse_dt = |s: &str| -> PyResult<chrono::DateTime<chrono::Utc>> {

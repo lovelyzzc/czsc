@@ -68,10 +68,10 @@ impl Default for GateConfig {
     fn default() -> Self {
         Self {
             vol_ratio_threshold: SURGE_GATE_VOL_RATIO,
-            vol_ratio_direction: GateDirection::Gte,
+            vol_ratio_direction: GateDirection::Lte,
             ma_spread_threshold: SURGE_GATE_MA_SPREAD,
             ma_spread_direction: GateDirection::Gte,
-            use_above_zg: true,
+            use_above_zg: false,
             ret20_threshold: SURGE_GATE_RET20,
         }
     }
@@ -169,7 +169,12 @@ pub fn gate_confidence_with_config(feats: &FeatureSnapshot, cfg: &GateConfig) ->
         1.0
     };
 
-    (vr_score * 0.4 + sp_score * 0.35 + zg_score * 0.25).min(1.0)
+    let (vr_w, sp_w, zg_w) = if cfg.use_above_zg {
+        (0.4, 0.35, 0.25)
+    } else {
+        (0.55, 0.45, 0.0)
+    };
+    (vr_score * vr_w + sp_score * sp_w + zg_score * zg_w).min(1.0)
 }
 
 /// 连续置信度 0.0–1.0（使用默认阈值和方向）。
@@ -355,7 +360,7 @@ pub fn surge_score(feats: Option<&FeatureSnapshot>) -> f64 {
         if x.is_nan() { default } else { x }
     };
 
-    let s = (v(feats.vol_ratio, 0.0) / 2.0).min(1.0) * 30.0
+    let s = (1.0 - v(feats.vol_ratio, 1.0).min(2.0) / 2.0).max(0.0) * 30.0
         + (v(feats.ma_spread_pct, 0.0) / 15.0).min(1.0) * 30.0
         + (v(feats.ret20, 0.0).max(0.0) / 30.0).min(1.0) * 20.0
         + (v(feats.last_up_angle, 0.0).max(0.0) / 45.0).min(1.0) * 20.0;
@@ -379,7 +384,8 @@ pub fn priority_score(
     regime: u8,
     scan_window: usize,
 ) -> f64 {
-    let mut p = score.min(100.0) * 0.35;
+    let normalized = score.min(100.0) / 100.0;
+    let mut p = normalized * normalized * 100.0 * 0.35;
 
     if sl_pct.is_nan() || sl_pct <= 0.0 {
         p -= 30.0;

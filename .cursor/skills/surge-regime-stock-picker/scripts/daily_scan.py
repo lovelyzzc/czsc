@@ -3,15 +3,19 @@
 基于 `trend_regime` 的 11 态走势状态机，用因果「主升浪启动」信号（`surge_onset`）
 扫描全 A 股最新一根 K 线，输出当日处于主升浪启动/追入窗口的标的 + 推荐止损。
 
-相比旧 surge-wave-stock-picker（S1-S7 等权 + 全量 CZSC 后 edt 过滤，有轻微未来函数泄漏），
-本扫描用流式状态机（`iter_states(tail=...)`）+ 原生中枢，**对「今日」无未来数据，严格因果**。
+支持四种策略模式（--strategy 参数）：
+  s0   — 只报告主升浪候选（默认，当前行为不变）
+  s4   — 环境自适应：牛市用 S0 追涨，熊市/震荡用均值回复
+  s7   — 分层策略：S2b 核心(sp>=12) 全天候 + S2c 增量(sp>=10) 仅牛市，无回复
+  all  — 同时报告 surge + reversion 两类信号
 
 用法：
-    PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python daily_scan.py
+    PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python daily_scan.py [--strategy s0|s4|s7|all]
 """
 
 from __future__ import annotations
 
+import argparse
 import multiprocessing as mp
 import os
 import sys
@@ -21,26 +25,47 @@ from pathlib import Path
 import pandas as pd
 import tinyshare as ts
 
-# 引入仓库 scripts/ 下的 trend_regime（共享因果信号，单一真源）
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO / "scripts"))
 
 import surge_live as sl  # noqa: E402
-import surge_portfolio_backtest as spb  # noqa: E402  # load_st_intervals / is_st_on（本地 namechange 历史 ST 判定）
+import surge_portfolio_backtest as spb  # noqa: E402
 import trend_regime as tr  # noqa: E402
-from trend_regime import REGIME_CN, Regime, priority_score, surge_onset, surge_score  # noqa: E402
+from trend_regime import (  # noqa: E402
+    REGIME_CN,
+    Regime,
+    classify_market_regime,
+    priority_score,
+    reversion_onset,
+    reversion_score,
+    surge_onset,
+    surge_score,
+)
 
 TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
 OUTPUT_DIR = REPO / "scripts" / "_output" / "surge_regime_picks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SCAN_WINDOW = 10  # 回看最近 N 根找最新启动信号
-TAIL = 160  # iter_states 快路径窗口（> SCAN_WINDOW + SURGE_PRIOR_WINDOW）
-MIN_AMOUNT_E = float(os.getenv("SURGE_PICKER_MIN_AMOUNT_E", "1.0"))  # 最近一日成交额下限：亿元
+SCAN_WINDOW = 10
+TAIL = 160
+MIN_AMOUNT_E = float(os.getenv("SURGE_PICKER_MIN_AMOUNT_E", "1.0"))
 STOP_MIN_PCT = float(os.getenv("SURGE_PICKER_STOP_MIN_PCT", "8"))
 STOP_MAX_PCT = float(os.getenv("SURGE_PICKER_STOP_MAX_PCT", "20"))
 UPTREND_FAMILY = {Regime.UpwardDeparture, Regime.ThirdBuy, Regime.MainUptrend, Regime.Acceleration}
+RECOVERY_FAMILY = {int(Regime.FirstBuy), int(Regime.SecondBuy), int(Regime.PivotBuilding)}
 TP_RULE = "SL2/中枢下沿托底 + 浮盈后18%跟踪 + 背驰减仓/破坏清仓"
+REVERSION_LOOKBACK = 20
+
+
+def _count_down_days(regimes: list[int], up_to: int) -> int:
+    """从 up_to 位置向前数连续 Downtrend(1) 天数。"""
+    count = 0
+    for i in range(up_to - 1, -1, -1):
+        if regimes[i] == int(Regime.Downtrend):
+            count += 1
+        else:
+            break
+    return count
 
 
 def _scan_one(parquet_path: str) -> dict | None:
@@ -53,62 +78,97 @@ def _scan_one(parquet_path: str) -> dict | None:
 
     regimes = [s.regime for s in states]
     last = states[-1]
-    if last.regime not in UPTREND_FAMILY:  # 结构已破坏/已转卖点 → 非追入窗口
-        return None
-
     code = df["symbol"].iloc[0]
     amount = float(df["amount"].iloc[-1]) if "amount" in df.columns else 0.0
-    amount_e = sl.amount_to_e(amount)  # round 3，与 dump/镜像核对同口径
+    amount_e = sl.amount_to_e(amount)
 
-    # 实验 · delay5 回踩买点（独立于主表逻辑，不影响默认输出）
-    exp = sl.detect_delay5(states)
-    if exp:
-        exp["代码"] = code
-        exp["成交额亿"] = amount_e
+    result: dict = {"main": None, "exp": None, "reversion": None}
 
-    # 最近 SCAN_WINDOW 根内最新的一次主升浪启动
-    found = None
-    for p in range(len(states) - 1, max(0, len(states) - 1 - SCAN_WINDOW), -1):
-        prior = regimes[max(0, p - tr.SURGE_PRIOR_WINDOW) : p]
-        for mode in ("confirm", "anticipate"):
-            if surge_onset(states[p - 1].regime, states[p].regime, states[p].feats, prior, mode):
-                found = (p, mode)
+    # ── Surge 检测（需在上行家族内） ──
+    if last.regime in UPTREND_FAMILY:
+        exp = sl.detect_delay5(states)
+        if exp:
+            exp["代码"] = code
+            exp["成交额亿"] = amount_e
+            result["exp"] = exp
+
+        found = None
+        for p in range(len(states) - 1, max(0, len(states) - 1 - SCAN_WINDOW), -1):
+            prior = regimes[max(0, p - tr.SURGE_PRIOR_WINDOW) : p]
+            for mode in ("confirm", "anticipate"):
+                if surge_onset(states[p - 1].regime, states[p].regime, states[p].feats, prior, mode):
+                    found = (p, mode)
+                    break
+            if found:
                 break
         if found:
+            p_onset, variant = found
+            freshness = (len(states) - 1) - p_onset
+            feats = last.feats or {}
+            close = last.close
+            sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd
+            sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
+            sl_pct = round((close - sl_ref) / close * 100, 1) if sl_ref else None
+            result["main"] = {
+                "代码": code,
+                "名称": "",
+                "行业": "",
+                "日期": last.dt.strftime("%Y-%m-%d"),
+                "收盘价": round(close, 2),
+                "当前状态": REGIME_CN[Regime(last.regime)],
+                "启动方式": "确认追入" if variant == "confirm" else "启动埋伏",
+                "启动日": states[p_onset].dt.strftime("%Y-%m-%d"),
+                "新鲜度": freshness,
+                "score": surge_score(feats),
+                "量比": feats.get("vol_ratio"),
+                "MA散度%": feats.get("ma_spread_pct"),
+                "ret20%": feats.get("ret20"),
+                "成交额亿": amount_e,
+                "推荐止损": round(sl_ref, 2) if sl_ref else None,
+                "止损幅度%": sl_pct,
+                "过滤原因": "",
+                "可操作": False,
+                "止盈规则": TP_RULE,
+            }
+
+    # ── Reversion 检测（Downtrend→Recovery 转换） ──
+    rev_found = None
+    for p in range(len(states) - 1, max(0, len(states) - 1 - SCAN_WINDOW), -1):
+        prior = regimes[max(0, p - REVERSION_LOOKBACK) : p]
+        if reversion_onset(states[p - 1].regime, states[p].regime, states[p].feats, prior):
+            rev_found = p
             break
-    if found is None:
-        return {"main": None, "exp": exp} if exp else None
+    if rev_found is not None:
+        down_days = _count_down_days(regimes, rev_found)
+        rev_state = states[rev_found]
+        feats = last.feats or {}
+        close = last.close
+        sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd
+        sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
+        sl_pct = round((close - sl_ref) / close * 100, 1) if sl_ref else None
+        result["reversion"] = {
+            "代码": code,
+            "名称": "",
+            "行业": "",
+            "日期": last.dt.strftime("%Y-%m-%d"),
+            "收盘价": round(close, 2),
+            "当前状态": REGIME_CN[Regime(last.regime)],
+            "转换日": rev_state.dt.strftime("%Y-%m-%d"),
+            "转换状态": REGIME_CN[Regime(rev_state.regime)],
+            "下跌天数": down_days,
+            "新鲜度": (len(states) - 1) - rev_found,
+            "rev_score": reversion_score(feats, down_days),
+            "量比": feats.get("vol_ratio"),
+            "MA散度%": feats.get("ma_spread_pct"),
+            "ret20%": feats.get("ret20"),
+            "成交额亿": amount_e,
+            "推荐止损": round(sl_ref, 2) if sl_ref else None,
+            "止损幅度%": sl_pct,
+            "过滤原因": "",
+            "可操作": False,
+        }
 
-    p_onset, variant = found
-    freshness = (len(states) - 1) - p_onset
-    feats = last.feats or {}
-    close = last.close
-    sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd  # NaN 检查；退化用中枢下沿
-    sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
-    sl_pct = round((close - sl_ref) / close * 100, 1) if sl_ref else None
-
-    main_rec = {
-        "代码": code,
-        "名称": "",
-        "行业": "",
-        "日期": last.dt.strftime("%Y-%m-%d"),
-        "收盘价": round(close, 2),
-        "当前状态": REGIME_CN[Regime(last.regime)],
-        "启动方式": "确认追入" if variant == "confirm" else "启动埋伏",
-        "启动日": states[p_onset].dt.strftime("%Y-%m-%d"),
-        "新鲜度": freshness,
-        "score": surge_score(feats),
-        "量比": feats.get("vol_ratio"),
-        "MA散度%": feats.get("ma_spread_pct"),
-        "ret20%": feats.get("ret20"),
-        "成交额亿": amount_e,
-        "推荐止损": round(sl_ref, 2) if sl_ref else None,
-        "止损幅度%": sl_pct,
-        "过滤原因": "",
-        "可操作": False,
-        "止盈规则": TP_RULE,
-    }
-    return {"main": main_rec, "exp": exp}
+    return result if any(result.values()) else None
 
 
 def _priority(r: dict) -> float:
@@ -153,10 +213,101 @@ def _filter_reasons(r: dict, *, check_name: bool) -> list[str]:
     return reasons
 
 
+def _compute_market_regime() -> str:
+    """基于全市场等权指数，用 30 日回看窗口分类当前市场环境。"""
+    try:
+        panel = sl.build_live_panel()
+        daily = panel.groupby("dt").agg(eq_close=("close", "mean")).reset_index().sort_values("dt")
+        closes = daily["eq_close"].tolist()
+        if len(closes) < 35:
+            return "sideways"
+        regime_labels = classify_market_regime(closes, lookback=30, bull_threshold=8.0, bear_threshold=-8.0)
+        return regime_labels[-1] if regime_labels else "sideways"
+    except Exception as e:
+        print(f"  [市场环境] 计算失败，默认 sideways：{e}")
+        return "sideways"
+
+
+REGIME_CN_MARKET = {"bull": "牛市", "sideways": "震荡", "bear": "熊市"}
+
+
+def _report_reversion(rev_results, name_map, industry_map, metadata_available):
+    """报告均值回复信号候选。"""
+    if not rev_results:
+        print("\n今日无均值回复信号候选")
+        return
+
+    for r in rev_results:
+        r["名称"] = name_map.get(r["代码"], "")
+        r["行业"] = industry_map.get(r["代码"], "")
+        reasons = _filter_reasons(r, check_name=metadata_available)
+        r["过滤原因"] = "|".join(reasons)
+        r["可操作"] = not reasons
+
+    rev_results.sort(key=lambda x: -x["rev_score"])
+    scan_date = rev_results[0]["日期"]
+    actionable = [r for r in rev_results if r["可操作"]]
+
+    print(f"\n{'=' * 150}")
+    print(
+        f"  {scan_date} 均值回复信号 | 可操作 {len(actionable)} 只 / 总候选 {len(rev_results)} 只 | "
+        f"信号：下跌态→回复态（Downtrend→FirstBuy/PivotBuilding）| 建议持有 20 日"
+    )
+    st_filter = "剔除 ST/退市风险、" if metadata_available else "ST过滤未启用、"
+    print(f"  硬过滤：{st_filter}成交额<{MIN_AMOUNT_E:g}亿、止损幅度不在{STOP_MIN_PCT:g}-{STOP_MAX_PCT:g}%")
+    print(f"{'=' * 150}")
+    header = (
+        f"{'序':>3} {'代码':>11} {'名称':<8} {'行业':<7} {'收盘':>7} {'状态':<7} "
+        f"{'转换状态':<7} {'下跌天':>5} {'rev_score':>8} {'量比':>5} {'额亿':>5} {'止损':>7} {'幅度%':>6}"
+    )
+    print(header)
+    print("-" * 150)
+    display = actionable[:20] if actionable else rev_results[:20]
+    for i, r in enumerate(display, 1):
+        print(
+            f"{i:>3} {r['代码']:>11} {r['名称'][:6]:<8} {r['行业'][:6]:<7} {r['收盘价']:>7.2f} "
+            f"{r['当前状态']:<7} {r['转换状态']:<7} {r['下跌天数']:>5} {r['rev_score']:>8.1f} "
+            f"{(r['量比'] or 0):>5.2f} {r['成交额亿']:>5.2f} {(r['推荐止损'] or 0):>7.2f} "
+            f"{(r['止损幅度%'] if r['止损幅度%'] is not None else 0):>6.1f}"
+        )
+    if len(display) < len(rev_results):
+        print(f"  ... 另有 {len(rev_results) - len(display)} 只未显示")
+
+    out = OUTPUT_DIR / f"picks_reversion_{scan_date}.parquet"
+    cols = [
+        "代码", "名称", "行业", "日期", "收盘价", "当前状态", "转换日", "转换状态",
+        "下跌天数", "新鲜度", "rev_score", "量比", "MA散度%", "ret20%", "成交额亿",
+        "推荐止损", "止损幅度%", "可操作", "过滤原因",
+    ]
+    pd.DataFrame(rev_results)[cols].to_parquet(out, index=False)
+    print(f"\n[文件] {out}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="主升浪 + 均值回复每日选股扫描")
+    parser.add_argument(
+        "--strategy",
+        choices=["s0", "s4", "s7", "all"],
+        default="s0",
+        help="策略模式：s0=仅surge（默认）, s4=环境自适应, s7=S2b核心+S2c牛市增量, all=同时报告两类",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_args()
+    strategy = args.strategy
+
+    title = {
+        "s0": "主升浪启动 (S0 — 追涨)",
+        "s4": "环境自适应 (S4 — 牛市追涨/熊市-震荡回复)",
+        "s7": "分层策略 (S7 — S2b核心 + S2c牛市增量)",
+        "all": "全信号扫描 (Surge + Reversion)",
+    }[strategy]
     print("=" * 70)
-    print("  主升浪启动（缠论状态机）— 每日选股扫描")
+    print(f"  {title} — 每日选股扫描")
     print("=" * 70)
+
     metadata_available = False
     try:
         name_map, industry_map = _load_stock_basic()
@@ -166,30 +317,58 @@ def main():
         print(f"[基础] 名称/行业加载失败（仅离线扫描）：{e}")
         name_map, industry_map = {}, {}
 
+    market_regime = "sideways"
+    if strategy in ("s4", "s7", "all"):
+        print("[市场环境] 计算中 ...")
+        market_regime = _compute_market_regime()
+        print(f"  当前市场环境：{REGIME_CN_MARKET.get(market_regime, market_regime)}")
+
     files = [str(p) for p in sorted(tr.DATA_DIR.glob("*.parquet"))]
     n_workers = min(mp.cpu_count(), 8)
     print(
-        f"[数据] {len(files)} 只 | {n_workers} 进程 | 门控 量比≥{tr.SURGE_GATE_VOL_RATIO} 散度≥{tr.SURGE_GATE_MA_SPREAD}%\n"
+        f"[数据] {len(files)} 只 | {n_workers} 进程 | 门控 量比≤{tr.SURGE_GATE_VOL_RATIO} 散度≥{tr.SURGE_GATE_MA_SPREAD}%\n"
     )
 
     t0 = time.time()
-    results, exp_raw = [], []
+    surge_results, exp_raw, rev_results = [], [], []
     ctx = mp.get_context("spawn")
     with ctx.Pool(n_workers) as pool:
         for i, res in enumerate(pool.imap_unordered(_scan_one, files, chunksize=20), 1):
             if res:
                 if res.get("main"):
-                    results.append(res["main"])
+                    surge_results.append(res["main"])
                 if res.get("exp"):
                     exp_raw.append(res["exp"])
+                if res.get("reversion"):
+                    rev_results.append(res["reversion"])
             if i % 1000 == 0 or i == len(files):
-                print(f"  [{i}/{len(files)}] 命中 {len(results)} | {time.time() - t0:.0f}s")
+                n_hits = len(surge_results) + len(rev_results)
+                print(f"  [{i}/{len(files)}] surge={len(surge_results)} rev={len(rev_results)} | {time.time() - t0:.0f}s")
 
-    if results:
-        _report_default(results, name_map, industry_map, metadata_available)
+    show_surge = strategy in ("s0", "all") or (strategy == "s4" and market_regime == "bull")
+    show_rev = strategy == "all" or (strategy == "s4" and market_regime in ("bear", "sideways"))
+
+    if strategy == "s4":
+        print(f"\n[S4 路由] 市场环境={REGIME_CN_MARKET.get(market_regime, market_regime)} → ", end="")
+        if market_regime == "bull":
+            print("使用 Surge 追涨信号")
+        else:
+            print("使用 Reversion 均值回复信号")
+
+    if strategy == "s7":
+        _report_s7(surge_results, name_map, industry_map, metadata_available, market_regime)
     else:
-        print("\n今日无处于主升浪启动/追入窗口的标的")
-    _report_experimental(exp_raw, name_map, industry_map, metadata_available)
+        if show_surge:
+            if surge_results:
+                _report_default(surge_results, name_map, industry_map, metadata_available)
+            else:
+                print("\n今日无处于主升浪启动/追入窗口的标的")
+
+        if show_rev:
+            _report_reversion(rev_results, name_map, industry_map, metadata_available)
+
+    if strategy in ("s0", "all"):
+        _report_experimental(exp_raw, name_map, industry_map, metadata_available)
 
 
 def _report_default(results, name_map, industry_map, metadata_available):
@@ -271,6 +450,95 @@ def _report_default(results, name_map, industry_map, metadata_available):
         "止盈规则",
     ]
     pd.DataFrame(results)[cols].to_parquet(out, index=False)
+    print(f"\n[文件] {out}")
+
+
+def _report_s7(results, name_map, industry_map, metadata_available, market_regime: str):
+    """S7 分层策略报告：S2b 核心（sp>=12 全天候）+ S2c 增量（10<=sp<12 仅牛市）。"""
+    if not results:
+        print("\n今日无处于主升浪启动/追入窗口的标的")
+        return
+
+    for r in results:
+        r["名称"] = name_map.get(r["代码"], "")
+        r["行业"] = industry_map.get(r["代码"], "")
+        r["优先级"] = _priority(r)
+        sl_pct = r.get("止损幅度%")
+        reasons = _filter_reasons(r, check_name=metadata_available)
+        r["过滤原因"] = "|".join(reasons)
+        r["可操作"] = not reasons
+        sp = r.get("MA散度%") or 0
+        if sp >= tr.S2B_GATE_MA_SPREAD:
+            r["层级"] = "核心"
+            r["等级"] = (
+                "C"
+                if (sl_pct is None or sl_pct <= 0 or reasons)
+                else ("A" if r["优先级"] >= 75 else "B" if r["优先级"] >= 60 else "C")
+            )
+        elif sp >= tr.S2C_GATE_MA_SPREAD:
+            r["层级"] = "增量"
+            r["等级"] = (
+                "C"
+                if (sl_pct is None or sl_pct <= 0 or reasons)
+                else ("B" if r["优先级"] >= 60 else "C")
+            )
+        else:
+            r["层级"] = "—"
+            r["等级"] = "C"
+
+    is_bull = market_regime == "bull"
+    core = [r for r in results if r["层级"] == "核心"]
+    incr = [r for r in results if r["层级"] == "增量"] if is_bull else []
+    display = core + incr
+    display.sort(key=lambda x: (-{"核心": 1, "增量": 0}.get(x["层级"], -1), -x["优先级"]))
+
+    scan_date = results[0]["日期"]
+    actionable = [r for r in display if r["可操作"]]
+    n_core = sum(1 for r in actionable if r["层级"] == "核心")
+    n_incr = sum(1 for r in actionable if r["层级"] == "增量")
+
+    regime_cn = REGIME_CN_MARKET.get(market_regime, market_regime)
+    print(f"\n{'=' * 160}")
+    print(
+        f"  {scan_date} S7 分层策略 | 市场环境={regime_cn} | "
+        f"核心(sp≥{tr.S2B_GATE_MA_SPREAD}) {n_core} 只 | "
+        f"增量(sp≥{tr.S2C_GATE_MA_SPREAD}) {n_incr if is_bull else 0} 只{'(牛市启用)' if is_bull else '(非牛市-不展示)'} | "
+        f"止损止盈：{TP_RULE}"
+    )
+    st_filter = "剔除 ST/退市风险、" if metadata_available else "ST过滤未启用（缺少名称/行业元数据）、"
+    print(f"  硬过滤：{st_filter}成交额<{MIN_AMOUNT_E:g}亿、止损幅度不在{STOP_MIN_PCT:g}-{STOP_MAX_PCT:g}%")
+    print("  核心=S2b(vr≤0.8,sp≥12) 全天候 | 增量=S2c(sp≥10,sp<12) 仅牛市补位 | 无均值回复")
+    print(f"{'=' * 160}")
+    header = (
+        f"{'序':>3} {'层':>4} {'级':>2} {'代码':>11} {'名称':<8} {'行业':<7} {'收盘':>7} {'状态':<7} "
+        f"{'方式':<5} {'优先级':>5} {'score':>5} {'量比':>5} {'散度%':>6} {'ret20':>6} {'额亿':>5} {'止损':>7} {'幅度%':>6} {'新鲜':>4}"
+    )
+    print(header)
+    print("-" * 160)
+    show = actionable[:20] if actionable else display[:20]
+    for i, r in enumerate(show, 1):
+        print(
+            f"{i:>3} {r['层级']:>4} {r['等级']:>2} {r['代码']:>11} {r['名称'][:6]:<8} {r['行业'][:6]:<7} {r['收盘价']:>7.2f} "
+            f"{r['当前状态']:<7} {r['启动方式']:<5} {r['优先级']:>5} {r['score']:>5} "
+            f"{(r['量比'] or 0):>5.2f} {(r['MA散度%'] or 0):>6.2f} {(r['ret20%'] or 0):>6.1f} "
+            f"{r['成交额亿']:>5.2f} {(r['推荐止损'] or 0):>7.2f} "
+            f"{(r['止损幅度%'] if r['止损幅度%'] is not None else 0):>6.1f} {r['新鲜度']:>4}"
+        )
+    if len(actionable) > 20:
+        print(f"\n  ... 另有 {len(actionable) - 20} 只可操作结构候选未显示（优先级较低）")
+    if not actionable:
+        print("\n  今日无通过硬过滤的可操作标的，上表为前 20。")
+
+    out = OUTPUT_DIR / f"picks_s7_{scan_date}.parquet"
+    for r in display:
+        r["止盈规则"] = TP_RULE
+    cols = [
+        "代码", "名称", "行业", "层级", "等级", "优先级", "日期", "收盘价",
+        "当前状态", "启动方式", "启动日", "新鲜度", "score",
+        "量比", "MA散度%", "ret20%", "成交额亿",
+        "推荐止损", "止损幅度%", "可操作", "过滤原因", "止盈规则",
+    ]
+    pd.DataFrame(display)[cols].to_parquet(out, index=False)
     print(f"\n[文件] {out}")
 
 
