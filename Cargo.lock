@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "czsc"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "czsc-core",
  "czsc-signals",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-core"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-derive"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-python"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-research"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "czsc-core",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-signal-macros"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-signals"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-ta"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "numpy",
  "ordered-float",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-trader"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-trend-regime"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "czsc-core",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "czsc-utils"
-version = "1.0.0-rc.8"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",

@@ -9,6 +9,12 @@
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-09
+
+### Added
+
+- **公开缠论结构分析链 API**：新增 `create_fake_bis`、`get_zs_seq`、`is_symmetry_zs`、`is_bis_up`、`is_bis_down`、`check_gap_info`，并新增基于 `finished_bis` 计算的 `CZSC.zs_list` 属性。Python 顶层、`czsc._native` 类型桩和 Rust `czsc` facade 同步暴露。
+
 ### Fixed
 
 - **`CZSC_MIN_BI_LEN` 现在真正作用于 Rust 端成笔逻辑**（[waditu/czsc#328](https://github.com/waditu/czsc/issues/328)）：此前 `crates/czsc-core/src/analyze/utils.rs` 的 `check_bi` 硬编码 `let min_bi_len = 6;`，且 `CZSC` 构造函数签名只有 `(bars_raw, max_bi_num)`，导致 `CZSC_MIN_BI_LEN` 只影响 `czsc.envs.get_min_bi_len()` 的返回值、对 `bi_list` / `finished_bis` 毫无作用。修复：
@@ -18,13 +24,13 @@
   - 新增 `CZSC.min_bi_len` getter；pickle (`__reduce__`) 现在保留 `min_bi_len`。
   - 回归测试 `min_bi_len_affects_bi_count` 锁定"更大阈值产出更少/更长的笔"。
 
-### Notes
+### Fixed
 
-- **1.0.0-rc.8 在纯 Rust 下游不可用（PyPI 用户不受影响）**：发布后验证发现 cargo 用户 `cargo add czsc@=1.0.0-rc.8` 无法编译。两个根因：
-  1. **SemVer prerelease 解析坑**：crates.io 上同时存在 `czsc-* 1.0.0` (stable) 与 `1.0.0-rc.*`，workspace 内部 dep 写 `version = "1.0.0-rc.8"`（不带 `=`）会被 cargo 解析到 1.0.0 stable（按 SemVer，stable > prerelease），导致 polars 0.42 与 0.52 双版本冲突。已对 8 个 czsc-* 1.0.0 stable 执行 `cargo yank` 缓解。
-  2. **pyo3 / pyo3-stub-gen / numpy 是无条件硬依赖**（不在 feature gate 后），纯 Rust 用户也被强制拉 PyO3 工具链，撞 pyo3-stub-gen 0.22.x ↔ pyo3 0.28.3 的 `PyEncodingWarning` 兼容性 bug。
-- **rc.9 计划**：(a) 把 4 个 czsc-* crate 的 pyo3 系列 dep 改 `optional = true` + 引入 `python` feature gate；(b) workspace dep 改 `version = "=1.0.0-rc.9"` 严格锁定 prerelease；(c) `docs/release_checklist.md` §7 已升级"cargo add 可解析" → "cargo check 真编"，下次再踩同样坑被立即拦下。
-- **PyPI 1.0.0rc8 完全可用**，Python 用户无需做任何处理。
+- **Rust 发布依赖图**：workspace 内部 `czsc-*` 依赖改为严格 `=<version>` 锁定；`czsc-signals` 与 `czsc-trader` 仅在 Python 构建路径启用 `czsc-core/python`，纯 Rust 用户不再被强制拉入 PyO3 工具链。
+
+### Documentation
+
+- 真实数据 Tushare 案例已补入案例索引，并明确其 `TUSHARE_TOKEN` 前置条件；发布自检只检查已删除模块路径，保留有效的兼容性说明。
 
 ---
 
@@ -404,6 +410,7 @@ fig.show()
   bump `Cargo.toml [workspace.package].version` 即可，pyproject.toml 自动同步。
 - 旧 Python 实现可在 `v0.9.69` tag 或 [0.9.X 分支](https://github.com/waditu/czsc/tree/v0.9.69) 查看。
 
+[1.0.1]: https://github.com/waditu/czsc/compare/v1.0.0-rc.8...v1.0.1
 [1.0.0-rc.5]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.5]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.4
