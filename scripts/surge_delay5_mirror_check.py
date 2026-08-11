@@ -10,7 +10,7 @@
 - 同时核对 live 市场状态（surge_live.build_live_panel 尾部面板）与研究
   market_state.parquet 在重叠日期的数值与门判定。
 
-预期：选股集合匹配率 ~100%；不匹配逐笔归因（次日无 bar 致 dump 缺行 / qfq 复权漂移 /
+预期：选股集合、匹配行字段与市场状态门必须全部一致；不匹配逐笔归因（次日无 bar 致 dump 缺行 / qfq 复权漂移 /
 满 500 根宇宙漂移 / 逻辑 bug——最后一类必须为 0）。
 
     uv run --no-sync python scripts/surge_delay5_mirror_check.py [--days 10]
@@ -38,11 +38,10 @@ AMT_TOL = 0.0011  # amount_e 容差
 
 
 def _signal_gate(df: pd.DataFrame) -> pd.Series:
-    """Anticipate 信号门控（与 surge_portfolio_backtest.gated_candidates 同口径）。"""
+    """Anticipate 信号门控（与 Rust ``GateConfig::default()`` 同口径）。"""
     g = (
-        (df["sig_vol_ratio"] >= tr.SURGE_GATE_VOL_RATIO)
+        (df["sig_vol_ratio"] <= tr.SURGE_GATE_VOL_RATIO)
         & (df["sig_ma_spread_pct"] >= tr.SURGE_GATE_MA_SPREAD)
-        & (df["sig_above_zg"] == 1)
         & (df["sig_ret20"] >= tr.SURGE_GATE_RET20)
     )
     return g.fillna(False)
@@ -172,6 +171,29 @@ def compare_market_state(t_list: list[pd.Timestamp]) -> list[dict]:
     return rows
 
 
+def build_verdict(
+    *,
+    total_live: int,
+    total_dump: int,
+    total_matched: int,
+    total_set_mismatches: int,
+    total_value_diffs: int,
+    gates_ok: bool,
+    gate_note: str,
+) -> str:
+    """集合、匹配字段、市场状态三层同时一致时才允许 PASS。"""
+
+    passed = (
+        total_set_mismatches == 0 and total_value_diffs == 0 and total_matched == total_live == total_dump and gates_ok
+    )
+    if passed:
+        return "PASS — selection sets, matched values and market-state gates agree"
+    return (
+        f"ATTENTION — {total_set_mismatches} set mismatches, {total_value_diffs} matched-value diffs, "
+        f"market-state={gate_note}"
+    )
+
+
 def write_report(summary: dict) -> None:
     lines = [
         "# Delay5 engineering mirror check",
@@ -201,7 +223,8 @@ def write_report(summary: dict) -> None:
     lines.extend(
         [
             "",
-            f"**Totals**: matched {summary['total_matched']} / live {summary['total_live']} / dump {summary['total_dump']}; mismatches {summary['total_mismatch']}.",
+            f"**Totals**: matched {summary['total_matched']} / live {summary['total_live']} / dump {summary['total_dump']}; "
+            f"set mismatches {summary['total_mismatch']}; matched-value diffs {summary['total_value_diffs']}.",
         ]
     )
     if summary["all_attributions"]:
@@ -275,17 +298,21 @@ def main() -> None:
     total_dump = sum(d["dump_n"] for d in days)
     total_matched = sum(d["matched"] for d in days)
     total_mismatch = sum(len(d["live_only"]) + len(d["dump_only"]) for d in days)
+    all_attributions = [a for d in days for a in d["attributions"]]
+    all_value_diffs = [v for d in days for v in d["value_diffs"]]
     # 市场状态必须每个 T 都有有效对比行：缺失日不允许靠 all(空集)=True 误判 PASS
     valid_market = [r for r in market_rows if "gate_match" in r]
     missing_market = len(t_list) - len(valid_market)
     gates_ok = missing_market == 0 and all(r["gate_match"] for r in valid_market)
-    gate_note = (
-        "all ok" if gates_ok else (f"{missing_market} day(s) MISSING" if missing_market else "DIVERGED")
-    )
-    verdict = (
-        "PASS — selection sets identical and market-state gates agree"
-        if total_mismatch == 0 and total_matched == total_live == total_dump and gates_ok
-        else f"ATTENTION — {total_mismatch} set mismatches (see attributions), market-state={gate_note}"
+    gate_note = "all ok" if gates_ok else (f"{missing_market} day(s) MISSING" if missing_market else "DIVERGED")
+    verdict = build_verdict(
+        total_live=total_live,
+        total_dump=total_dump,
+        total_matched=total_matched,
+        total_set_mismatches=total_mismatch,
+        total_value_diffs=len(all_value_diffs),
+        gates_ok=gates_ok,
+        gate_note=gate_note,
     )
     summary = {
         "dates": [str(t.date()) for t in t_list],
@@ -294,8 +321,9 @@ def main() -> None:
         "total_dump": total_dump,
         "total_matched": total_matched,
         "total_mismatch": total_mismatch,
-        "all_attributions": [a for d in days for a in d["attributions"]],
-        "all_value_diffs": [v for d in days for v in d["value_diffs"]],
+        "total_value_diffs": len(all_value_diffs),
+        "all_attributions": all_attributions,
+        "all_value_diffs": all_value_diffs,
         "market_state": market_rows,
         "verdict": verdict,
     }

@@ -15,6 +15,11 @@
 - 三个方案全部未通过硬条款 P2（增量显著）与 P3（反彩票）；
 - walk-forward、多重检验修正、架构新鲜段和随机挤占对照均不支持上线。
 
+进一步的固定 S2b 匹配对照改变了一个表述边界：**不能再把结论概括成“S2b 历史上完全没有
+选股相对优势”**。S2b 在历史匹配对照中存在正超额，且 10 槽容量没有将其破坏；但 2026
+可执行子集尚未通过 HAC 与 bootstrap 双门槛。因此当前准确表述是：
+**存在历史相对优势假说，但尚无独立前向确认，也没有可部署 alpha。**
+
 本轮新增日期尚未覆盖最长 60 个交易日的完整退出周期，不构成新的完整独立 OOS。
 主结论仍应以架构新鲜段、冻结至 2026-07-27 的留出段、walk-forward 和随机对照为准。
 
@@ -135,21 +140,62 @@ DSR 门槛。
 - 末根 regime 一致 243/243；
 - 最近 10 根 onset 集合一致 243/243。
 
-`surge_delay5_mirror_check.py` 当前存在一个待修的比较器口径问题：dump 侧仍使用旧门控
+本轮发现并修正了 `surge_delay5_mirror_check.py` 的比较器口径问题：dump 侧此前仍使用旧门控
 `sig_vol_ratio >= 0.8 && sig_above_zg == 1`，而当前 Rust/live 默认门控已经是
-`sig_vol_ratio <= 0.8` 且不使用 `above_zg`。
+`sig_vol_ratio <= 0.8` 且不使用 `above_zg`。修复后增加了回归测试，锁定量比方向、阈值边界、
+`above_zg` 退役语义以及“匹配字段有差异时不得 PASS”。
 
-因此原脚本报告的 `live=18 / dump=173 / matched=0` 是旧门控造成的假警报。保持其余条件不变，
-按当前 Rust 门控重算 dump 后得到：
+原脚本报告的 `live=18 / dump=173 / matched=0` 是旧门控造成的假警报。修复后重新对 5,750 只股票、
+最近 10 个交易日做完整截断重放，正式结果为：
 
+- live：18；
+- dump：18；
 - matched：18/18；
 - live_only：0；
 - dump_only：0。
+- matched-value diffs：0；
+- market-state gate mismatches：0；
+- 判定：`PASS — selection sets, matched values and market-state gates agree`。
 
 这个问题不影响 S8 主审计：`_s2c_core.py` 的 S2b/S2c 门控使用当前的 `<=` 方向。
-后续应先修正镜像脚本，再把其生成报告作为正式工程证据。
+修复后的镜像验证现已可作为正式工程证据；每次数据或 FSM/门控改变后都应重新执行。
 
-## 六、另一台设备的复现顺序
+## 六、S2b 匹配对照与执行缺口审计
+
+为解释“S2b 候选层滚动超额较强，但 2026 组合绝对收益很差”的矛盾，本轮新增冻结审计
+`scripts/s2b_matched_control_audit.py`：
+
+- 固定门控 `sig_vol_ratio <= 0.8 && sig_ma_spread_pct >= 12`，不搜索新参数；
+- 每笔 S2b 匹配同决策日、同成交额十分位的确定性 K=50 对照；
+- 对照使用相同入场日与退出日，毛收益对毛收益；
+- 先按决策日聚类，再做 HAC 与 10 日平稳分块 bootstrap；
+- `max_hold` 且持有不足 59 日的 4 笔尾部交易按右删失排除。
+
+rolling stability 的描述性结果先确认了研究动机：冻结 sp=12 在 51 个重叠 12 月窗口中，
+5 日超额 50/51 为正、均值 +1.2306%；20 日超额 39/51 为正、均值 +1.5918%。这些窗口高度
+重叠且阈值经过历史搜索，不能单独用于确认。
+
+匹配对照主结果：
+
+| 窗口/集合 | 交易数 | 匹配超额均值 | 中位数 | 日聚类 HAC t | bootstrap 95% CI |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 架构新鲜段 2021-07→2023-12 | 457 | +2.229% | +2.047% | 2.232 | [+0.041%, +3.690%] |
+| 2024+ · 10 槽实际执行 | 329 | +3.801% | +2.836% | 3.650 | [+1.387%, +6.207%] |
+| 2024+ · 因容量未执行 | 479 | +3.292% | +1.557% | 2.176 | [+0.418%, +4.290%] |
+| 2026→07-27 · 全部成熟候选 | 218 | +1.600% | +1.667% | 1.279 | [-1.819%, +5.679%] |
+| 2026→07-27 · 10 槽实际执行 | 98 | +1.488% | +1.939% | **1.133** | **[-1.751%, +6.251%]** |
+
+由此得到三点：
+
+1. 历史样本中，S2b 的同日同流动性相对优势并未被 10 槽容量破坏；执行集甚至略强于未执行集。
+2. 2026 绝对毛收益均值仍为 -1.886%；相对对照虽为正，但统计区间宽且跨零，不能确认。
+3. 2024+ 已参与过门控选择，架构新鲜段也不是新生成的前向数据；历史显著性不能替代冻结后的 OOS。
+
+当前审计状态为 `HISTORICAL_EDGE_BUT_FORWARD_CONFIRMATION_PENDING`，
+`live_authorized=false`。此外，对照只控制日期与成交额十分位，尚未控制行业和精确市值；这应作为
+下一轮稳健性检验，而不是据此上线。
+
+## 七、另一台设备的复现顺序
 
 ```bash
 git fetch mine feat/surge-wave-strategy
@@ -167,15 +213,19 @@ uv run --no-sync python scripts/surge_candidates_dump.py
 uv run --no-sync python scripts/s8_incremental_validation.py
 uv run --no-sync python scripts/surge_market_state_filter.py
 uv run --no-sync python scripts/check_tail_consistency.py 160 300
+uv run --no-sync python scripts/surge_delay5_mirror_check.py --days 10
+uv run --no-sync python scripts/sp_rolling_stability.py
+uv run --no-sync python scripts/s2b_matched_control_audit.py
 ```
 
 如果另一台设备执行时已经晚于 2026-08-10，应把 `--end-date` 改为当日，并记录新的
 safe end、inventory SHA256 与审计 SHA256；新结果应另建日期报告，不能覆盖本文身份。
 
-## 七、下一步研究边界
+## 八、下一步研究边界
 
 1. **冻结当前参数**，不要用 2026-08 新增尾部重新调 S2b/S2c 门控。
 2. 等最新信号覆盖完整 60 个交易日退出周期后，再形成真正的新前向 OOS。
-3. 修正 Delay5 镜像比较器的旧门控，并重新要求选择集合、字段和市场状态同时通过。
-4. 新方案必须相对 A/E 做配对增量检验；漂亮的绝对净值不能替代增量证据。
-5. 在 P2、P3、P5 和 P6 同时通过前，保持 `live_authorized=false`。
+3. 每次数据或 FSM/门控改变后重跑 Delay5 镜像，并要求选择集合、字段和市场状态同时通过。
+4. 对 S2b 的历史匹配优势补做行业与精确市值匹配；不得用新的匹配结果反向调 S2b 参数。
+5. 新方案必须相对 A/E 做配对增量检验；漂亮的绝对净值不能替代增量证据。
+6. 在新前向样本通过显著性、反彩票、多重检验与工程镜像前，保持 `live_authorized=false`。
