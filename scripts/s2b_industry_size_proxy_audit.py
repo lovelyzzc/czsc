@@ -262,14 +262,26 @@ def _match_trade(
     entry_dt = pd.Timestamp(trade.entry_dt)
     exit_dt = pd.Timestamp(trade.exit_dt)
     if dec_dt not in sampler.dates or entry_dt not in sampler.dates or exit_dt not in sampler.dates:
-        return {"excess_pct": np.nan, "pool_n": 0, "used_n": 0, "max_size_ratio": np.nan}
+        return {
+            "excess_pct": np.nan,
+            "pool_n": 0,
+            "used_n": 0,
+            "max_size_ratio": np.nan,
+            "control_symbols": [],
+        }
 
     sizes = sampler.close_w.loc[dec_dt].mul(shares, fill_value=np.nan)
     eligible = sizes.index
     if industries is not None:
         treated_industry = industries.get(trade.symbol)
         if treated_industry is None or pd.isna(treated_industry) or not str(treated_industry):
-            return {"excess_pct": np.nan, "pool_n": 0, "used_n": 0, "max_size_ratio": np.nan}
+            return {
+                "excess_pct": np.nan,
+                "pool_n": 0,
+                "used_n": 0,
+                "max_size_ratio": np.nan,
+                "control_symbols": [],
+            }
         eligible = industries.index[industries.eq(treated_industry)]
 
     valid_prices = sampler.open_w.loc[entry_dt].notna() & sampler.close_w.loc[exit_dt].notna()
@@ -288,14 +300,26 @@ def _match_trade(
     )
     pool_n = int(len(pool_sizes))
     if len(symbols) < MIN_VALID:
-        return {"excess_pct": np.nan, "pool_n": pool_n, "used_n": len(symbols), "max_size_ratio": np.nan}
+        return {
+            "excess_pct": np.nan,
+            "pool_n": pool_n,
+            "used_n": len(symbols),
+            "max_size_ratio": np.nan,
+            "control_symbols": symbols,
+        }
     returns = (
         sampler.close_w.loc[exit_dt, symbols].to_numpy(float) / sampler.open_w.loc[entry_dt, symbols].to_numpy(float)
         - 1
     )
     returns = returns[np.isfinite(returns)]
     if len(returns) < MIN_VALID:
-        return {"excess_pct": np.nan, "pool_n": pool_n, "used_n": len(returns), "max_size_ratio": np.nan}
+        return {
+            "excess_pct": np.nan,
+            "pool_n": pool_n,
+            "used_n": len(returns),
+            "max_size_ratio": np.nan,
+            "control_symbols": symbols,
+        }
     treated_size = float(sizes[trade.symbol])
     ratios = sizes.loc[symbols].to_numpy(float) / treated_size
     max_ratio = float(np.maximum(ratios, 1 / ratios).max())
@@ -304,6 +328,7 @@ def _match_trade(
         "pool_n": pool_n,
         "used_n": int(len(returns)),
         "max_size_ratio": max_ratio,
+        "control_symbols": symbols,
     }
 
 
