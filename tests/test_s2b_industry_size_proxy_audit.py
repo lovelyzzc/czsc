@@ -24,6 +24,30 @@ def test_symbol_converters_cover_three_exchanges() -> None:
     assert np.isnan(audit._quote_float("--"))
 
 
+def test_canonical_industry_sha_is_independent_of_row_and_column_order() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "B.SZ",
+                "code": "sz.B",
+                "updateDate": "2025-01-01",
+                "industry": "B",
+                "industryClassification": "证监会行业分类",
+            },
+            {
+                "symbol": "A.SH",
+                "code": "sh.A",
+                "updateDate": "2025-01-01",
+                "industry": "A",
+                "industryClassification": "证监会行业分类",
+            },
+        ]
+    )
+    reordered = frame.iloc[::-1][list(reversed(frame.columns))]
+    assert audit.canonical_industry_sha256(frame) == audit.canonical_industry_sha256(reordered)
+    assert audit.INDUSTRY_SOURCE_COLUMNS == ("code", "updateDate", "industryClassification", "industry")
+
+
 def test_nearest_control_symbols_is_deterministic_and_excludes_treated() -> None:
     sizes = pd.Series({"T": 100.0, "B": 105.0, "A": 95.0, "C": 160.0, "D": 50.0})
 

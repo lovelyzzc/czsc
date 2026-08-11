@@ -1,0 +1,276 @@
+{
+  "schema": "s2b_full_exact_match_plan_manifest_v1",
+  "canonicalization": "top-level JSON array; positional records; dates YYYY-MM-DD; lexicographic sort; json.dumps ensure_ascii=False separators=(',', ':') allow_nan=False; UTF-8; no trailing newline",
+  "cohort": {
+    "year_counts": {
+      "2024": 96,
+      "2025": 135,
+      "2026": 98
+    },
+    "capacity_entry_keys": {
+      "count": 329,
+      "bytes": 8884,
+      "sha256": "78f24cccbc71a47618163c689dc9d1223a9fa3f57b3729ad5eb57dc795ac6142",
+      "first3": [
+        [
+          "000056.SZ",
+          "2026-07-08"
+        ],
+        [
+          "000559.SZ",
+          "2025-10-14"
+        ],
+        [
+          "000564.SZ",
+          "2024-12-19"
+        ]
+      ],
+      "last3": [
+        [
+          "605376.SH",
+          "2025-12-25"
+        ],
+        [
+          "605376.SH",
+          "2025-12-31"
+        ],
+        [
+          "605389.SH",
+          "2025-10-17"
+        ]
+      ]
+    },
+    "full_trade_records": {
+      "count": 329,
+      "bytes": 17438,
+      "sha256": "30c057c04d6c34418700ea0ce67267e4f9ee69b541f6fe75dffe74a1e65fc9b3",
+      "first3": [
+        [
+          "000056.SZ",
+          "2026-07-07",
+          "2026-07-08",
+          "2026-07-10"
+        ],
+        [
+          "000559.SZ",
+          "2025-10-13",
+          "2025-10-14",
+          "2025-11-10"
+        ],
+        [
+          "000564.SZ",
+          "2024-12-18",
+          "2024-12-19",
+          "2024-12-23"
+        ]
+      ],
+      "last3": [
+        [
+          "605376.SH",
+          "2025-12-24",
+          "2025-12-25",
+          "2025-12-29"
+        ],
+        [
+          "605376.SH",
+          "2025-12-30",
+          "2025-12-31",
+          "2026-01-21"
+        ],
+        [
+          "605389.SH",
+          "2025-10-16",
+          "2025-10-17",
+          "2025-12-02"
+        ]
+      ]
+    },
+    "decision_dates": {
+      "count": 219,
+      "bytes": 2848,
+      "sha256": "1a19000783e686f83a37846c26f06da88bd127c24c637e68b06fed8b4ecfabf4",
+      "first3": [
+        "2024-01-08",
+        "2024-02-22",
+        "2024-02-23"
+      ],
+      "last3": [
+        "2026-07-07",
+        "2026-07-08",
+        "2026-07-14"
+      ]
+    }
+  },
+  "request_universes": {
+    "legacy_future_valid": {
+      "count": 60028,
+      "bytes": 1620757,
+      "sha256": "8a8643abb3fbfe4e459e3fece879d4dc4f01585b48bfff42d49fe16ac569674e",
+      "first3": [
+        [
+          "000002.SZ",
+          "2024-05-21"
+        ],
+        [
+          "000002.SZ",
+          "2024-11-15"
+        ],
+        [
+          "000002.SZ",
+          "2025-11-06"
+        ]
+      ],
+      "last3": [
+        [
+          "689009.SH",
+          "2026-06-25"
+        ],
+        [
+          "689009.SH",
+          "2026-07-03"
+        ],
+        [
+          "689009.SH",
+          "2026-07-07"
+        ]
+      ]
+    },
+    "decision_date_only": {
+      "count": 60102,
+      "bytes": 1622755,
+      "sha256": "a1f01f61efc127e3878eac2c686ed67f929a2a8e8bc9735060819ddf2fd30296",
+      "first3": [
+        [
+          "000002.SZ",
+          "2024-05-21"
+        ],
+        [
+          "000002.SZ",
+          "2024-11-15"
+        ],
+        [
+          "000002.SZ",
+          "2025-11-06"
+        ]
+      ],
+      "last3": [
+        [
+          "689009.SH",
+          "2026-06-25"
+        ],
+        [
+          "689009.SH",
+          "2026-07-03"
+        ],
+        [
+          "689009.SH",
+          "2026-07-07"
+        ]
+      ]
+    },
+    "annual_industry_full": {
+      "count": 60900,
+      "bytes": 1644301,
+      "sha256": "b7255e7ab2a53c132b856b91793f7d1a93184dc6ffcd5c8c5e1df1a2f8983253",
+      "first3": [
+        [
+          "000002.SZ",
+          "2024-05-21"
+        ],
+        [
+          "000002.SZ",
+          "2024-11-15"
+        ],
+        [
+          "000002.SZ",
+          "2025-11-06"
+        ]
+      ],
+      "last3": [
+        [
+          "689009.SH",
+          "2026-06-25"
+        ],
+        [
+          "689009.SH",
+          "2026-07-03"
+        ],
+        [
+          "689009.SH",
+          "2026-07-07"
+        ]
+      ]
+    }
+  },
+  "industry_snapshots": {
+    "2024": {
+      "requested_anchor": "2024-01-02",
+      "effective_dates": [
+        "2024-01-01"
+      ],
+      "rows": 5298,
+      "canonical_content_sha256": "4b4d33bd78215aa808a2c21128a9266e8247157049fd3877f5975f555920e231"
+    },
+    "2025": {
+      "requested_anchor": "2025-01-02",
+      "effective_dates": [
+        "2024-12-30"
+      ],
+      "rows": 5375,
+      "canonical_content_sha256": "db11f8c6ac3789bbcd19d108296ff8c520754af4648bee19ac55190e49b1d1fa"
+    },
+    "2026": {
+      "requested_anchor": "2026-01-05",
+      "effective_dates": [
+        "2026-01-05"
+      ],
+      "rows": 5182,
+      "canonical_content_sha256": "a829f1aa817514f9b09a07800dc5b85d4eb6717d3f6f09f4e64f2ee30d8b2f58"
+    }
+  },
+  "local_ignored_artifacts": {
+    "baostock_exact_mcap": {
+      "available": true,
+      "sha256": "6b6363162a930ce22c3a77d37e1c1a086e2567019f5b123afd815cea8b2d560e",
+      "rows": 4315,
+      "valid_exact_mcap": 4315,
+      "symbols": 2556,
+      "decision_dates": 197
+    },
+    "tushare_baostock_sanity": {
+      "available": true,
+      "scope": "two 2026 dates only; supplier-unit sanity check, not full-period equivalence evidence",
+      "objects": {
+        "2026-06-26": {
+          "sha256": "5121f47e3ebc2a810e75595de68a4d69234093bb6b6d5dda78c04c6bb47be106",
+          "rows": 5591
+        },
+        "2026-07-03": {
+          "sha256": "0f715365b4b4d36d3e5a8803ca4acfb084bc1fbd1b4fcf99536022c817888859",
+          "rows": 5594
+        }
+      },
+      "unit_conversion": "Tushare circ_mv (10k CNY) * 10,000 = CNY",
+      "overlap_pairs": 42,
+      "ratio_median": 0.999998477,
+      "absolute_difference_pct_median": 0.000527,
+      "absolute_difference_pct_p95": 0.005479,
+      "absolute_difference_pct_max": 1.782662,
+      "pairs_above_5pct": 0,
+      "max_difference_pair": {
+        "symbol": "002981.SZ",
+        "dec_dt": "2026-07-03"
+      }
+    },
+    "git_portable": false
+  },
+  "fetch_plan": {
+    "recommended_source": "Tushare daily_basic by decision date; use circ_mv without per-symbol source mixing",
+    "git_only_required_calls": 219,
+    "calls_if_two_named_ignored_objects_are_copied": 217,
+    "approximate_rows_git_only": 1200000,
+    "full_exact_matching_implemented": false,
+    "preferred_request_universe": "decision_date_only",
+    "legacy_future_valid_warning": "60,028 pairs condition on entry/treated-exit price availability; use the 60,102 decision-date-only universe for the next design and handle later missing outcomes explicitly"
+  }
+}

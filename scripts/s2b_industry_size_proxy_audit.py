@@ -56,6 +56,8 @@ TENCENT_BATCH_SIZE = 50
 MATCH_K = 10
 MIN_VALID = 5
 CALIPER_RATIO = 1.5
+INDUSTRY_SOURCE_COLUMNS = ("code", "updateDate", "industryClassification", "industry")
+INDUSTRY_CONTENT_COLUMNS = ("symbol", "code", "updateDate", "industry", "industryClassification")
 
 
 def sha256_file(path: Path) -> str:
@@ -66,6 +68,22 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_industry_sha256(frame: pd.DataFrame) -> str:
+    """计算不受 Parquet writer 或列顺序影响的行业快照内容 SHA256。"""
+
+    if missing := set(INDUSTRY_CONTENT_COLUMNS) - set(frame):
+        raise ValueError(f"industry frame missing canonical columns: {sorted(missing)}")
+    canonical = frame.loc[:, INDUSTRY_CONTENT_COLUMNS].fillna("").astype(str)
+    canonical = canonical.sort_values(list(INDUSTRY_CONTENT_COLUMNS), kind="mergesort")
+    payload = json.dumps(
+        canonical.to_numpy().tolist(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def tencent_quote_code(symbol: str) -> str:
@@ -202,10 +220,10 @@ def fetch_industry_snapshots(*, refresh: bool = False) -> dict[int, pd.DataFrame
                 if result.error_code != "0":
                     raise RuntimeError(f"BaoStock industry[{anchor}] failed: {result.error_msg}")
                 frame = pd.DataFrame(rows, columns=result.fields)
-                required = {"updateDate", "code", "industry", "industryClassification"}
+                required = set(INDUSTRY_SOURCE_COLUMNS)
                 if missing := required - set(frame):
                     raise RuntimeError(f"industry[{anchor}] missing fields: {sorted(missing)}")
-                frame = frame[list(required)].copy()
+                frame = frame.loc[:, INDUSTRY_SOURCE_COLUMNS].copy()
                 frame["symbol"] = frame["code"].map(baostock_symbol)
                 frame = frame[frame["industry"].astype(str).str.len().gt(0)].copy()
                 if frame.duplicated("symbol").any():
@@ -428,7 +446,8 @@ def _reference_manifest(capital: pd.DataFrame, industries: dict[int, pd.DataFram
                 "rows": int(len(frame)),
                 "industries": int(frame["industry"].nunique()),
                 "path": str(_industry_path(year)),
-                "sha256": sha256_file(_industry_path(year)),
+                "file_sha256": sha256_file(_industry_path(year)),
+                "canonical_content_sha256": canonical_industry_sha256(frame),
             }
             for year, frame in industries.items()
         },

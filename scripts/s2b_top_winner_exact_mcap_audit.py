@@ -76,10 +76,10 @@ def _load_year_matches(year: int, *, top_n: int | None = None) -> tuple[pd.DataF
         s2b[column] = pd.to_datetime(s2b[column])
     s2b = s2b[~base.censored_tail_mask(s2b)].copy()
     execution_keys = base._main_execution_keys(context)
-    s2b["executed_main"] = [
+    s2b["capacity_selected"] = [
         (symbol, entry_dt) in execution_keys for symbol, entry_dt in zip(s2b["symbol"], s2b["entry_dt"], strict=False)
     ]
-    s2b = s2b[s2b["executed_main"] & s2b["dec_dt"].dt.year.eq(year)].copy()
+    s2b = s2b[s2b["capacity_selected"] & s2b["dec_dt"].dt.year.eq(year)].copy()
 
     sampler = StableControlSampler()
     shares = capital.set_index("symbol")["current_float_shares"].reindex(sampler.close_w.columns)
@@ -103,6 +103,15 @@ def _load_year_matches(year: int, *, top_n: int | None = None) -> tuple[pd.DataF
                 "exit_dt": pd.Timestamp(trade.exit_dt),
                 "industry": industry_map.get(trade.symbol),
                 "ret_gross_pct": float(trade.ret_gross_pct),
+                "hold_days": int(trade.hold_days),
+                "exit_reason": str(trade.exit_reason),
+                "dec_regime": int(trade.dec_regime),
+                "score": float(trade.score),
+                "amount_e": float(trade.amount_e),
+                "sl_pct": float(trade.sl_pct),
+                "sig_vol_ratio": float(trade.sig_vol_ratio),
+                "sig_ma_spread_pct": float(trade.sig_ma_spread_pct),
+                "sig_ret20": float(trade.sig_ret20),
                 "proxy_excess_pct": float(match["excess_pct"]),
                 "control_symbols": list(match["control_symbols"]),
                 "eligible_symbols": industry_map.index[
@@ -114,12 +123,16 @@ def _load_year_matches(year: int, *, top_n: int | None = None) -> tuple[pd.DataF
                 .tolist(),
             }
         )
+    capacity_simulated_trades = int(len(s2b))
     frame = pd.DataFrame(rows).sort_values(["proxy_excess_pct", "symbol"], ascending=[False, True])
     if top_n is not None:
         if len(frame) < top_n:
-            raise RuntimeError(f"only {len(frame)} valid {year} executed matches; need {top_n}")
+            raise RuntimeError(f"only {len(frame)} valid {year} capacity matches; need {top_n}")
         frame = frame.head(top_n)
-    return frame.reset_index(drop=True), sampler
+    frame = frame.reset_index(drop=True)
+    frame.attrs["capacity_simulated_trades"] = capacity_simulated_trades
+    frame.attrs["proxy_supported_trades"] = int(len(rows))
+    return frame, sampler
 
 
 def _fetch_one(result: Any, *, symbol: str, dec_dt: pd.Timestamp) -> dict[str, Any]:
