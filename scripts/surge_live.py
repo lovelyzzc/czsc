@@ -119,7 +119,7 @@ def detect_delay5(states: list[tr.StateSnapshot]) -> dict | None:
         "sl_pct": sl_pct,
         "score": score,
         # 镜像口径：研究端 delayed 入场的 priority 也用 freshness=0
-        "priority": tr.priority_score(score, sl_pct, 0, dec.regime),
+        "priority": tr.priority_score(score, sl_pct if sl_pct is not None else np.nan, 0, dec.regime),
         "vol_ratio": feats.get("vol_ratio"),
         "ma_spread_pct": feats.get("ma_spread_pct"),
         "ret20": feats.get("ret20"),

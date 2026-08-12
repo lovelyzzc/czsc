@@ -54,10 +54,15 @@ TAIL = 160
 MIN_AMOUNT_E = float(os.getenv("SURGE_PICKER_MIN_AMOUNT_E", "1.0"))
 STOP_MIN_PCT = float(os.getenv("SURGE_PICKER_STOP_MIN_PCT", "8"))
 STOP_MAX_PCT = float(os.getenv("SURGE_PICKER_STOP_MAX_PCT", "20"))
-UPTREND_FAMILY = {Regime.UpwardDeparture, Regime.ThirdBuy, Regime.MainUptrend, Regime.Acceleration}
+UPTREND_FAMILY = {int(Regime.UpwardDeparture), int(Regime.ThirdBuy), int(Regime.MainUptrend), int(Regime.Acceleration)}
 RECOVERY_FAMILY = {int(Regime.FirstBuy), int(Regime.SecondBuy), int(Regime.PivotBuilding)}
 TP_RULE = "SL2/中枢下沿托底 + 浮盈后18%跟踪 + 背驰减仓/破坏清仓"
 REVERSION_LOOKBACK = 20
+
+
+def _regime_name(value: int) -> str:
+    """把 Rust 状态整数转换为中文名称。"""
+    return REGIME_CN[Regime.from_int(int(value))]
 
 
 def _count_down_days(regimes: list[int], up_to: int) -> int:
@@ -89,12 +94,6 @@ def _scan_one(parquet_path: str) -> dict | None:
 
     # ── Surge 检测（需在上行家族内） ──
     if last.regime in UPTREND_FAMILY:
-        exp = sl.detect_delay5(states)
-        if exp:
-            exp["代码"] = code
-            exp["成交额亿"] = amount_e
-            result["exp"] = exp
-
         found = None
         for p in range(len(states) - 1, max(0, len(states) - 1 - SCAN_WINDOW), -1):
             prior = regimes[max(0, p - tr.SURGE_PRIOR_WINDOW) : p]
@@ -107,7 +106,8 @@ def _scan_one(parquet_path: str) -> dict | None:
         if found:
             p_onset, variant = found
             freshness = (len(states) - 1) - p_onset
-            feats = last.feats or {}
+            feat_snapshot = last.feats
+            feats = feat_snapshot or {}
             close = last.close
             sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd
             sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
@@ -118,11 +118,11 @@ def _scan_one(parquet_path: str) -> dict | None:
                 "行业": "",
                 "日期": last.dt.strftime("%Y-%m-%d"),
                 "收盘价": round(close, 2),
-                "当前状态": REGIME_CN[Regime(last.regime)],
+                "当前状态": _regime_name(last.regime),
                 "启动方式": "确认追入" if variant == "confirm" else "启动埋伏",
                 "启动日": states[p_onset].dt.strftime("%Y-%m-%d"),
                 "新鲜度": freshness,
-                "score": surge_score(feats),
+                "score": surge_score(feat_snapshot),
                 "量比": feats.get("vol_ratio"),
                 "MA散度%": feats.get("ma_spread_pct"),
                 "ret20%": feats.get("ret20"),
@@ -144,7 +144,8 @@ def _scan_one(parquet_path: str) -> dict | None:
     if rev_found is not None:
         down_days = _count_down_days(regimes, rev_found)
         rev_state = states[rev_found]
-        feats = last.feats or {}
+        feat_snapshot = last.feats
+        feats = feat_snapshot or {}
         close = last.close
         sl_ref = last.sl_ref if last.sl_ref == last.sl_ref else last.zd
         sl_ref = sl_ref if (sl_ref == sl_ref and sl_ref > 0) else None
@@ -155,12 +156,12 @@ def _scan_one(parquet_path: str) -> dict | None:
             "行业": "",
             "日期": last.dt.strftime("%Y-%m-%d"),
             "收盘价": round(close, 2),
-            "当前状态": REGIME_CN[Regime(last.regime)],
+            "当前状态": _regime_name(last.regime),
             "转换日": rev_state.dt.strftime("%Y-%m-%d"),
-            "转换状态": REGIME_CN[Regime(rev_state.regime)],
+            "转换状态": _regime_name(rev_state.regime),
             "下跌天数": down_days,
             "新鲜度": (len(states) - 1) - rev_found,
-            "rev_score": reversion_score(feats, down_days),
+            "rev_score": reversion_score(feat_snapshot, down_days),
             "量比": feats.get("vol_ratio"),
             "MA散度%": feats.get("ma_spread_pct"),
             "ret20%": feats.get("ret20"),
@@ -278,9 +279,25 @@ def _report_reversion(rev_results, name_map, industry_map, metadata_available):
 
     out = OUTPUT_DIR / f"picks_reversion_{scan_date}.parquet"
     cols = [
-        "代码", "名称", "行业", "日期", "收盘价", "当前状态", "转换日", "转换状态",
-        "下跌天数", "新鲜度", "rev_score", "量比", "MA散度%", "ret20%", "成交额亿",
-        "推荐止损", "止损幅度%", "可操作", "过滤原因",
+        "代码",
+        "名称",
+        "行业",
+        "日期",
+        "收盘价",
+        "当前状态",
+        "转换日",
+        "转换状态",
+        "下跌天数",
+        "新鲜度",
+        "rev_score",
+        "量比",
+        "MA散度%",
+        "ret20%",
+        "成交额亿",
+        "推荐止损",
+        "止损幅度%",
+        "可操作",
+        "过滤原因",
     ]
     pd.DataFrame(rev_results)[cols].to_parquet(out, index=False)
     print(f"\n[文件] {out}")
@@ -332,20 +349,19 @@ def main():
     )
 
     t0 = time.time()
-    surge_results, exp_raw, rev_results = [], [], []
+    surge_results, rev_results = [], []
     ctx = mp.get_context("spawn")
     with ctx.Pool(n_workers) as pool:
         for i, res in enumerate(pool.imap_unordered(_scan_one, files, chunksize=20), 1):
             if res:
                 if res.get("main"):
                     surge_results.append(res["main"])
-                if res.get("exp"):
-                    exp_raw.append(res["exp"])
                 if res.get("reversion"):
                     rev_results.append(res["reversion"])
             if i % 1000 == 0 or i == len(files):
-                n_hits = len(surge_results) + len(rev_results)
-                print(f"  [{i}/{len(files)}] surge={len(surge_results)} rev={len(rev_results)} | {time.time() - t0:.0f}s")
+                print(
+                    f"  [{i}/{len(files)}] surge={len(surge_results)} rev={len(rev_results)} | {time.time() - t0:.0f}s"
+                )
 
     show_surge = strategy in ("s0", "all") or (strategy == "s4" and market_regime == "bull")
     show_rev = strategy == "all" or (strategy == "s4" and market_regime in ("bear", "sideways"))
@@ -367,7 +383,7 @@ def main():
         _report_reversion(rev_results, name_map, industry_map, metadata_available)
 
     if strategy in ("s0", "all"):
-        _report_experimental(exp_raw, name_map, industry_map, metadata_available)
+        print("\n[delay5] legacy 结构观察入口不运行 delay5；请使用 surge-delay5-stock-picker 专用扫描器")
 
 
 def _report_default(results, name_map, industry_map, metadata_available):
@@ -399,7 +415,7 @@ def _report_default(results, name_map, industry_map, metadata_available):
     )
     st_filter = "剔除 ST/退市风险、" if metadata_available else "ST过滤未启用（缺少名称/行业元数据）、"
     print(f"  硬过滤：{st_filter}成交额<{MIN_AMOUNT_E:g}亿、止损幅度不在{STOP_MIN_PCT:g}-{STOP_MAX_PCT:g}%")
-    print("  ⚠ 本表是结构观察池；实盘镜像验证应使用末尾 delay5 存活确认段，priority 仅作展示排序")
+    print("  ⚠ 本表是结构观察池；delay5 验证应使用专用研究扫描器，priority 仅作展示排序")
     print(f"{'=' * 150}")
     header = (
         f"{'序':>3} {'级':>2} {'代码':>11} {'名称':<8} {'行业':<7} {'收盘':>7} {'状态':<7} "
@@ -452,17 +468,17 @@ def _report_default(results, name_map, industry_map, metadata_available):
     print(f"\n[文件] {out}")
 
 
-def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
-    """实验 · 回踩买点 delay5。镜像口径固定（不吃环境变量阈值），仅记录与研究，非默认买入建议。
+def _report_experimental(exp_raw, name_map, industry_map, metadata_available, *, expected_dec_dt):
+    """实验 · delay5 存活确认。镜像口径固定（不吃环境变量阈值），仅记录与研究，非默认买入建议。
 
     口径 = state_delay5 变体（原 scripts/surge_pullback_entry_research.py，已清理）：
     anticipate 信号（信号日门控）后第 5 个交易日收盘决策、次日开盘入场；
     市场状态门 high20_ratio>0.12 & 等权指数>MA20；硬过滤 成交额≥1亿 + 止损带 8-20% + 剔除 ST。
     """
     print(f"\n{'=' * 150}")
-    print("  实验 · 回踩买点 delay5（研究中，非买入建议）— anticipate 信号后第 5 个交易日决策、次日开盘入场")
+    print("  实验 · delay5 存活确认（研究中，非买入建议）— anticipate 信号后第 5 个交易日决策、次日开盘入场")
     print(
-        "  机制注记：稳健性审计显示超额来自「5 日存活确认」而非回踩定价；超额中位数为负、肥尾驱动（详见 SURGE_REGIME_DELAY5_MIRROR_2026-06-11.md）"
+        "  最新证据：旧 amount-decile/FULL 模拟存在尾部集中；生产共同期限行业/规模控制的 5/20/60 日超额均未确认，live_authorized=false。"
     )
     print(f"{'=' * 150}")
 
@@ -471,6 +487,10 @@ def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
     panel = sl.build_live_panel()
     state = sl.live_market_state(panel)
     row = state.iloc[-1]
+    actual_dt = pd.Timestamp(row["dt"]).normalize()
+    expected_dt = pd.Timestamp(expected_dec_dt).normalize()
+    if actual_dt != expected_dt:
+        raise RuntimeError(f"market state is stale: expected {expected_dt.date()}, got {actual_dt.date()}")
     gate = sl.market_gate_open(row)
     sl.append_market_state_log(state.tail(10))
     above = "高于" if row["ew_index_above_ma20"] > 0 else "低于"
@@ -519,14 +539,14 @@ def _report_experimental(exp_raw, name_map, industry_map, metadata_available):
     for i, r in enumerate(exp_raw[:10], 1):
         print(
             f"{i:>3} {r['代码']:>11} {r['名称'][:6]:<8} {r['close']:>7.2f} "
-            f"{REGIME_CN[Regime(r['dec_regime'])]:<7} {r['priority']:>5} {r['score']:>5} "
+            f"{_regime_name(r['dec_regime']):<7} {r['priority']:>5} {r['score']:>5} "
             f"{(r['sl_ref'] or 0):>7.2f} {(r['sl_pct'] if r['sl_pct'] is not None else 0):>6.1f} "
             f"{r['成交额亿']:>6.2f} {pd.Timestamp(r['sig_dt']).strftime('%Y-%m-%d'):<11} {r['过滤原因']:<18}"
         )
     if len(exp_raw) > 10:
         print(f"  ... 另有 {len(exp_raw) - 10} 只结构候选未显示")
     if not gate:
-        print("  ⚠ 市场状态门关闭：以上仅作记录，按策略口径今日不开新仓（2026 环境常态，属系统按设计工作）")
+        print("  ⚠ 市场状态门关闭：以上仅作记录；本研究入口始终 live_authorized=false，不产生开仓授权")
 
     dec_date = pd.Timestamp(exp_raw[0]["dec_dt"]).strftime("%Y-%m-%d")
     out = OUTPUT_DIR / f"picks_exp_delay5_{dec_date}.parquet"
