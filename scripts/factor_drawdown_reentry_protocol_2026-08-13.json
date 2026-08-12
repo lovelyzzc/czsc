@@ -1,0 +1,102 @@
+{
+  "schema": "factor_drawdown_reentry_protocol_v1",
+  "study_id": "factor_drawdown_reentry_20260813",
+  "frozen_at_local": "2026-08-13T00:20:00+08:00",
+  "classification": "RETROSPECTIVE_POST_DEVELOPMENT_HYPOTHESIS_WITH_LOCKED_TEMPORAL_VALIDATION",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "genesis": {
+    "source": "factor_tsmom_overlay_20260812 development-only failure",
+    "audit": {
+      "path": "scripts/_output/factor_tsmom_overlay/audit.json",
+      "sha256": "71813a33689f5a7b202c21cc799d6d6cf4a27eafe81912d859f990bede479706"
+    },
+    "observed_development_fact": "risk-on-when-positive transformed F annualized return from +9.15% to -7.29%, suggesting factor-level mean reversion rather than continuation",
+    "development_is_confirmatory": false
+  },
+  "claim_boundary": [
+    "the direction was selected after the 2022-2023 positive-trend overlay failed",
+    "development results are descriptive and forbidden as confirmation",
+    "the exact inverse rule's 2024plus path was not opened before this freeze but remains retrospective temporal validation",
+    "a pass creates a prospective forward-test candidate only",
+    "a failure closes this exact inverse rule without lookback, threshold, hysteresis, or leverage rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "the unchanged F book has medium-horizon mean reversion, so exposure after a non-positive 20-decision realized return can improve the path",
+    "single_variant_only": true
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a"
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8"
+    },
+    "historical_stage2_f_path": {
+      "path": "scripts/_output/xs_chan_exploration_stage2/STAGE2_9b50c30fa68af7fbc45e7da2a539224cabb2c52c43684ffe6262165f3c1123b3/path_weekly.parquet",
+      "sha256": "e21ce630aea3186284ed0b7569a2854e756d2a7d93bb1bf4a05e7cdaec649662"
+    }
+  },
+  "factor_baseline": {
+    "target_slots": 50,
+    "retention_max_rank": 75,
+    "membership": "unchanged frozen F path",
+    "initial_cash_buffer": 0.005,
+    "self_financing": true
+  },
+  "overlay": {
+    "lookback_decisions": 20,
+    "signal_at_decision_close": "F_BASELINE close NAV divided by its close NAV 20 decision dates earlier minus one",
+    "risk_on": "less than or equal to zero",
+    "risk_off": "strictly greater than zero",
+    "warmup": "cash through the first 20 decision dates",
+    "risk_on_target": "exact contemporaneous F membership",
+    "risk_off_target": "cash",
+    "fill": "strict next common market-session open",
+    "no_hysteresis": true,
+    "no_leverage": true
+  },
+  "execution": {
+    "prices": "qfq open fills and qfq close daily marks",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006],
+    "terminal_liquidation": "2026-05-18 common endpoint open",
+    "cash_return": 0.0
+  },
+  "sample": {
+    "development_descriptive": ["2022-06-10", "2023-12-29"],
+    "locked_validation": ["2024-01-01", "2026-05-18"],
+    "locked_validation_subperiods": [["2024", "2024-01-01", "2024-12-31"], ["2025_PLUS", "2025-01-01", "2026-05-18"]],
+    "annualization_sessions": 242,
+    "weekly_hac_lag": 4
+  },
+  "statistics": {
+    "primary_comparison": "F_DRAWDOWN_REENTRY minus F_BASELINE at 40bps",
+    "minimum_risk_on_decision_rate": 0.15,
+    "maximum_risk_on_decision_rate": 0.75,
+    "minimum_relative_drawdown_reduction": 0.15,
+    "minimum_sharpe_improvement": 0.15,
+    "maximum_annual_return_underperformance": 0.01,
+    "weekly_noninferiority_margin": 0.0001923076923076923,
+    "one_sided_alpha": 0.05
+  },
+  "decision_rules": {
+    "development": "reported descriptively only because the sign was selected from development",
+    "locked_validation_pass": "risk-on rate in [15%,75%]; candidate annualized return>0; max-drawdown magnitude reduced>=15%; Sharpe improves>=0.15; annualized return no more than 1pp below F; weekly paired-return noninferiority one-sided HAC p<0.05; both subperiod candidate total returns>0 and paired total returns>=-2pp",
+    "cost_stress_pass": "at 60bp locked-validation candidate annualized return>0 and max drawdown is lower than F",
+    "candidate_status": "RETROSPECTIVE_DRAWDOWN_REENTRY_CANDIDATE_FORWARD_TEST_REQUIRED only if locked validation and cost stress pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_LOCKED_VALIDATION; no alternate lookback, threshold, hysteresis, or leverage rescue"
+  },
+  "outputs": {
+    "directory": "scripts/_output/factor_drawdown_reentry",
+    "target_memberships": "target_memberships.parquet",
+    "signals": "signals.parquet",
+    "paths": "paths.parquet",
+    "audit": "audit.json",
+    "report": "FACTOR_DRAWDOWN_REENTRY_2026-08-13.md"
+  }
+}

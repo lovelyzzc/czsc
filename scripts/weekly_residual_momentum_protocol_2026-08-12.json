@@ -1,0 +1,103 @@
+{
+  "schema": "weekly_residual_momentum_protocol_v1",
+  "study_id": "weekly_residual_momentum_20260812",
+  "frozen_at_local": "2026-08-12T23:30:00+08:00",
+  "classification": "RETROSPECTIVE_POST_DEVELOPMENT_HYPOTHESIS_WITH_LOCKED_TEMPORAL_VALIDATION",
+  "genesis": {
+    "source": "weekly_residual_reversal_20260812 development-only failure",
+    "observed_development_fact": "the pre-registered loser portfolio had active_mean=-0.0056802513 and HAC_t=-3.137 at 40bps",
+    "consequence": "the momentum sign is post-development hypothesis generation; its development p-value cannot be used as confirmation"
+  },
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "the direction was generated after observing the 2022-2023 reversal failure",
+    "development statistics are descriptive and forbidden as confirmation",
+    "the 2024plus segment was not opened for this direction before protocol freeze but remains retrospective, not independent OOS",
+    "a pass creates a candidate for a separate self-financing daily path and prospective forward test only",
+    "a failure closes this exact momentum definition without lookback, neutralization, target-size, buffer, or holding-period rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "industry- and size-neutralized one-week winners continue over the next week after realistic membership turnover costs",
+    "single_variant_only": true
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a",
+      "rows": 676812,
+      "decision_dates": 220,
+      "last_complete_primary_decision": "2026-05-08"
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128,
+      "max_date": "2026-06-11"
+    },
+    "genesis_audit": {
+      "path": "scripts/_output/weekly_residual_reversal/audit.json",
+      "sha256": "3a192ec04ccf24178d8f225a0da9df9ad3929d7c572e94086b78c47750ea8935"
+    }
+  },
+  "signal": {
+    "decision_time": "frozen weekly decision-session close",
+    "raw_return": "decision close divided by the fifth prior observed stock close minus one",
+    "winsorization": "within decision date at 1st and 99th percentiles for raw return and log free-float market cap",
+    "neutralization": "weekly OLS raw_return ~ intercept + zscore(log_free_float_mcap) + SW2021_L1 industry dummies with deterministic sorted columns",
+    "score": "positive OLS residual so the most idiosyncratically strong winner ranks first",
+    "minimum_complete_weekly_universe": 1000,
+    "tie_break": ["residual_return_descending", "symbol_ascending"]
+  },
+  "portfolio": {
+    "target_slots": 50,
+    "retention_max_rank": 75,
+    "recursive_membership": "retain previous names if current momentum rank<=75, then fill by momentum rank and symbol",
+    "cash_buffer": 0.005,
+    "entry": "strict next common market-session open",
+    "outcome": "fifth common market-session open return from entry",
+    "missing_or_untradable_selected_slot": "zero return cash proxy and separately report completeness",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "terminal_liquidation": true,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006]
+  },
+  "benchmark": {
+    "definition": "same-week equal-weight mean fwd_5d_open_return of every finite entry-tradable eligible stock",
+    "cash_scaling": 0.995,
+    "transaction_cost": 0.0
+  },
+  "sample": {
+    "development": ["2022-01-14", "2023-12-29"],
+    "development_halves": [["2022-01-14", "2022-12-30"], ["2023-01-01", "2023-12-29"]],
+    "validation": ["2024-01-01", "2026-05-08"],
+    "validation_halves": [["2024-01-01", "2024-12-31"], ["2025-01-01", "2026-05-08"]]
+  },
+  "statistics": {
+    "estimand": "weekly candidate net return minus theoretical all-eligible gross benchmark return",
+    "newey_west_lag_weeks": 4,
+    "one_sided_alpha": 0.05,
+    "circular_block_weeks": 4,
+    "bootstrap_draws": 20000,
+    "bootstrap_seed": 20260814,
+    "minimum_active_weekly_effect": 0.0025,
+    "minimum_observable_target_slot_rate": 0.98,
+    "maximum_compounded_drawdown": 0.35
+  },
+  "decision_rules": {
+    "development_descriptive_gate": "same numerical rules are reported only as a sanity check; because the sign was selected from development, this gate has no confirmatory weight",
+    "validation_pass": "mean active net return>=0.25% weekly; one-sided HAC p<0.05; block-bootstrap q05>0; both locked validation-half active means>0; candidate net mean>0; observable target slot rate>=98%; compounded candidate max drawdown<=35%",
+    "cost_stress_pass": "at 60bp roundtrip the validation active mean and block-bootstrap q05 remain positive",
+    "candidate_status": "RETROSPECTIVE_MOMENTUM_CANDIDATE_DAILY_PATH_AND_FORWARD_TEST_REQUIRED only if locked validation and 60bp stress pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_LOCKED_VALIDATION; no alternate lookbacks, neutralizers, target sizes, buffers, or holding horizons in this study"
+  },
+  "outputs": {
+    "directory": "scripts/_output/weekly_residual_momentum",
+    "blind_ranked_signal": "blind_ranked_signal.parquet",
+    "memberships": "memberships.parquet",
+    "weekly": "weekly.parquet",
+    "audit": "audit.json",
+    "report": "WEEKLY_RESIDUAL_MOMENTUM_2026-08-12.md"
+  }
+}

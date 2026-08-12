@@ -1,0 +1,103 @@
+{
+  "schema": "factor_stable_entry_protocol_v1",
+  "study_id": "factor_stable_entry_20260812",
+  "frozen_at_local": "2026-08-12T23:45:00+08:00",
+  "classification": "RETROSPECTIVE_FULL_SAMPLE_GENERATED_INTERACTION_TEST",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "the absolute-shock mechanism was generated after observing both tails over development and historical validation",
+    "no historical segment is independent OOS and all p-values are descriptive consistency diagnostics",
+    "a pass creates a prospective forward-test candidate only",
+    "a failure closes this exact entry-only interaction without cutoff, factor, target-size, buffer, or holding-period rescue"
+  ],
+  "genesis": {
+    "reversal_audit": {
+      "path": "scripts/_output/weekly_residual_reversal/audit.json",
+      "sha256": "3a192ec04ccf24178d8f225a0da9df9ad3929d7c572e94086b78c47750ea8935"
+    },
+    "momentum_audit": {
+      "path": "scripts/_output/weekly_residual_momentum/audit.json",
+      "sha256": "23c31322aa5264bcc5204c48f15f4e5b921781d10ac115d1b929bca70684628c"
+    },
+    "observed_pattern": "both the most negative and most positive industry-size-neutral weekly-return tails underperformed the all-eligible benchmark"
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a",
+      "rows": 676812,
+      "decision_dates": 220
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128
+    },
+    "historical_stage2_f_path": {
+      "path": "scripts/_output/xs_chan_exploration_stage2/STAGE2_9b50c30fa68af7fbc45e7da2a539224cabb2c52c43684ffe6262165f3c1123b3/path_weekly.parquet",
+      "sha256": "e21ce630aea3186284ed0b7569a2854e756d2a7d93bb1bf4a05e7cdaec649662"
+    }
+  },
+  "shock_measure": {
+    "raw_return": "decision close divided by the fifth prior observed stock close minus one",
+    "winsorization": "weekly 1st and 99th percentiles",
+    "neutralization": "weekly OLS on intercept, zscore log free-float market cap, and sorted SW2021_L1 industry dummies",
+    "absolute_shock": "absolute OLS residual",
+    "stable_new_entry_pool": "absolute_shock <= same-week 80th percentile",
+    "cutoff": 0.8,
+    "minimum_complete_weekly_universe": 1000
+  },
+  "arms": {
+    "F_BASELINE": "retain prior names if factor_rank<=75, then fill by factor_rank and symbol to 50",
+    "F_STABLE_ENTRY": "retain prior names if factor_rank<=75 regardless of current shock; fill only from factor-ranked candidates inside the stable new-entry pool",
+    "entry_filter_only": true,
+    "forced_shock_exit": false,
+    "both_arms_target_slots": 50
+  },
+  "execution": {
+    "entry": "strict next common market-session open",
+    "outcome": "fifth common market-session open return from entry",
+    "cash_buffer": 0.005,
+    "missing_or_untradable_slot": "zero return cash proxy with completeness reported",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "terminal_liquidation": true,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006]
+  },
+  "sample": {
+    "full": ["2022-01-14", "2026-05-08"],
+    "fixed_subperiods": [
+      ["2022", "2022-01-14", "2022-12-30"],
+      ["2023", "2023-01-01", "2023-12-29"],
+      ["2024", "2024-01-01", "2024-12-31"],
+      ["2025_PLUS", "2025-01-01", "2026-05-08"]
+    ]
+  },
+  "statistics": {
+    "primary_estimand": "weekly F_STABLE_ENTRY net return minus F_BASELINE net return at 40bps",
+    "newey_west_lag_weeks": 4,
+    "one_sided_alpha": 0.05,
+    "circular_block_weeks": 4,
+    "bootstrap_draws": 20000,
+    "bootstrap_seed": 20260815,
+    "minimum_weekly_improvement": 0.001,
+    "minimum_observable_target_slot_rate": 0.98,
+    "maximum_compounded_drawdown": 0.35
+  },
+  "decision_rules": {
+    "retrospective_candidate": "full-sample paired improvement>=0.10% weekly; one-sided HAC p<0.05; bootstrap q05>0; every fixed subperiod paired mean>0; every fixed subperiod F_STABLE_ENTRY net mean>0; observable rate>=98%; full compounded max drawdown<=35%",
+    "cost_stress": "at 60bp full paired mean and bootstrap q05 remain positive and every fixed subperiod F_STABLE_ENTRY net mean remains positive",
+    "candidate_status": "RETROSPECTIVE_STABLE_ENTRY_CANDIDATE_FORWARD_TEST_REQUIRED only if all descriptive consistency and cost-stress rules pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE; no cutoff, factor, target-size, buffer, or holding-period rescue"
+  },
+  "outputs": {
+    "directory": "scripts/_output/factor_stable_entry",
+    "blind_shock_surface": "blind_shock_surface.parquet",
+    "memberships": "memberships.parquet",
+    "weekly": "weekly.parquet",
+    "audit": "audit.json",
+    "report": "FACTOR_STABLE_ENTRY_2026-08-12.md"
+  }
+}

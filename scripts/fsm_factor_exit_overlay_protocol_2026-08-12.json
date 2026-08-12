@@ -1,0 +1,113 @@
+{
+  "schema": "fsm_factor_exit_overlay_protocol_v1",
+  "study_id": "fsm_factor_exit_overlay_20260812",
+  "frozen_at_local": "2026-08-12T22:55:00+08:00",
+  "classification": "RETROSPECTIVE_MECHANISM_TEST_WITH_TEMPORAL_VALIDATION_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "the complete historical sample has been visible to earlier CZSC research and is not independent OOS",
+    "the 2024plus segment is a locked temporal validation inside this study, not prospective confirmation",
+    "a passing result creates a forward-test candidate only",
+    "a failing result closes this exact exit overlay without state, cooldown, cost, or threshold rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "FSM deterioration states are more useful as a causal exit and risk-control overlay on the unchanged factor F path than as an entry selector",
+    "motivation_fixed_before_outcomes": [
+      "the Stage-2 FC entry gate was falsified and reduced slot utilization",
+      "the factor F path remains the unchanged identity-selection baseline",
+      "states 9 Divergence and 10 Breakdown have fixed bearish semantics and were already the production FSM exit family"
+    ],
+    "primary_comparison": "F_EXIT_9_10 minus F_BASELINE",
+    "single_variant_only": true
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a",
+      "rows": 676812,
+      "decision_dates": 220
+    },
+    "historical_stage2_f_path": {
+      "path": "scripts/_output/xs_chan_exploration_stage2/STAGE2_9b50c30fa68af7fbc45e7da2a539224cabb2c52c43684ffe6262165f3c1123b3/path_weekly.parquet",
+      "sha256": "e21ce630aea3186284ed0b7569a2854e756d2a7d93bb1bf4a05e7cdaec649662"
+    },
+    "state_cache": {
+      "path": "scripts/_output/fsm_audit/states.parquet",
+      "sha256": "1d25648ffa70618a4d241c22b4ff3bae1319512545c4b5b0dd065cad2f67ee14",
+      "rows": 6578974,
+      "max_date": "2026-06-11"
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128,
+      "max_date": "2026-06-11"
+    }
+  },
+  "factor_baseline": {
+    "decision_frequency": "frozen ranked-surface decision dates at the session close",
+    "target_slots": 50,
+    "retention_max_rank": 75,
+    "membership_rule": "retain prior target identities if present with factor_rank<=75, then fill by factor_rank and symbol to 50",
+    "membership_is_shared_between_arms": true,
+    "initial_cash_buffer": 0.005,
+    "no_weekly_equal_weight_rebalancing_of_retained_positions": true,
+    "historical_reconstruction_gate": "rebuilt F weekly slots, buys, sells, and gross proxy returns must reproduce the frozen Stage-2 F path"
+  },
+  "execution": {
+    "decision_time": "session close",
+    "weekly_membership_fill": "strict next common market-session open",
+    "overlay_signal_states": [9, 10],
+    "overlay_signal_time": "first held-session close observed in state 9 or 10",
+    "overlay_exit_fill": "next observable stock open after the signal; suspended positions remain pending",
+    "overlay_cash_rule": "after an overlay exit the slot stays cash until the first weekly decision strictly after the signal; no midweek replacement",
+    "same_decision_signal_rule": "a state exit signalled on a weekly decision close cannot be repurchased at that decision's next-open fill",
+    "weekly_buy_missing_open": "skip the buy and keep the slot cash until a later weekly decision",
+    "terminal_liquidation": "liquidate at the frozen ranked surface's final common five-session endpoint open",
+    "initial_buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006],
+    "prices": "qfq open for fills and qfq close for daily marks",
+    "permanent_cash_return": 0.0,
+    "delisting_terminal_value": "not modelled; missing terminal positions and pending exits are fail-closed completeness findings"
+  },
+  "sample": {
+    "development": ["2022-01-14", "2023-12-29"],
+    "validation": ["2024-01-01", "2026-05-18"],
+    "validation_calendar_subperiods": ["2024", "2025", "2026_YTD"],
+    "annualization_sessions": 242,
+    "weekly_hac_lag": 4
+  },
+  "statistics": {
+    "daily_metrics": ["total_return", "annualized_return", "annualized_volatility", "sharpe", "maximum_drawdown", "calmar"],
+    "active_return_series": "last-observed-Friday NAV pct_change of overlay minus baseline",
+    "noninferiority_margin_annual_return": 0.02,
+    "noninferiority_margin_weekly_mean": 0.0003846153846153846,
+    "one_sided_alpha": 0.05,
+    "minimum_development_overlay_exits": 100,
+    "minimum_validation_overlay_exits": 100,
+    "minimum_relative_drawdown_reduction": 0.10,
+    "minimum_sharpe_improvement": 0.10,
+    "maximum_calendar_year_active_underperformance": 0.05
+  },
+  "decision_rules": {
+    "development_gate": "complete path and reconstruction gates; >=100 overlay exits; max-drawdown magnitude reduced >=10%; Sharpe improves >=0.10; annualized return no more than 2pp below F; weekly active-return noninferiority one-sided HAC p<0.05",
+    "validation_opening": "validation statistics and path outputs must not be computed or persisted unless every development gate passes",
+    "validation_pass": "complete path; >=100 overlay exits; max-drawdown magnitude reduced >=10%; Sharpe improves >=0.10; annualized return no more than 2pp below F; weekly active-return noninferiority one-sided HAC p<0.05; no validation calendar subperiod underperforms F by more than 5pp",
+    "cost_stress_pass": "at 60bp roundtrip in both development and validation, annualized return is no more than 3pp below its same-cost F baseline and max-drawdown magnitude is lower",
+    "candidate_status": "RETROSPECTIVE_RISK_OVERLAY_CANDIDATE_FORWARD_TEST_REQUIRED only if development, validation, and cost-stress gates all pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE; do not rescue by testing state 9 or 10 separately, delays, cooldowns, or new thresholds"
+  },
+  "outputs": {
+    "directory": "scripts/_output/fsm_factor_exit_overlay",
+    "target_memberships": "target_memberships.parquet",
+    "development_daily_paths": "development_daily_paths.parquet",
+    "development_events": "development_events.parquet",
+    "validation_daily_paths": "validation_daily_paths.parquet",
+    "validation_events": "validation_events.parquet",
+    "audit": "audit.json",
+    "report": "FSM_FACTOR_EXIT_OVERLAY_2026-08-12.md"
+  }
+}

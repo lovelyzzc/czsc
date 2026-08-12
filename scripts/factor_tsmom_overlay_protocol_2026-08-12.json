@@ -1,0 +1,104 @@
+{
+  "schema": "factor_tsmom_overlay_protocol_v1",
+  "study_id": "factor_tsmom_overlay_20260812",
+  "frozen_at_local": "2026-08-13T00:05:00+08:00",
+  "classification": "RETROSPECTIVE_MECHANISM_TEST_WITH_TEMPORAL_VALIDATION_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "the historical sample has been visible to prior CZSC research and is not independent OOS",
+    "the exact portfolio-level time-series rule has not previously been evaluated in this workspace",
+    "2024plus is a gated temporal validation but remains retrospective",
+    "a pass creates a prospective forward-test candidate only",
+    "a failure closes this exact 20-decision zero-threshold overlay without lookback, threshold, hysteresis, or leverage rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "stock-level entry and exit filters are weak, but reducing the entire unchanged factor F book when its own realized 20-decision trend is negative can improve drawdown and risk-adjusted return",
+    "distinct_from_failed_market_state_filters": "uses only the causal realized NAV of the investable F portfolio, not cross-sectional breadth, median momentum, or FSM state composition",
+    "single_variant_only": true
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a",
+      "rows": 676812,
+      "decision_dates": 220
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128,
+      "max_date": "2026-06-11"
+    },
+    "historical_stage2_f_path": {
+      "path": "scripts/_output/xs_chan_exploration_stage2/STAGE2_9b50c30fa68af7fbc45e7da2a539224cabb2c52c43684ffe6262165f3c1123b3/path_weekly.parquet",
+      "sha256": "e21ce630aea3186284ed0b7569a2854e756d2a7d93bb1bf4a05e7cdaec649662"
+    }
+  },
+  "factor_baseline": {
+    "target_slots": 50,
+    "retention_max_rank": 75,
+    "membership": "unchanged frozen F factor-rank path",
+    "initial_cash_buffer": 0.005,
+    "self_financing": true,
+    "retained_positions_are_not_artificially_rebalanced_to_equal_weight": true
+  },
+  "overlay": {
+    "lookback_decisions": 20,
+    "signal_at_decision_close": "F_BASELINE close NAV divided by its close NAV 20 decision dates earlier minus one",
+    "risk_on": "strictly greater than zero",
+    "risk_off": "less than or equal to zero",
+    "warmup": "cash through the first 20 decision dates",
+    "risk_on_target": "the exact contemporaneous frozen F membership",
+    "risk_off_target": "zero stock slots and cash",
+    "fill": "strict next common market-session open",
+    "no_hysteresis": true,
+    "no_leverage": true
+  },
+  "execution": {
+    "prices": "qfq open fills and qfq close daily marks",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006],
+    "missing_buy_open": "skip and keep cash until a later weekly decision",
+    "missing_sell_open": "remain pending until the next observable stock open",
+    "terminal_liquidation": "2026-05-18 common endpoint open",
+    "cash_return": 0.0
+  },
+  "sample": {
+    "development": ["2022-06-10", "2023-12-29"],
+    "validation": ["2024-01-01", "2026-05-18"],
+    "validation_subperiods": [["2024", "2024-01-01", "2024-12-31"], ["2025_PLUS", "2025-01-01", "2026-05-18"]],
+    "annualization_sessions": 242,
+    "weekly_hac_lag": 4
+  },
+  "statistics": {
+    "primary_comparison": "F_TSMOM minus F_BASELINE at 40bps",
+    "minimum_risk_on_decision_rate": 0.25,
+    "maximum_risk_on_decision_rate": 0.85,
+    "minimum_relative_drawdown_reduction": 0.15,
+    "minimum_sharpe_improvement": 0.15,
+    "maximum_annual_return_underperformance": 0.01,
+    "weekly_noninferiority_margin": 0.0001923076923076923,
+    "one_sided_alpha": 0.05
+  },
+  "decision_rules": {
+    "development_pass": "risk-on decision rate in [25%,85%]; candidate annualized return>0; max-drawdown magnitude reduced>=15%; Sharpe improves>=0.15; annualized return no more than 1pp below F; weekly paired-return noninferiority one-sided HAC p<0.05",
+    "validation_opening": "validation paths, signals, and statistics are not computed or persisted unless every development gate passes",
+    "validation_pass": "same primary rules; both locked validation subperiod candidate total returns>0 and paired total returns>=-2pp",
+    "cost_stress_pass": "at 60bp candidate annualized return>0 and max drawdown is lower than F in both development and validation",
+    "candidate_status": "RETROSPECTIVE_TSMOM_CANDIDATE_FORWARD_TEST_REQUIRED only if development, validation, and cost stress all pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE; no alternate lookback, threshold, hysteresis, or leverage rescue"
+  },
+  "outputs": {
+    "directory": "scripts/_output/factor_tsmom_overlay",
+    "target_memberships": "target_memberships.parquet",
+    "development_signals": "development_signals.parquet",
+    "development_paths": "development_paths.parquet",
+    "validation_signals": "validation_signals.parquet",
+    "validation_paths": "validation_paths.parquet",
+    "audit": "audit.json",
+    "report": "FACTOR_TSMOM_OVERLAY_2026-08-12.md"
+  }
+}

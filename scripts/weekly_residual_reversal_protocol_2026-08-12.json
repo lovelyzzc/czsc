@@ -1,0 +1,98 @@
+{
+  "schema": "weekly_residual_reversal_protocol_v1",
+  "study_id": "weekly_residual_reversal_20260812",
+  "frozen_at_local": "2026-08-12T23:15:00+08:00",
+  "classification": "RETROSPECTIVE_MECHANISM_TEST_WITH_TEMPORAL_VALIDATION_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "all historical dates have been visible to prior CZSC research and are not independent OOS",
+    "the 2024plus segment is opened only after the development gate but remains retrospective temporal validation",
+    "a pass creates a candidate for a separate self-financing implementation and forward test only",
+    "a failure closes this exact continuous reversal definition without lookback, neutralization, target-size, or holding-period rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "industry- and size-neutralized one-week losers mean-revert over the next week after realistic membership turnover costs",
+    "distinct_from_failed_fsm_reversal": "continuous cross-sectional oversold residual over the full eligible universe, not a sparse transition from FSM state 1 into states 2/3/4",
+    "single_variant_only": true
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "ranked_surface": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a",
+      "rows": 676812,
+      "decision_dates": 220,
+      "last_complete_primary_decision": "2026-05-08"
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128,
+      "max_date": "2026-06-11"
+    }
+  },
+  "signal": {
+    "decision_time": "frozen weekly decision-session close",
+    "raw_return": "decision close divided by the fifth prior observed stock close minus one",
+    "winsorization": "within decision date at 1st and 99th percentiles for raw return and log free-float market cap",
+    "neutralization": "weekly OLS raw_return ~ intercept + zscore(log_free_float_mcap) + SW2021_L1 industry dummies with deterministic sorted columns",
+    "score": "negative OLS residual so the most idiosyncratically oversold stock ranks first",
+    "minimum_complete_weekly_universe": 1000,
+    "tie_break": ["residual_return_ascending", "symbol_ascending"]
+  },
+  "portfolio": {
+    "target_slots": 50,
+    "retention_max_rank": 75,
+    "recursive_membership": "retain previous names if current reversal rank<=75, then fill by reversal rank and symbol",
+    "cash_buffer": 0.005,
+    "entry": "strict next common market-session open",
+    "outcome": "fifth common market-session open return from entry",
+    "missing_or_untradable_selected_slot": "zero return cash proxy and separately report completeness",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "terminal_liquidation": true,
+    "roundtrip_cost_stress": [0.002, 0.004, 0.006]
+  },
+  "benchmark": {
+    "definition": "same-week equal-weight mean fwd_5d_open_return of every finite entry-tradable eligible stock",
+    "cash_scaling": 0.995,
+    "transaction_cost": 0.0,
+    "reason": "a deliberately hard theoretical all-eligible benchmark removes broad market direction without granting a turnover advantage to the candidate"
+  },
+  "sample": {
+    "development": ["2022-01-14", "2023-12-29"],
+    "development_halves": [["2022-01-14", "2022-12-30"], ["2023-01-01", "2023-12-29"]],
+    "validation": ["2024-01-01", "2026-05-08"],
+    "validation_halves": [["2024-01-01", "2024-12-31"], ["2025-01-01", "2026-05-08"]]
+  },
+  "statistics": {
+    "estimand": "weekly candidate net return minus theoretical all-eligible gross benchmark return",
+    "newey_west_lag_weeks": 4,
+    "one_sided_alpha": 0.05,
+    "circular_block_weeks": 4,
+    "bootstrap_draws": 20000,
+    "bootstrap_seed": 20260813,
+    "minimum_active_weekly_effect": 0.0025,
+    "minimum_observable_target_slot_rate": 0.98,
+    "maximum_compounded_drawdown": 0.35
+  },
+  "decision_rules": {
+    "development_pass": "mean active net return>=0.25% weekly; one-sided HAC p<0.05; block-bootstrap q05>0; both development-half active means>0; candidate net mean>0; observable target slot rate>=98%; compounded candidate max drawdown<=35%",
+    "validation_opening": "validation returns, statistics, and artifacts must not be computed or persisted unless every development gate passes",
+    "validation_pass": "same fixed rules and both locked validation-half active means>0",
+    "cost_stress_pass": "at 60bp roundtrip both development and validation active means and bootstrap q05 remain positive",
+    "candidate_status": "RETROSPECTIVE_REVERSAL_CANDIDATE_DAILY_PATH_AND_FORWARD_TEST_REQUIRED only if development, validation, and 60bp stress all pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE; no alternate lookbacks, neutralizers, target sizes, buffers, or holding horizons in this study"
+  },
+  "outputs": {
+    "directory": "scripts/_output/weekly_residual_reversal",
+    "blind_ranked_signal": "blind_ranked_signal.parquet",
+    "development_memberships": "development_memberships.parquet",
+    "development_weekly": "development_weekly.parquet",
+    "validation_memberships": "validation_memberships.parquet",
+    "validation_weekly": "validation_weekly.parquet",
+    "audit": "audit.json",
+    "report": "WEEKLY_RESIDUAL_REVERSAL_2026-08-12.md"
+  }
+}

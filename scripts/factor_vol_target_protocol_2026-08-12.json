@@ -1,0 +1,77 @@
+{
+  "schema": "factor_vol_target_protocol_v1",
+  "study_id": "factor_vol_target_20260812",
+  "frozen_at_local": "2026-08-12T23:25:00+08:00",
+  "classification": "RETROSPECTIVE_STANDARD_RISK_OVERLAY_WITH_TEMPORAL_VALIDATION",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "all dates are historical and not independent OOS",
+    "the exact 20-session 15-percent target-volatility rule is frozen before its path is inspected",
+    "2024plus is opened only after a complete development pass and remains retrospective",
+    "a pass creates a prospective forward-test candidate only",
+    "a failure ends same-sample strategy mining and requires new immutable data"
+  ],
+  "inputs": {
+    "ranked_surface": {"path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet", "sha256": "2807272ca28424bc8611f06b17995c73a5ef4dcd8f3e81d93a9fa5a14f51336a"},
+    "price_panel": {"path": "scripts/_output/surge_candidates/panel.parquet", "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8"},
+    "historical_stage2_f_path": {"path": "scripts/_output/xs_chan_exploration_stage2/STAGE2_9b50c30fa68af7fbc45e7da2a539224cabb2c52c43684ffe6262165f3c1123b3/path_weekly.parquet", "sha256": "e21ce630aea3186284ed0b7569a2854e756d2a7d93bb1bf4a05e7cdaec649662"}
+  },
+  "factor_baseline": {"target_slots": 50, "retention_max_rank": 75, "membership": "unchanged F", "cash_buffer": 0.005, "self_financing": true},
+  "overlay": {
+    "lookback_market_sessions": 20,
+    "annualization_sessions": 242,
+    "target_annualized_volatility": 0.15,
+    "target_exposure": "min(1, target_volatility / realized_F_close_to_close_volatility)",
+    "signal_baseline_cost": "fixed primary F path with buy 15bp and sell 25bp; the same exposure schedule is reused in cost stress",
+    "minimum_exposure": 0.0,
+    "maximum_exposure": 1.0,
+    "signal_time": "weekly decision close using returns through that close",
+    "fill": "next common market-session open",
+    "warmup": "cash until 20 finite F close-to-close returns exist",
+    "no_leverage": true,
+    "no_hysteresis": true
+  },
+  "execution": {
+    "F_internal_costs": "same 20/40/60bp stock-level paths",
+    "overlay_buy_cost": 0.0015,
+    "overlay_sell_cost": 0.0025,
+    "overlay_cost_stress": [0.002, 0.004, 0.006],
+    "sleeve_accounting": "F overnight and intraday NAV returns split at exact daily open NAV; exposure changes only at next decision open",
+    "cash_return": 0.0,
+    "terminal_liquidation": "2026-05-18 open"
+  },
+  "sample": {
+    "development": ["2022-03-01", "2023-12-29"],
+    "validation": ["2024-01-01", "2026-05-18"],
+    "validation_subperiods": [["2024", "2024-01-01", "2024-12-31"], ["2025_PLUS", "2025-01-01", "2026-05-18"]],
+    "annualization_sessions": 242,
+    "weekly_hac_lag": 4
+  },
+  "statistics": {
+    "minimum_average_exposure": 0.25,
+    "maximum_average_exposure": 0.95,
+    "minimum_relative_drawdown_reduction": 0.15,
+    "minimum_sharpe_improvement": 0.15,
+    "maximum_annual_return_underperformance": 0.01,
+    "weekly_noninferiority_margin": 0.0001923076923076923,
+    "one_sided_alpha": 0.05
+  },
+  "decision_rules": {
+    "development_pass": "average exposure in [25%,95%]; candidate annualized return>0; drawdown magnitude reduced>=15%; Sharpe improves>=0.15; annualized return no more than 1pp below F; weekly paired noninferiority HAC p<0.05",
+    "validation_opening": "no validation path or statistics unless every development gate passes",
+    "validation_pass": "same rules plus both locked subperiod candidate total returns>0 and paired total returns>=-2pp",
+    "cost_stress_pass": "at 60bp candidate annualized return>0 and drawdown lower than F in both development and validation",
+    "candidate_status": "RETROSPECTIVE_VOL_TARGET_CANDIDATE_FORWARD_TEST_REQUIRED only if all gates pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE_STOP_SAME_SAMPLE_MINING"
+  },
+  "outputs": {
+    "directory": "scripts/_output/factor_vol_target",
+    "development_signals": "development_signals.parquet",
+    "development_paths": "development_paths.parquet",
+    "validation_signals": "validation_signals.parquet",
+    "validation_paths": "validation_paths.parquet",
+    "audit": "audit.json",
+    "report": "FACTOR_VOL_TARGET_2026-08-12.md"
+  }
+}

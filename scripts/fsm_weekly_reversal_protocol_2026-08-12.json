@@ -1,0 +1,139 @@
+{
+  "schema": "fsm_weekly_reversal_discovery_protocol_v1",
+  "study_id": "fsm_weekly_reversal_discovery_20260812",
+  "frozen_at_local": "2026-08-12T23:00:00+08:00",
+  "classification": "RETROSPECTIVE_DISCOVERY_WITH_TEMPORAL_VALIDATION_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "live_trading_authorized": false,
+  "claim_boundary": [
+    "the historical sample has been visible to earlier CZSC research and is not independent OOS",
+    "the 2024plus segment is a locked temporal validation inside this study, not prospective confirmation",
+    "a passing result creates a forward-test candidate only",
+    "a failing result closes this exact hypothesis without parameter rescue"
+  ],
+  "mechanism": {
+    "hypothesis": "a fresh weekly transition out of a persistent Downtrend into a recovery regime captures short-horizon reversal that remains after same-date industry, size and causal-risk matching",
+    "distinct_from_closed_delay5": "contrarian recovery after state 1, not delayed continuation in states 5-8",
+    "decision_frequency": "dates with a complete frozen daily_basic cross-section",
+    "decision_time": "decision-session close",
+    "entry": "strict next official market-session open",
+    "primary_exit": "20th common market-session close including the entry session as day 1"
+  },
+  "inputs": {
+    "git_head_at_freeze": "dba4add251776beb4071977940bfd43f57dc1462",
+    "state_cache": {
+      "path": "scripts/_output/fsm_audit/states.parquet",
+      "sha256": "1d25648ffa70618a4d241c22b4ff3bae1319512545c4b5b0dd065cad2f67ee14",
+      "rows": 6578974,
+      "max_date": "2026-06-11"
+    },
+    "price_panel": {
+      "path": "scripts/_output/surge_candidates/panel.parquet",
+      "sha256": "e67210eb9193ff11497540460bf80ee342d0c8fe2d895199167e627668cbf3e8",
+      "rows": 5631128
+    },
+    "candidate_manifest": {
+      "path": "scripts/_output/surge_candidates/manifest.json",
+      "sha256": "3cb18b9010438e54b2238078eb8660d56f37ff82f4ca9edd55bc6e6fdd8b56ab"
+    },
+    "weekly_daily_basic": {
+      "directory": "scripts/_output/xs_chan_exploration_stage1/reference_data/daily_basic_weekly",
+      "file_count": 221,
+      "inventory_sha256": "07ece8308de96eba7ba95b757a46370a6c1ee2ef4582925d04e3339a8a04433a",
+      "first_date": "2022-01-07",
+      "last_date": "2026-05-08"
+    },
+    "industry_membership": {
+      "path": "scripts/_output/xs_chan_exploration_stage1/reference_data/sw2021_l1_membership.parquet",
+      "sha256": "5099b979f79897d8a979138f328d53e8f51b855449b4554f2583d56c80bdeec7"
+    },
+    "historical_names": {
+      "path": "~/.ts_data_cache/namechange.parquet",
+      "sha256": "4064b06847bbfdda524d0609892fca3ae61363521ace5ded88989eac01d439a8"
+    }
+  },
+  "sample": {
+    "development": ["2022-01-07", "2023-12-29"],
+    "development_halves": [["2022-01-07", "2022-12-30"], ["2023-01-01", "2023-12-29"]],
+    "validation": ["2024-01-01", "2026-05-08"],
+    "validation_halves": [["2024-01-01", "2024-12-31"], ["2025-01-01", "2026-05-08"]],
+    "universe": {
+      "minimum_source_bars": 500,
+      "excluded_prefixes": ["688", "920", "83", "43"],
+      "exclude_active_st_or_delisting_name": true,
+      "minimum_decision_amount_100m_cny": 1.0,
+      "require_complete_causal_features": true,
+      "require_positive_decision_day_circ_mv": true
+    }
+  },
+  "signal_family": {
+    "previous_regime": 1,
+    "target_regimes": [2, 3, 4],
+    "downtrend_run_buckets_inclusive": [[5, 7], [8, 12], [13, 20]],
+    "family_size": 9,
+    "fresh_transition_only": true,
+    "selection_primary_horizon_sessions": 20,
+    "diagnostic_horizons_sessions": [5, 60]
+  },
+  "execution": {
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "entry_gap_rule": "finite positive next-session open and gap_pct < board_limit_pct - 0.3",
+    "endpoint_price": "last observable close at or before the fixed common-session endpoint (LOCF for suspension)",
+    "missing_or_delisted_terminal_value": "not modelled; reported as a limitation",
+    "overlapping_signals": "retained for pair ATT; weekly basket diagnostic is equal weight"
+  },
+  "outcome_blind_matching": {
+    "exact_fields": ["decision_date", "target_regime", "SW2021_L1_industry"],
+    "circ_mv_caliper_ratio_inclusive": 2.0,
+    "minimum_controls": 5,
+    "maximum_controls": 20,
+    "control_pool": "eligible non-family-event stocks with the same target regime on the same decision date",
+    "distance": "standardized Euclidean using development-only scales",
+    "features": [
+      "log_circ_mv",
+      "ret5",
+      "ret20",
+      "ret60",
+      "vol20",
+      "vol60",
+      "log_price",
+      "log_amount",
+      "liq20",
+      "ma_spread_pct",
+      "volume_ratio"
+    ],
+    "tie_break": ["distance", "symbol"],
+    "weights": "equal within each treated trade",
+    "coverage_threshold": 0.8,
+    "maximum_absolute_smd": 0.1,
+    "matching_and_balance_must_be_persisted_before_outcome_join": true
+  },
+  "statistics": {
+    "weekly_estimand": "equal-weight mean treated-trade net ATT within decision date",
+    "newey_west_lag_weeks": 4,
+    "circular_block_weeks": 4,
+    "bootstrap_draws": 20000,
+    "bootstrap_seed_root": 20260812,
+    "development_multiplicity": "Holm-adjusted one-sided normal p over the fixed 9-cell H20 family",
+    "minimum_development_supported_trades": 60,
+    "minimum_validation_supported_trades": 40,
+    "minimum_effect_net_att": 0.005
+  },
+  "decision_rules": {
+    "development_pass": "coverage>=0.80, max_abs_smd<=0.10, supported_trades>=60, mean_net_H20_ATT>=0.50%, Holm one-sided p<0.05, bootstrap q05>0, and both development-half means>0",
+    "selection": "among development-pass cells choose the largest bootstrap q05, then mean ATT, then lexical cell id",
+    "validation_pass": "locked cell coverage>=0.80, max_abs_smd<=0.10, supported_trades>=40, mean_net_H20_ATT>=0.50%, one-sided HAC p<0.05, bootstrap q05>0, and both validation-half means>0",
+    "candidate_status": "RETROSPECTIVE_CANDIDATE_FORWARD_TEST_REQUIRED only if both development and validation pass",
+    "failure_status": "HYPOTHESIS_FALSIFIED_RETROSPECTIVE; no threshold, target-state, duration or horizon rescue"
+  },
+  "outputs": {
+    "directory": "scripts/_output/fsm_weekly_reversal_discovery",
+    "blind_pairs": "matched_pairs_blind.parquet",
+    "match_attempts": "match_attempts.parquet",
+    "balance": "balance.json",
+    "trade_att": "trade_att.parquet",
+    "audit": "audit.json",
+    "report": "FSM_WEEKLY_REVERSAL_DISCOVERY_2026-08-12.md"
+  }
+}
