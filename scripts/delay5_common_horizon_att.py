@@ -36,6 +36,7 @@ import trend_regime as tr
 SCRIPT_DIR = Path(__file__).resolve().parent
 CANDIDATES_PATH = SCRIPT_DIR / "_output" / "surge_candidates" / "candidates.parquet"
 PANEL_PATH = SCRIPT_DIR / "_output" / "surge_candidates" / "panel.parquet"
+CANDIDATE_MANIFEST_PATH = SCRIPT_DIR / "_output" / "surge_candidates" / "manifest.json"
 MARKET_PATH = SCRIPT_DIR / "_output" / "surge_market_state_filter" / "market_state.parquet"
 PRODUCTION_DIR = SCRIPT_DIR / "_output" / "surge_delay5_production_cohort"
 PRODUCTION_COHORT_PATH = PRODUCTION_DIR / "cohort.parquet"
@@ -364,13 +365,14 @@ def load_production_common_support(
         if not path.is_file():
             raise FileNotFoundError(f"required {label} is missing: {path}")
     upstream = json.loads(PRODUCTION_AUDIT_PATH.read_text(encoding="utf-8"))
-    if upstream.get("schema") != "surge_delay5_production_cohort_audit_v2":
+    if upstream.get("schema") != "surge_delay5_production_cohort_audit_v3":
         raise RuntimeError("unexpected production cohort audit schema")
     expected_output = upstream.get("outputs", {}).get("cohort", {})
     if expected_output.get("sha256") != proxy.sha256_file(PRODUCTION_COHORT_PATH):
         raise RuntimeError("production cohort parquet no longer matches its audit identity")
     bound_inputs = {
         "candidates": CANDIDATES_PATH,
+        "candidate_manifest": CANDIDATE_MANIFEST_PATH,
         "panel": PANEL_PATH,
         "market_state": MARKET_PATH,
         "historical_st": portfolio.NAMECHANGE_PATH,
@@ -391,9 +393,11 @@ def load_production_common_support(
         "stage_market",
         "stage_fill",
         "stage_mature",
-        "state_fill_dt",
-        "state_fill_open",
-        "state_fill_observed",
+        "entry_fill_dt",
+        "entry_fill_open",
+        "entry_fill_observed",
+        "common_h60_dt",
+        "common_60_mature",
     }
     if missing := required - set(cohort):
         raise RuntimeError(f"production cohort lacks stage columns: {sorted(missing)}")
@@ -986,6 +990,10 @@ def run_audit(*, n_boot: int = N_BOOT, output_dir: Path = OUTPUT_DIR) -> dict[st
                 "raw_completeness_proven": bool(production_audit["raw_completeness_proven"]),
             },
             "candidates": {"path": str(CANDIDATES_PATH), "sha256": proxy.sha256_file(CANDIDATES_PATH)},
+            "candidate_manifest": {
+                "path": str(CANDIDATE_MANIFEST_PATH),
+                "sha256": proxy.sha256_file(CANDIDATE_MANIFEST_PATH),
+            },
             "panel": {"path": str(PANEL_PATH), "sha256": proxy.sha256_file(PANEL_PATH)},
             "market_state": {"path": str(MARKET_PATH), "sha256": proxy.sha256_file(MARKET_PATH)},
             "namechange": {

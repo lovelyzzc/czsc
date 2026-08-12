@@ -247,12 +247,14 @@ def test_upstream_production_cohort_identity_is_required(tmp_path: Path, monkeyp
     calendar = pd.bdate_range("2026-01-05", periods=61)
     candidate_path = tmp_path / "candidates.parquet"
     panel_path = tmp_path / "panel.parquet"
+    manifest_path = tmp_path / "manifest.json"
     market_path = tmp_path / "market.parquet"
     st_path = tmp_path / "namechange.parquet"
     cohort_path = tmp_path / "cohort.parquet"
     upstream_path = tmp_path / "audit.json"
     candidate_path.write_bytes(b"candidate-v1")
     panel_path.write_bytes(b"panel-v1")
+    manifest_path.write_bytes(b"manifest-v1")
     market_path.write_bytes(b"market-v1")
     st_path.write_bytes(b"st-v1")
     cohort = pd.DataFrame(
@@ -261,18 +263,20 @@ def test_upstream_production_cohort_identity_is_required(tmp_path: Path, monkeyp
             "sig_dt": [calendar[0]],
             "dec_dt": [calendar[0]],
             "entry_dt": [calendar[1]],
-            "exit_dt": [calendar[10]],
-            "state_fill_dt": [calendar[10]],
-            "state_fill_open": [10.0],
-            "state_fill_observed": pd.array([True], dtype="boolean"),
+            "entry_fill_dt": [calendar[1]],
+            "entry_fill_open": [10.0],
+            "entry_fill_observed": pd.array([True], dtype="boolean"),
+            "common_h60_dt": [calendar[60]],
+            "common_60_mature": [True],
             **{f"stage_{name}": [True] for name in ["raw", "gate", "hard", "st", "market", "fill", "mature"]},
         }
     )
     cohort.to_parquet(cohort_path, index=False)
     upstream = {
-        "schema": "surge_delay5_production_cohort_audit_v2",
+        "schema": "surge_delay5_production_cohort_audit_v3",
         "inputs": {
             "candidates": {"sha256": audit.proxy.sha256_file(candidate_path)},
+            "candidate_manifest": {"sha256": audit.proxy.sha256_file(manifest_path)},
             "panel": {"sha256": audit.proxy.sha256_file(panel_path)},
             "market_state": {"sha256": audit.proxy.sha256_file(market_path)},
             "historical_st": {"sha256": audit.proxy.sha256_file(st_path)},
@@ -282,6 +286,7 @@ def test_upstream_production_cohort_identity_is_required(tmp_path: Path, monkeyp
     upstream_path.write_text(json.dumps(upstream), encoding="utf-8")
     monkeypatch.setattr(audit, "CANDIDATES_PATH", candidate_path)
     monkeypatch.setattr(audit, "PANEL_PATH", panel_path)
+    monkeypatch.setattr(audit, "CANDIDATE_MANIFEST_PATH", manifest_path)
     monkeypatch.setattr(audit, "MARKET_PATH", market_path)
     monkeypatch.setattr(audit, "PRODUCTION_COHORT_PATH", cohort_path)
     monkeypatch.setattr(audit, "PRODUCTION_AUDIT_PATH", upstream_path)

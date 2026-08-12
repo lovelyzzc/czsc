@@ -27,7 +27,7 @@ def test_exact_mcap_caliper_is_inclusive_and_ties_break_by_symbol() -> None:
         }
     )
 
-    matched, eligible_n = audit.nearest_exact_mcap_controls(pool, treated_mcap=target, k=3)
+    matched, eligible_n = audit.nearest_exact_mcap_controls(pool, treated_mcap=target, k=3, caliper_ratio=1.5)
 
     assert eligible_n == 3
     assert matched["symbol"].tolist() == ["000002.SZ", "000001.SZ", "000004.SZ"]
@@ -98,6 +98,28 @@ def test_missing_industry_treated_is_an_explicit_unsupported_attempt() -> None:
     assert attempts.loc[0, "unsupported_reason"] == "missing_treated_industry"
 
 
+def test_incomplete_causal_feature_controls_are_explicitly_excluded() -> None:
+    treated, all_filled, store, exact, industries = _small_match_inputs()
+    late_symbol = "C6.SZ"
+    late_panel = store.panel[~((store.panel["symbol"] == late_symbol) & (store.panel["dt"] < treated.loc[0, "dec_dt"]))]
+    late_store = audit.CausalFeatureStore.from_panel(late_panel, store.calendar)
+
+    pairs, attempts = audit.build_exact_matches(
+        treated,
+        all_filled,
+        feature_store=late_store,
+        exact_mcap=exact,
+        industry_maps=industries,
+        st_intervals={},
+    )
+
+    assert late_symbol not in set(pairs["control_symbol"])
+    assert attempts.loc[0, "eligible_before_feature_complete_n"] == 6
+    assert attempts.loc[0, "feature_complete_pool_n"] == 5
+    assert attempts.loc[0, "selected_controls_n"] == 5
+    assert bool(attempts.loc[0, "support_ok"])
+
+
 def test_future_price_mutation_does_not_change_pair_identity_hash() -> None:
     treated, all_filled, store, exact, industries = _small_match_inputs()
     pairs_before, _ = audit.build_exact_matches(
@@ -129,12 +151,13 @@ def test_future_price_mutation_does_not_change_pair_identity_hash() -> None:
     assert audit.frame_identity(pairs_before, columns) == audit.frame_identity(pairs_after, columns)
 
 
-def test_balance_weights_each_treated_one_and_controls_one_over_k() -> None:
+def test_balance_uses_frozen_within_trade_control_weights() -> None:
     pairs = pd.DataFrame(
         {
             "trade_id": ["T1", "T2", "T2"],
             "treated_x": [0.0, 2.0, 2.0],
             "control_x": [0.0, 1.0, 3.0],
+            "control_weight": [1.0, 0.5, 0.5],
         }
     )
 
@@ -147,10 +170,48 @@ def test_balance_weights_each_treated_one_and_controls_one_over_k() -> None:
 
 
 def test_balance_nan_fails_closed_instead_of_row_dropping() -> None:
-    pairs = pd.DataFrame({"trade_id": ["T1"], "treated_x": [np.nan], "control_x": [1.0]})
+    pairs = pd.DataFrame({"trade_id": ["T1"], "treated_x": [np.nan], "control_x": [1.0], "control_weight": [1.0]})
     result, missing = audit.balance_statistics(pairs, ["x"])
     assert result == {}
     assert missing == ["x"]
+
+
+def test_conditional_entropy_weights_balance_both_scopes_and_preserve_ess() -> None:
+    rows = []
+    specifications = [("T1", 2023, 0.0, 1.0), ("T2", 2023, 1.0, 2.0), ("T3", 2024, 2.0, 4.0), ("T4", 2025, 3.0, 8.0)]
+    offsets_x = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]
+    offsets_y = [-2.5, 1.5, -0.5, 2.5, -1.5, 0.5]
+    for trade_id, year, target_x, target_y in specifications:
+        for rank, (offset_x, offset_y) in enumerate(zip(offsets_x, offsets_y, strict=True), start=1):
+            rows.append(
+                {
+                    "trade_id": trade_id,
+                    "support_ok": True,
+                    "dec_dt": pd.Timestamp(f"{year}-01-02"),
+                    "treated_symbol": trade_id,
+                    "control_symbol": f"{trade_id}C{rank}",
+                    "rank": rank,
+                    "year": year,
+                    "treated_x": target_x,
+                    "control_x": target_x + offset_x,
+                    "treated_y": target_y,
+                    "control_y": target_y + offset_y,
+                }
+            )
+
+    weighted, diagnostics = audit.fit_conditional_entropy_weights(pd.DataFrame(rows), ["x", "y"])
+    balance = audit.scoped_balance(weighted, ["x", "y"])
+    positivity = audit.positivity_diagnostics(weighted)
+
+    assert diagnostics["solver_success"] is True
+    assert weighted.groupby("trade_id")["control_weight"].sum().tolist() == pytest.approx([1.0] * 4)
+    assert all(
+        abs(balance[scope]["statistics"][feature]["smd"]) < 1e-10
+        for scope in audit.BALANCE_SCOPES
+        for feature in ("x", "y")
+    )
+    assert positivity["all"]["passes"] is True
+    assert positivity["2024plus"]["passes"] is True
 
 
 def test_coverage_denominators_and_verdict_are_fixed() -> None:
@@ -183,7 +244,8 @@ def test_coverage_denominators_and_verdict_are_fixed() -> None:
     coverage["all"]["D_source"] = 5
     coverage["2024plus"]["D_supported"] = 3
     coverage["2024plus"]["D_source"] = 4
-    verdict = audit.build_verdict(coverage, balanced, required_features=["log_exact_mcap"])
+    positivity = {scope: {"passes": True} for scope in audit.BALANCE_SCOPES}
+    verdict = audit.build_verdict(coverage, balanced, positivity, required_features=["log_exact_mcap"])
     assert verdict["status"] == "COLLECTOR_COVERAGE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED"
     assert verdict["outcomes_loaded"] is False
     assert verdict["live_authorized"] is False
@@ -210,7 +272,8 @@ def test_balance_gate_uses_stricter_log_exact_mcap_threshold() -> None:
         }
         for scope in audit.BALANCE_SCOPES
     }
-    verdict = audit.build_verdict(coverage, stats, required_features=["log_exact_mcap", "ret5"])
+    positivity = {scope: {"passes": True} for scope in audit.BALANCE_SCOPES}
+    verdict = audit.build_verdict(coverage, stats, positivity, required_features=["log_exact_mcap", "ret5"])
     assert verdict["status"] == "BALANCE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED"
     assert verdict["failed_balance_features"]["all"] == ["log_exact_mcap"]
 

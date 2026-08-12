@@ -48,12 +48,25 @@ def test_tracked_design_is_outcome_blind_and_fail_closed() -> None:
     design = manifest["design"]
     assert design["data_source"]["exact_mcap_cny"] == "circ_mv * 10000"
     assert design["matching"]["primary"] == {
-        "name": "pit_exact_industry_mcap_k10_min5_c1p5",
+        "name": "pit_exact_industry_mcap2_conditional_entropy_v1",
         "industry": "same frozen annual industry; missing treated industry is unsupported",
-        "metric": "nearest absolute log(exact point-in-time circ_mv CNY) distance",
-        "caliper_ratio": 1.5,
-        "k": 10,
+        "candidate_pool": (
+            "all controls with complete frozen causal balance features inside the inclusive exact point-in-time "
+            "circ_mv caliper"
+        ),
+        "caliper_ratio": 2.0,
         "min_controls": 5,
+        "weighting": (
+            "conditional entropy tilting with one all-scope and one 2024plus-scope coefficient per balance "
+            "feature; weights normalize to one within each treated trade"
+        ),
+        "solver": {
+            "method": "scipy.optimize.least_squares",
+            "max_nfev": 2000,
+            "parameter_bounds": [-50.0, 50.0],
+            "initial_parameters": "all zeros",
+            "xtol_ftol_gtol": 1e-12,
+        },
         "tie_break": "match_distance, symbol",
     }
     assert design["balance_gate"]["scopes"] == {"all": 286, "2024plus": 174}
@@ -62,6 +75,13 @@ def test_tracked_design_is_outcome_blind_and_fail_closed() -> None:
         "all_other_features": 0.1,
     }
     assert design["balance_gate"]["coverage"]["treated_exact_mcap"] == "286/286"
+    assert design["balance_gate"]["positivity"] == {
+        "all_and_2024plus": {
+            "per_trade_ess_p05_gte": 5.0,
+            "max_pair_weight_lte": 0.5,
+            "global_pair_ess_per_trade_gte": 5.0,
+        }
+    }
     assert design["outcome_authorization"]["allowed_in_this_plan"] is False
     assert manifest["verdict"]["live_authorized"] is False
 

@@ -1,0 +1,89 @@
+{
+  "schema": "surge_delay5_forward_capture_protocol_v1",
+  "frozen_at_utc": "2026-08-12T08:25:35Z",
+  "main_forward_protocol": {
+    "locator": "scripts/surge_delay5_forward_protocol_2026-08-12.json",
+    "sha256": "e99c27b9a4794ccc58dddee5e7d011caaac814aff923858e6fa3a72434ebaa25"
+  },
+  "capture_script": {
+    "locator": "scripts/surge_delay5_forward_capture.py",
+    "sha256": "55031619841cb7f33eb186029c2d00583e1faa1de5294f3b43319dceed285596"
+  },
+  "decision_cutoff_inclusive": "2026-08-12",
+  "capture_scope": "every observed post-freeze official session through completion of all enrolled H60 paths",
+  "objects": {
+    "every_observed_session": {
+      "market_panel_projection": [
+        "symbol",
+        "dt",
+        "open",
+        "close",
+        "amount_e"
+      ],
+      "production_projection": [
+        "symbol",
+        "sig_dt",
+        "dec_dt",
+        "entry_dt",
+        "entry_fill_dt",
+        "common_h60_dt",
+        "stage_raw",
+        "stage_gate",
+        "stage_hard",
+        "stage_st",
+        "stage_market",
+        "stage_fill",
+        "stage_mature"
+      ],
+      "market_projection": [
+        "dt",
+        "high20_ratio",
+        "ew_index_above_ma20"
+      ]
+    },
+    "first_60_accrual_sessions_only": {
+      "causal_surface": [
+        "symbol",
+        "decision_close",
+        "decision_amount_e",
+        "industry",
+        "is_st",
+        "log_exact_mcap",
+        "ret5",
+        "ret20",
+        "ret60",
+        "vol20",
+        "vol60",
+        "log_price",
+        "log_amount",
+        "liq20"
+      ],
+      "daily_basic": [
+        "ts_code",
+        "trade_date",
+        "close",
+        "total_share",
+        "float_share",
+        "total_mv",
+        "circ_mv"
+      ]
+    }
+  },
+  "timeliness": {
+    "capture_requirement": "session is the latest observed market session when appended",
+    "remote_anchor_proxy": "the unique ledger-head anchor must be clean, committed, reachable from the configured live remote branch, and have a commit timestamp before the next official session opens at 09:30 Asia/Shanghai; this is an operational remote anchor, not an independent timestamp authority",
+    "late_or_unanchored_action": "permanently exclude that decision session from the primary forward sample"
+  },
+  "chain": {
+    "ledger_schema": "surge_delay5_forward_capture_ledger_v1",
+    "record_schema": "surge_delay5_forward_capture_record_v1",
+    "zero_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "objects_content_addressed": true,
+    "records_append_only": true
+  },
+  "outcome_lock": {
+    "combined_unlock": "main forward protocol is ready AND every required session through the final enrolled H60 endpoint has a verified timely remote anchor AND every required session object verifies",
+    "outcomes_loaded": false,
+    "live_authorized": false
+  }
+}

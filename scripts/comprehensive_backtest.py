@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from surge_candidates_dump import completed_outcomes
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output"
 CANDIDATES_PATH = OUTPUT_DIR / "surge_candidates" / "candidates.parquet"
@@ -48,7 +49,7 @@ BEAR_THRESHOLD = -8.0
 def load_data():
     """加载所有数据。"""
     print("[加载] 数据 ...")
-    cand = pd.read_parquet(CANDIDATES_PATH)
+    cand = completed_outcomes(pd.read_parquet(CANDIDATES_PATH))
     panel = pd.read_parquet(PANEL_PATH)
     states = pd.read_parquet(STATES_PATH)
     print(f"  候选: {len(cand)} | 面板: {len(panel)} | FSM状态: {len(states)}")
@@ -59,9 +60,7 @@ def compute_panel_fwd(panel: pd.DataFrame) -> pd.DataFrame:
     """为面板添加前向收益。"""
     ps = panel.sort_values(["symbol", "dt"]).reset_index(drop=True)
     for w in FWD_WINDOWS:
-        ps[f"fwd_{w}d"] = ps.groupby("symbol")["close"].transform(
-            lambda s: s.shift(-w) / s - 1
-        ) * 100
+        ps[f"fwd_{w}d"] = ps.groupby("symbol")["close"].transform(lambda s: s.shift(-w) / s - 1) * 100
     return ps
 
 
@@ -100,16 +99,19 @@ def detect_reversion(states: pd.DataFrame, min_down: int = 5, max_down: int = 20
                 dc = 0
             if regimes[i - 1] == DOWNTREND and int(regimes[i]) in RECOVERY_REGIMES:
                 if min_down <= dc <= max_down:
-                    signals.append({
-                        "symbol": sym, "dt": dates[i],
-                        "to_regime": int(regimes[i]), "down_days": dc,
-                    })
+                    signals.append(
+                        {
+                            "symbol": sym,
+                            "dt": dates[i],
+                            "to_regime": int(regimes[i]),
+                            "down_days": dc,
+                        }
+                    )
                 dc = 0
     return pd.DataFrame(signals)
 
 
-def gate_filter(cand: pd.DataFrame, vr_th: float, vr_dir: str,
-                sp_th: float, sp_dir: str, use_zg: bool) -> pd.Series:
+def gate_filter(cand: pd.DataFrame, vr_th: float, vr_dir: str, sp_th: float, sp_dir: str, use_zg: bool) -> pd.Series:
     """向量化门控过滤。"""
     vr = cand["sig_vol_ratio"]
     sp = cand["sig_ma_spread_pct"]
@@ -131,8 +133,9 @@ def gate_filter(cand: pd.DataFrame, vr_th: float, vr_dir: str,
     return vr_ok & sp_ok & zg_ok
 
 
-def simulate_portfolio(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
-                       n_slots: int = N_SLOTS, hold_days_col: str = None) -> dict:
+def simulate_portfolio(
+    entries: pd.DataFrame, panel_fwd: pd.DataFrame, n_slots: int = N_SLOTS, hold_days_col: str = None
+) -> dict:
     """简化的槽位组合模拟。
 
     entries 需要列：symbol, dt, priority, [hold_days]
@@ -140,7 +143,8 @@ def simulate_portfolio(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
     """
     merged = entries.merge(
         panel_fwd[["symbol", "dt", "close"] + [f"fwd_{w}d" for w in FWD_WINDOWS]],
-        on=["symbol", "dt"], how="left",
+        on=["symbol", "dt"],
+        how="left",
     )
     merged["seg"] = np.where(merged["dt"] <= TRAIN_END, "train", "test")
     merged = merged.dropna(subset=["fwd_5d"])
@@ -175,9 +179,11 @@ def simulate_portfolio(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
     trades_df = pd.DataFrame(trades)
 
     result = {}
-    for seg_label, mask in [("ALL", pd.Series(True, index=trades_df.index)),
-                             ("IS", trades_df["seg"] == "train"),
-                             ("OOS", trades_df["seg"] == "test")]:
+    for seg_label, mask in [
+        ("ALL", pd.Series(True, index=trades_df.index)),
+        ("IS", trades_df["seg"] == "train"),
+        ("OOS", trades_df["seg"] == "test"),
+    ]:
         sub = trades_df.loc[mask]
         n = len(sub)
         seg_data = {"n_trades": n}
@@ -212,12 +218,12 @@ def simulate_portfolio(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
     return result
 
 
-def analyze_capacity(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
-                     label: str, n_slots: int = N_SLOTS) -> dict:
+def analyze_capacity(entries: pd.DataFrame, panel_fwd: pd.DataFrame, label: str, n_slots: int = N_SLOTS) -> dict:
     """分析策略的槽位容量：利用率、空仓天数、有效年化。"""
     merged = entries.merge(
         panel_fwd[["symbol", "dt", "close"] + [f"fwd_{w}d" for w in FWD_WINDOWS]],
-        on=["symbol", "dt"], how="left",
+        on=["symbol", "dt"],
+        how="left",
     ).dropna(subset=["fwd_5d"])
     merged = merged.sort_values(["dt", "priority"], ascending=[True, False])
 
@@ -244,10 +250,14 @@ def analyze_capacity(entries: pd.DataFrame, panel_fwd: pd.DataFrame,
             occupied[row["symbol"]] = release
             free -= 1
             new_fills += 1
-        daily_stats.append({
-            "dt": dt, "occupied": len(occupied),
-            "utilization": len(occupied) / n_slots, "new_fills": new_fills,
-        })
+        daily_stats.append(
+            {
+                "dt": dt,
+                "occupied": len(occupied),
+                "utilization": len(occupied) / n_slots,
+                "new_fills": new_fills,
+            }
+        )
 
     ds = pd.DataFrame(daily_stats)
     ds["year"] = pd.to_datetime(ds["dt"]).dt.year
@@ -312,35 +322,47 @@ def main():
     # ─── S0: New Default (flipped gate) ──────────────────────────
     print("\n[S0] NewDefault: vr<=0.8, sp>=3.0, zg=False (新默认) ...")
     s0_mask = gate_filter(d0, 0.8, "lte", 3.0, "gte", False)
-    s0_entries = d0.loc[s0_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s0_entries = d0.loc[s0_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S0_NewDefault"] = simulate_portfolio(s0_entries, panel_fwd)
 
     # ─── S0L: Legacy Baseline (old defaults) ──────────────────────
     print("[S0L] LegacyBaseline: vr>=1.2, sp>=3.0, zg=True (旧默认) ...")
     s0l_mask = gate_filter(d0, 1.2, "gte", 3.0, "gte", True)
-    s0l_entries = d0.loc[s0l_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s0l_entries = d0.loc[s0l_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S0L_Legacy"] = simulate_portfolio(s0l_entries, panel_fwd)
 
     # ─── S2: Optimal Gate ─────────────────────────────────────────
     print("[S2] OptimalGate: vr<=1.2, sp>=10.0, zg=False ...")
     s2_mask = gate_filter(d0, 1.2, "lte", 10.0, "gte", False)
-    s2_entries = d0.loc[s2_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s2_entries = d0.loc[s2_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S2_OptimalGate"] = simulate_portfolio(s2_entries, panel_fwd)
 
     # ─── S2a/S2b/S2c: 精搜索验证 Top-3 ─────────────────────────
     print("[S2a] Refined_vr09_sp12: vr<=0.9, sp>=12.0, zg=False ...")
     s2a_mask = gate_filter(d0, 0.9, "lte", 12.0, "gte", False)
-    s2a_entries = d0.loc[s2a_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s2a_entries = d0.loc[s2a_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S2a_vr09_sp12"] = simulate_portfolio(s2a_entries, panel_fwd)
 
     print("[S2b] Refined_vr08_sp12: vr<=0.8, sp>=12.0, zg=False ...")
     s2b_mask = gate_filter(d0, 0.8, "lte", 12.0, "gte", False)
-    s2b_entries = d0.loc[s2b_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s2b_entries = d0.loc[s2b_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S2b_vr08_sp12"] = simulate_portfolio(s2b_entries, panel_fwd)
 
     print("[S2c] Refined_vr09_sp10: vr<=0.9, sp>=10.0, zg=False ...")
     s2c_mask = gate_filter(d0, 0.9, "lte", 10.0, "gte", False)
-    s2c_entries = d0.loc[s2c_mask, ["symbol", "entry_dt", "score"]].rename(columns={"entry_dt": "dt", "score": "priority"})
+    s2c_entries = d0.loc[s2c_mask, ["symbol", "entry_dt", "score"]].rename(
+        columns={"entry_dt": "dt", "score": "priority"}
+    )
     results["strategies"]["S2c_vr09_sp10"] = simulate_portfolio(s2c_entries, panel_fwd)
 
     # ─── S3: Pure Reversion ───────────────────────────────────────
@@ -357,30 +379,39 @@ def main():
     s3_entries_tagged = s3_entries.copy()
     s3_entries_tagged["market"] = s3_entries_tagged["dt"].map(mkt_map)
 
-    s4_entries = pd.concat([
-        s0_entries_tagged[s0_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
-        s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
-    ], ignore_index=True)
+    s4_entries = pd.concat(
+        [
+            s0_entries_tagged[s0_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
+            s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
+        ],
+        ignore_index=True,
+    )
     results["strategies"]["S4_Adaptive"] = simulate_portfolio(s4_entries, panel_fwd)
 
     # ─── S4b: Adaptive with S2b bull arm (vr<=0.8, sp>=12) ─────
     print("[S4b] Adaptive(S2b): 牛市追涨(S2b sp>=12) + 熊/震荡均值回复(S3) ...")
     s2b_entries_tagged = s2b_entries.copy()
     s2b_entries_tagged["market"] = s2b_entries_tagged["dt"].map(mkt_map)
-    s4b_entries = pd.concat([
-        s2b_entries_tagged[s2b_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
-        s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
-    ], ignore_index=True)
+    s4b_entries = pd.concat(
+        [
+            s2b_entries_tagged[s2b_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
+            s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
+        ],
+        ignore_index=True,
+    )
     results["strategies"]["S4b_Adaptive_S2b"] = simulate_portfolio(s4b_entries, panel_fwd)
 
     # ─── S4c: Adaptive with S2c bull arm (vr<=0.9, sp>=10) ─────
     print("[S4c] Adaptive(S2c): 牛市追涨(S2c sp>=10) + 熊/震荡均值回复(S3) ...")
     s2c_entries_tagged = s2c_entries.copy()
     s2c_entries_tagged["market"] = s2c_entries_tagged["dt"].map(mkt_map)
-    s4c_entries = pd.concat([
-        s2c_entries_tagged[s2c_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
-        s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
-    ], ignore_index=True)
+    s4c_entries = pd.concat(
+        [
+            s2c_entries_tagged[s2c_entries_tagged["market"] == "bull"][["symbol", "dt", "priority"]],
+            s3_entries_tagged[s3_entries_tagged["market"].isin(["bear", "sideways"])][["symbol", "dt", "priority"]],
+        ],
+        ignore_index=True,
+    )
     results["strategies"]["S4c_Adaptive_S2c"] = simulate_portfolio(s4c_entries, panel_fwd)
 
     # ─── S7 已废弃（2026-07-31）────────────────────────────────
@@ -402,9 +433,7 @@ def main():
     s3_pool["priority"] = s3_pool["priority"] * 1.2
 
     s5_entries = pd.concat([s0_pool, s3_pool], ignore_index=True)
-    results["strategies"]["S5_Combined"] = simulate_portfolio(
-        s5_entries[["symbol", "dt", "priority"]], panel_fwd
-    )
+    results["strategies"]["S5_Combined"] = simulate_portfolio(s5_entries[["symbol", "dt", "priority"]], panel_fwd)
 
     # ─── 全市场对照组 ─────────────────────────────────────────────
     print("[BM] 全市场随机对照 ...")
@@ -431,9 +460,11 @@ def main():
         "S4b_Adaptive_S2b": cap_s4b,
     }
     for cap in [cap_s0, cap_s2b, cap_s4b]:
-        print(f"  {cap['label']}: 利用率={cap.get('avg_utilization_pct', 0)}%, "
-              f"空仓={cap.get('empty_days', 0)}天({cap.get('empty_pct', 0)}%), "
-              f"日均持仓={cap.get('avg_occupied_slots', 0)}槽")
+        print(
+            f"  {cap['label']}: 利用率={cap.get('avg_utilization_pct', 0)}%, "
+            f"空仓={cap.get('empty_days', 0)}天({cap.get('empty_pct', 0)}%), "
+            f"日均持仓={cap.get('avg_occupied_slots', 0)}槽"
+        )
 
     # ─── 输出 ────────────────────────────────────────────────────
     out_path = OUTPUT_DIR / "comprehensive_backtest.json"
@@ -449,7 +480,9 @@ def main():
     print(f"\n全市场基准: fwd_5d={baseline['fwd_5d']}% | fwd_20d={baseline['fwd_20d']}%")
 
     # OOS 对比表
-    print(f"\n{'策略':<20} {'OOS交易数':>10} {'fwd_5d均值':>12} {'fwd_5d净值':>12} {'胜率_5d':>8} {'Sharpe_5d':>10} {'fwd_20d均值':>12} {'fwd_20d净值':>12} {'胜率_20d':>8}")
+    print(
+        f"\n{'策略':<20} {'OOS交易数':>10} {'fwd_5d均值':>12} {'fwd_5d净值':>12} {'胜率_5d':>8} {'Sharpe_5d':>10} {'fwd_20d均值':>12} {'fwd_20d净值':>12} {'胜率_20d':>8}"
+    )
     print("-" * 120)
 
     for name, data in results["strategies"].items():

@@ -15,6 +15,7 @@
   - preempt : S2b 信号到达无空槽时逐出优先级最低的卫星持仓（S8-a，保证 S2b 集合不变）
   - budget  : 核心池/卫星池各自独立槽位，互不干扰（S8-b，S2b 集合天然不变）
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
+from surge_candidates_dump import completed_outcomes
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -49,16 +51,26 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 CAND_PATH = _SCRIPT_DIR / "_output" / "surge_candidates" / "candidates.parquet"
 PANEL_PATH = _SCRIPT_DIR / "_output" / "surge_candidates" / "panel.parquet"
 
-_ENTRY_COLS = ["symbol", "entry_dt", "exit_dt", "score", "ret_gross_pct",
-               "hold_days", "exit_reason", "sig_vol_ratio", "sig_ma_spread_pct", "amount_e"]
+_ENTRY_COLS = [
+    "symbol",
+    "entry_dt",
+    "exit_dt",
+    "score",
+    "ret_gross_pct",
+    "hold_days",
+    "exit_reason",
+    "sig_vol_ratio",
+    "sig_ma_spread_pct",
+    "amount_e",
+]
 
 # 随交易记录透传的元数据列（entry 侧原样带出，便于事后分层）
-_META_COLS = ["exit_dt", "ret_gross_pct", "hold_days", "exit_reason",
-              "sig_vol_ratio", "sig_ma_spread_pct", "amount_e"]
+_META_COLS = ["exit_dt", "ret_gross_pct", "hold_days", "exit_reason", "sig_vol_ratio", "sig_ma_spread_pct", "amount_e"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Data Loading
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def load_context(eval_start=None, eval_end=None, verbose=True):
     """加载候选/面板并建成矩阵。eval_start/eval_end 界定评估窗（含端点）。
@@ -67,7 +79,7 @@ def load_context(eval_start=None, eval_end=None, verbose=True):
     """
     if verbose:
         print("[加载] 数据 ...")
-    cand = pd.read_parquet(CAND_PATH)
+    cand = completed_outcomes(pd.read_parquet(CAND_PATH))
     panel = pd.read_parquet(PANEL_PATH)
     d0 = cand[cand["delay"] == 0].copy()
 
@@ -90,14 +102,22 @@ def load_context(eval_start=None, eval_end=None, verbose=True):
     ret_mx[si, di] = ps["daily_ret"].values
 
     ctx = {
-        "d0": d0, "panel": ps, "symbols": symbols, "dates": dates,
-        "sym2i": sym2i, "dt2i": dt2i, "close_mx": close_mx, "ret_mx": ret_mx,
+        "d0": d0,
+        "panel": ps,
+        "symbols": symbols,
+        "dates": dates,
+        "sym2i": sym2i,
+        "dt2i": dt2i,
+        "close_mx": close_mx,
+        "ret_mx": ret_mx,
     }
     set_eval_window(ctx, eval_start, eval_end)
     if verbose:
         print(f"  候选(d=0): {len(d0)} | 矩阵: {n_sym} symbols × {n_dt} dates")
-        print(f"  评估窗: {str(ctx['eval_dates'][0])[:10]} → {str(ctx['eval_dates'][-1])[:10]}"
-              f" ({len(ctx['eval_dates'])} 日)")
+        print(
+            f"  评估窗: {str(ctx['eval_dates'][0])[:10]} → {str(ctx['eval_dates'][-1])[:10]}"
+            f" ({len(ctx['eval_dates'])} 日)"
+        )
     return ctx
 
 
@@ -122,14 +142,18 @@ def attach_forward_returns(ctx, windows=(5, 20)):
     for w in windows:
         col = f"fwd_{w}d"
         if col not in ps.columns:
-            ps[col] = ps.groupby("symbol")["close"].transform(
-                lambda s, w=w: s.shift(-w) / s - 1) * 100
+            ps[col] = ps.groupby("symbol")["close"].transform(lambda s, w=w: s.shift(-w) / s - 1) * 100
         cols.append(col)
     d0 = ctx["d0"]
     if all(c in d0.columns for c in cols):
         return ctx
-    merged = d0.merge(ps[["symbol", "dt"] + cols], left_on=["symbol", "entry_dt"],
-                      right_on=["symbol", "dt"], how="left", suffixes=("", "_p"))
+    merged = d0.merge(
+        ps[["symbol", "dt"] + cols],
+        left_on=["symbol", "entry_dt"],
+        right_on=["symbol", "dt"],
+        how="left",
+        suffixes=("", "_p"),
+    )
     merged.drop(columns=[c for c in ("dt", "dt_p") if c in merged.columns], inplace=True)
     ctx["d0"] = merged
     return ctx
@@ -138,6 +162,7 @@ def attach_forward_returns(ctx, windows=(5, 20)):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Market Regime
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def build_market_regime(ctx, lag_days=0):
     close_mx, dates = ctx["close_mx"], ctx["dates"]
@@ -157,6 +182,7 @@ def build_market_regime(ctx, lag_days=0):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Gates & Entry Builders
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def gate_mask(df, vr_th, sp_th):
     vr, sp = df["sig_vol_ratio"], df["sig_ma_spread_pct"]
@@ -192,6 +218,7 @@ def build_satellite(d0, s2b_mask, s2c_mask, mkt_map=None, regime=None):
 # Slot Simulator
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _resolve_exit_di(exit_dt, entry_dt, di, ctx, default_days=22):
     """把 exit_dt 解析成日期索引。缺失时回落到 entry_dt + default_days 之后首个交易日。"""
     if exit_dt is None or exit_dt is pd.NaT or (isinstance(exit_dt, float) and np.isnan(exit_dt)):
@@ -204,8 +231,16 @@ def _resolve_exit_di(exit_dt, entry_dt, di, ctx, default_days=22):
     return int(pos) if pos < len(ctx["dates"]) else di + default_days
 
 
-def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=None,
-             cost_pct=TOTAL_COST_PCT, cash_daily=0.0, track_details=True):
+def simulate(
+    entries_df,
+    ctx,
+    policy="passive",
+    n_slots=N_SLOTS,
+    n_sat_slots=None,
+    cost_pct=TOTAL_COST_PCT,
+    cash_daily=0.0,
+    track_details=True,
+):
     """槽位组合模拟。
 
     policy:
@@ -260,14 +295,20 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
             return
         c0, ce = p["entry_price"], close_mx[p["si"], min(exit_di_actual, len(ctx["dates"]) - 1)]
         row = dict(p["meta"])
-        row.update({
-            "symbol": p["symbol"], "entry_dt": p["entry_dt"], "layer": p["layer"],
-            "priority": p["priority"], "preempted": preempted, "still_open": still_open,
-            "actual_exit_dt": ctx["dates"][min(exit_di_actual, len(ctx["dates"]) - 1)],
-            "hold_days_actual": exit_di_actual - p["entry_di"],
-            "close_ret_pct": ((ce / c0) - 1) * 100 if not np.isnan(ce) and c0 > 0 else np.nan,
-            "cost_pct": cost_pct,
-        })
+        row.update(
+            {
+                "symbol": p["symbol"],
+                "entry_dt": p["entry_dt"],
+                "layer": p["layer"],
+                "priority": p["priority"],
+                "preempted": preempted,
+                "still_open": still_open,
+                "actual_exit_dt": ctx["dates"][min(exit_di_actual, len(ctx["dates"]) - 1)],
+                "hold_days_actual": exit_di_actual - p["entry_di"],
+                "close_ret_pct": ((ce / c0) - 1) * 100 if not np.isnan(ce) and c0 > 0 else np.nan,
+                "cost_pct": cost_pct,
+            }
+        )
         row["close_ret_net_pct"] = row["close_ret_pct"] - cost_pct
         trades.append(row)
 
@@ -296,7 +337,7 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
                     cost_sum += sell_frac
             n_empty = cap - len(held[k])
             pool_ret[k] = (ret_sum + n_empty * cash_daily - cost_sum) / cap
-            nav[k] *= (1 + pool_ret[k])
+            nav[k] *= 1 + pool_ret[k]
 
         n_core = sum(1 for k in held for p in held[k] if p["layer"] == LAYER_CORE)
         n_sat = sum(1 for k in held for p in held[k] if p["layer"] != LAYER_CORE)
@@ -304,13 +345,22 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
         if policy == "budget":
             r_blend = (pools["core"] * pool_ret["core"] + pools["sat"] * pool_ret["sat"]) / total_slots
             r_overlay = pool_ret["core"] + pools["sat"] / pools["core"] * pool_ret["sat"]
-            nav_blend *= (1 + r_blend)
-            nav_overlay *= (1 + r_overlay)
-            row.update({"nav": nav_blend, "daily_ret": r_blend,
-                        "nav_blend": nav_blend, "daily_ret_blend": r_blend,
-                        "nav_overlay": nav_overlay, "daily_ret_overlay": r_overlay,
-                        "nav_core": nav["core"], "daily_ret_core": pool_ret["core"],
-                        "nav_sat": nav["sat"], "daily_ret_sat": pool_ret["sat"]})
+            nav_blend *= 1 + r_blend
+            nav_overlay *= 1 + r_overlay
+            row.update(
+                {
+                    "nav": nav_blend,
+                    "daily_ret": r_blend,
+                    "nav_blend": nav_blend,
+                    "daily_ret_blend": r_blend,
+                    "nav_overlay": nav_overlay,
+                    "daily_ret_overlay": r_overlay,
+                    "nav_core": nav["core"],
+                    "daily_ret_core": pool_ret["core"],
+                    "nav_sat": nav["sat"],
+                    "daily_ret_sat": pool_ret["sat"],
+                }
+            )
         else:
             row.update({"nav": nav["main"], "daily_ret": pool_ret["main"]})
         daily.append(row)
@@ -344,8 +394,15 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
                 occupied |= {p["symbol"] for p in held["core"]}
             if sym in occupied:
                 if track_details:
-                    rejected.append({"symbol": sym, "dt": dt, "layer": layer,
-                                     "priority": ent["priority"], "reason": "symbol_occupied"})
+                    rejected.append(
+                        {
+                            "symbol": sym,
+                            "dt": dt,
+                            "layer": layer,
+                            "priority": ent["priority"],
+                            "reason": "symbol_occupied",
+                        }
+                    )
                 continue
 
             if len(held[k]) >= pools[k]:
@@ -360,17 +417,32 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
                         evicted = True
                 if not evicted:
                     if track_details:
-                        rejected.append({"symbol": sym, "dt": dt, "layer": layer,
-                                         "priority": ent["priority"], "reason": "slot_full"})
+                        rejected.append(
+                            {
+                                "symbol": sym,
+                                "dt": dt,
+                                "layer": layer,
+                                "priority": ent["priority"],
+                                "reason": "slot_full",
+                            }
+                        )
                     continue
 
             exit_di = _resolve_exit_di(ent.get("exit_dt"), dt, di, ctx)
             meta = {c: ent.get(c, np.nan) for c in _META_COLS if c in ent.index}
-            held[k].append({
-                "symbol": sym, "si": si, "entry_dt": dt, "entry_di": di,
-                "entry_price": c, "exit_di": exit_di, "layer": layer,
-                "priority": ent["priority"], "meta": meta,
-            })
+            held[k].append(
+                {
+                    "symbol": sym,
+                    "si": si,
+                    "entry_dt": dt,
+                    "entry_di": di,
+                    "entry_price": c,
+                    "exit_di": exit_di,
+                    "layer": layer,
+                    "priority": ent["priority"],
+                    "meta": meta,
+                }
+            )
             pending_cost[k] += buy_frac
 
     # 评估窗末仍持有的仓位也要记一笔（否则 trades 数与入场数不一致）
@@ -381,16 +453,24 @@ def simulate(entries_df, ctx, policy="passive", n_slots=N_SLOTS, n_sat_slots=Non
 
     nav_df = pd.DataFrame(daily)
     if nav_df.empty:
-        nav_df = pd.DataFrame({"dt": eval_dates, "nav": 1.0, "daily_ret": 0.0,
-                               "n_pos": 0, "n_core": 0, "n_satellite": 0})
-    return {"trades": trades, "rejected": rejected, "nav": nav_df,
-            "policy": policy, "n_slots": n_slots, "n_sat_slots": n_sat_slots,
-            "total_slots": total_slots}
+        nav_df = pd.DataFrame(
+            {"dt": eval_dates, "nav": 1.0, "daily_ret": 0.0, "n_pos": 0, "n_core": 0, "n_satellite": 0}
+        )
+    return {
+        "trades": trades,
+        "rejected": rejected,
+        "nav": nav_df,
+        "policy": policy,
+        "n_slots": n_slots,
+        "n_sat_slots": n_sat_slots,
+        "total_slots": total_slots,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Risk Metrics
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def compute_metrics(nav_df, label="", rf_daily=0.0, slots=N_SLOTS, ret_col="daily_ret"):
     rets = nav_df[ret_col].values
@@ -438,11 +518,16 @@ def compute_metrics(nav_df, label="", rf_daily=0.0, slots=N_SLOTS, ret_col="dail
 
     avg_pos = nav_df["n_pos"].mean() if "n_pos" in nav_df.columns else np.nan
     return {
-        "label": label, "n_days": n,
+        "label": label,
+        "n_days": n,
         "total_ret_pct": round((nav[-1] - 1) * 100, 2),
-        "cagr_pct": round(cagr, 2), "ann_vol_pct": round(ann_vol, 2),
-        "sharpe": round(sharpe, 3), "sortino": round(sortino, 3), "calmar": round(calmar, 3),
-        "max_dd_pct": round(max_dd, 2), "max_dd_duration_days": int(max_dd_dur),
+        "cagr_pct": round(cagr, 2),
+        "ann_vol_pct": round(ann_vol, 2),
+        "sharpe": round(sharpe, 3),
+        "sortino": round(sortino, 3),
+        "calmar": round(calmar, 3),
+        "max_dd_pct": round(max_dd, 2),
+        "max_dd_duration_days": int(max_dd_dur),
         "var_95_pct": round(q5 * 100, 3),
         "cvar_95_pct": round(tail.mean() * 100, 3) if len(tail) else 0.0,
         "worst_day_pct": round(rets.min() * 100, 3),
@@ -459,6 +544,7 @@ def compute_metrics(nav_df, label="", rf_daily=0.0, slots=N_SLOTS, ret_col="dail
 # ═══════════════════════════════════════════════════════════════════════════════
 # Statistics
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def newey_west_tstat(x, lags=None):
     """H0: mean(x)=0，HAC(Newey-West) 稳健 t。lags 默认 floor(4*(n/100)^(2/9))。"""
@@ -478,9 +564,14 @@ def newey_west_tstat(x, lags=None):
     var = max(var, 1e-18)
     se = np.sqrt(var / n)
     t = x.mean() / se
-    return {"mean": float(x.mean()), "t_stat": round(float(t), 3), "n": n, "hac_lags": int(lags),
-            "p_value": round(float(2 * (1 - sp_stats.norm.cdf(abs(t)))), 4),
-            "p_value_one_sided": round(float(1 - sp_stats.norm.cdf(t)), 4)}
+    return {
+        "mean": float(x.mean()),
+        "t_stat": round(float(t), 3),
+        "n": n,
+        "hac_lags": int(lags),
+        "p_value": round(float(2 * (1 - sp_stats.norm.cdf(abs(t)))), 4),
+        "p_value_one_sided": round(float(1 - sp_stats.norm.cdf(t)), 4),
+    }
 
 
 def _stationary_bootstrap_idx(n, n_boot, block_len, rng):
@@ -507,11 +598,15 @@ def block_bootstrap_mean(x, n_boot=10000, block_len=10, seed=42, alpha=0.05):
     rng = np.random.default_rng(seed)
     idx = _stationary_bootstrap_idx(n, n_boot, block_len, rng)
     means = x[idx].mean(axis=1)
-    return {"mean": round(float(x.mean()), 6),
-            "ci_lo": round(float(np.percentile(means, 100 * alpha / 2)), 6),
-            "ci_hi": round(float(np.percentile(means, 100 * (1 - alpha / 2))), 6),
-            "p_boot_le_zero": round(float((means <= 0).mean()), 4),
-            "n": n, "n_boot": n_boot, "block_len": block_len}
+    return {
+        "mean": round(float(x.mean()), 6),
+        "ci_lo": round(float(np.percentile(means, 100 * alpha / 2)), 6),
+        "ci_hi": round(float(np.percentile(means, 100 * (1 - alpha / 2))), 6),
+        "p_boot_le_zero": round(float((means <= 0).mean()), 4),
+        "n": n,
+        "n_boot": n_boot,
+        "block_len": block_len,
+    }
 
 
 def block_bootstrap_sharpe_diff(ra, rb, n_boot=10000, block_len=10, seed=42, alpha=0.05):
@@ -533,11 +628,17 @@ def block_bootstrap_sharpe_diff(ra, rb, n_boot=10000, block_len=10, seed=42, alp
     diffs = _sr(ra[idx]) - _sr(rb[idx])
     diffs = diffs[~np.isnan(diffs)]
     obs = float(_sr(ra) - _sr(rb))
-    return {"diff": round(obs, 4), "sharpe_a": round(float(_sr(ra)), 4), "sharpe_b": round(float(_sr(rb)), 4),
-            "ci_lo": round(float(np.percentile(diffs, 100 * alpha / 2)), 4),
-            "ci_hi": round(float(np.percentile(diffs, 100 * (1 - alpha / 2))), 4),
-            "p_boot_le_zero": round(float((diffs <= 0).mean()), 4),
-            "n": n, "n_boot": n_boot, "block_len": block_len}
+    return {
+        "diff": round(obs, 4),
+        "sharpe_a": round(float(_sr(ra)), 4),
+        "sharpe_b": round(float(_sr(rb)), 4),
+        "ci_lo": round(float(np.percentile(diffs, 100 * alpha / 2)), 4),
+        "ci_hi": round(float(np.percentile(diffs, 100 * (1 - alpha / 2))), 4),
+        "p_boot_le_zero": round(float((diffs <= 0).mean()), 4),
+        "n": n,
+        "n_boot": n_boot,
+        "block_len": block_len,
+    }
 
 
 def jkm_sharpe_test(ra, rb):
@@ -557,17 +658,20 @@ def jkm_sharpe_test(ra, rb):
         return {"n": n, "error": "zero variance"}
     sr_a, sr_b = ra.mean() / sa, rb.mean() / sb
     rho = float(np.corrcoef(ra, rb)[0, 1])
-    var = (1 / n) * (2 * (1 - rho) + 0.5 * (sr_a ** 2 + sr_b ** 2 - 2 * sr_a * sr_b * rho ** 2))
+    var = (1 / n) * (2 * (1 - rho) + 0.5 * (sr_a**2 + sr_b**2 - 2 * sr_a * sr_b * rho**2))
     if var <= 0:
         return {"n": n, "error": "non-positive variance"}
     z = (sr_a - sr_b) / np.sqrt(var)
-    return {"n": n, "rho": round(rho, 4),
-            "sharpe_a_ann": round(sr_a * np.sqrt(ANN_DAYS), 4),
-            "sharpe_b_ann": round(sr_b * np.sqrt(ANN_DAYS), 4),
-            "diff_ann": round((sr_a - sr_b) * np.sqrt(ANN_DAYS), 4),
-            "z_stat": round(float(z), 3),
-            "p_value_one_sided": round(float(1 - sp_stats.norm.cdf(z)), 4),
-            "p_value_two_sided": round(float(2 * (1 - sp_stats.norm.cdf(abs(z)))), 4)}
+    return {
+        "n": n,
+        "rho": round(rho, 4),
+        "sharpe_a_ann": round(sr_a * np.sqrt(ANN_DAYS), 4),
+        "sharpe_b_ann": round(sr_b * np.sqrt(ANN_DAYS), 4),
+        "diff_ann": round((sr_a - sr_b) * np.sqrt(ANN_DAYS), 4),
+        "z_stat": round(float(z), 3),
+        "p_value_one_sided": round(float(1 - sp_stats.norm.cdf(z)), 4),
+        "p_value_two_sided": round(float(2 * (1 - sp_stats.norm.cdf(abs(z)))), 4),
+    }
 
 
 _EULER = 0.5772156649015329
@@ -595,22 +699,32 @@ def deflated_sharpe(sharpe_ann, n_trials, n_obs, skew=0.0, kurt_excess=0.0, lega
     nrm = sp_stats.norm
     if legacy:
         e_max = nrm.ppf(1 - 1 / n_trials) if n_trials > 1 else 0.0
-        se = np.sqrt((1 - skew * sharpe_ann + (kurt_excess - 1) / 4 * sharpe_ann ** 2) / n_obs)
+        se = np.sqrt((1 - skew * sharpe_ann + (kurt_excess - 1) / 4 * sharpe_ann**2) / n_obs)
         if se == 0:
             return {"dsr": 0.0, "p_value": 1.0}
         z = (sharpe_ann - e_max) / se
-        return {"dsr": round(float(z), 3), "p_value": round(float(1 - nrm.cdf(z)), 4),
-                "e_max_sharpe": round(float(e_max), 3), "sharpe_obs": round(sharpe_ann, 3),
-                "n_trials": int(n_trials), "legacy": True}
+        return {
+            "dsr": round(float(z), 3),
+            "p_value": round(float(1 - nrm.cdf(z)), 4),
+            "e_max_sharpe": round(float(e_max), 3),
+            "sharpe_obs": round(sharpe_ann, 3),
+            "n_trials": int(n_trials),
+            "legacy": True,
+        }
 
     sr_d = sharpe_ann / np.sqrt(ANN_DAYS)
     kurt = kurt_excess + 3.0
-    se = np.sqrt(max((1 - skew * sr_d + (kurt - 1) / 4 * sr_d ** 2) / (n_obs - 1), 1e-24))
-    e_max_d = expected_max_sharpe(n_trials, var_sr_daily=se ** 2)
+    se = np.sqrt(max((1 - skew * sr_d + (kurt - 1) / 4 * sr_d**2) / (n_obs - 1), 1e-24))
+    e_max_d = expected_max_sharpe(n_trials, var_sr_daily=se**2)
     z = (sr_d - e_max_d) / se
-    return {"dsr": round(float(z), 3), "p_value": round(float(1 - nrm.cdf(z)), 4),
-            "sharpe_obs_ann": round(sharpe_ann, 3),
-            "hurdle_sharpe_ann": round(float(e_max_d * np.sqrt(ANN_DAYS)), 3),
-            "se_daily": round(float(se), 6), "n_trials": int(n_trials), "n_obs": int(n_obs),
-            "passed": bool(z > sp_stats.norm.ppf(0.95)), "legacy": False}
-
+    return {
+        "dsr": round(float(z), 3),
+        "p_value": round(float(1 - nrm.cdf(z)), 4),
+        "sharpe_obs_ann": round(sharpe_ann, 3),
+        "hurdle_sharpe_ann": round(float(e_max_d * np.sqrt(ANN_DAYS)), 3),
+        "se_daily": round(float(se), 6),
+        "n_trials": int(n_trials),
+        "n_obs": int(n_obs),
+        "passed": bool(z > sp_stats.norm.ppf(0.95)),
+        "legacy": False,
+    }

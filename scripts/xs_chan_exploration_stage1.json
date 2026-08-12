@@ -1,0 +1,178 @@
+{
+  "study_id": "xs_chan_exploration_stage1_20260727",
+  "mode": "EXPLORATORY_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "revision_history": [
+    {
+      "revision": 2,
+      "date": "2026-07-27",
+      "reason": "Completion audit found that forward 20-session maximum drawdown had been misclassified as a decision-time failure feature and event rows had been passed to a weekly HAC statistic. Attempt 001 is retained as invalid; revision 2 separates feature timing and requires weekly state-return aggregation."
+    }
+  ],
+  "claim_boundary": [
+    "historical_descriptive_attribution_only",
+    "hypothesis_generation_only",
+    "no_alpha_confirmation",
+    "no_live_trading_authorization"
+  ],
+  "frozen_baseline": {
+    "git_commit": "7d1f3ce",
+    "protocol_id": "xs_chan_pilot_v2_1_preregistered_20260720",
+    "protocol_path": "scripts/xs_chan_protocol_v2_1.json",
+    "protocol_physical_sha256": "c05d249e1cf94edf741f097d375a26fad84657812ea1af2447b8431c66dd5c9e",
+    "protocol_canonical_sha256": "8501bdd242cdd961b13cb4688cc7e2fd6d621342f85039a3223a18c4579ea203",
+    "protocol_document_path": "scripts/XS_CHAN_PILOT_PROTOCOL_V2_1.md",
+    "protocol_document_sha256": "9d712eb6767ccf9f35f0f5b26acedfdd9feccd42ce33b73d8f0377fa5dfb2882",
+    "required_protocol_status": "LOCKED_PENDING_ENGINEERING_AND_FORWARD_DATA"
+  },
+  "sample": {
+    "start_date": "2022-01-01",
+    "end_date": "2026-07-08",
+    "decision_frequency": "last_observed_market_session_per_W_FRI_week",
+    "entry": "next_global_market_session_open",
+    "primary_holding_sessions": 5,
+    "diagnostic_holding_sessions": 20,
+    "signal_delays_sessions": [
+      0,
+      1,
+      3,
+      5
+    ],
+    "minimum_complete_decision_weeks": 150
+  },
+  "selection": {
+    "target_size": 50,
+    "retention_max_rank": 75,
+    "cash_buffer": 0.005,
+    "min_market_sessions_since_listing": 250,
+    "min_valid_sessions_60": 57,
+    "min_adv20_thousand_cny": 50000.0,
+    "exclude_boards": [
+      "STAR",
+      "BSE"
+    ],
+    "exclude_active_st": true,
+    "allowed_chan_regimes": [
+      5,
+      6,
+      7,
+      8
+    ],
+    "factor_weights": {
+      "mom_120_20": 0.5,
+      "lowvol_60": 0.5
+    },
+    "winsor_limits": [
+      0.01,
+      0.99
+    ],
+    "neutralization": "weekly_ols_industry_plus_standardized_log_free_float_mcap",
+    "slot_capital_cny": 199000.0,
+    "adv_participation_limit": 0.05
+  },
+  "attribution": {
+    "model": "weekly_cross_sectional_ols",
+    "response": "next_open_to_open_5_global_market_session_return",
+    "components": [
+      "market",
+      "size",
+      "industry",
+      "low_volatility",
+      "momentum",
+      "unexplained_residual"
+    ],
+    "numeric_exposures": [
+      "log_free_float_mcap",
+      "lowvol_60",
+      "mom_120_20"
+    ],
+    "industry_classification": "SW2021_L1_effective_dated",
+    "summary_hac_lag": 4
+  },
+  "failure_profile": {
+    "population": "weekly_buffered_factor_pool",
+    "primary_failure": "tradable_and_fwd_5d_open_return_lte_zero",
+    "secondary_failure": "tradable_and_fwd_5d_open_return_in_bottom_quintile_within_decision_week",
+    "split_date": "2024-01-01",
+    "decision_time_numeric_features": [
+      "factor_score",
+      "factor_rank",
+      "mom_120_20",
+      "lowvol_60",
+      "log_free_float_mcap",
+      "adv20",
+      "turnover_rate",
+      "volume_ratio",
+      "pe_ttm",
+      "pb",
+      "distance_to_sma20"
+    ],
+    "execution_time_numeric_features": [
+      "entry_gap"
+    ],
+    "outcome_diagnostics": [
+      "fwd_20d_max_drawdown"
+    ],
+    "categorical_features": [
+      "regime",
+      "industry_code",
+      "board"
+    ]
+  },
+  "negative_controls": {
+    "random_seed_root": 20260727,
+    "random_repetitions": 100,
+    "state_randomization": "permute_gate_identity_within_decision_week_preserving_weekly_gate_count",
+    "industry_size_matched_random": "sample_same_week_industry_and_mcap_quintile_excluding_actual_identity",
+    "signal_delay_sessions": [
+      0,
+      1,
+      3,
+      5
+    ],
+    "simple_trend_gate": "adjusted_close_gt_sma20"
+  },
+  "no_tuning": {
+    "parameter_search": false,
+    "threshold_optimization": false,
+    "best_variant_selection": false,
+    "failed_experiment_suppression": false,
+    "all_planned_experiments_must_be_registered": true,
+    "all_runtime_failures_must_be_registered": true,
+    "results_may_only_generate_new_hypotheses": true
+  },
+  "planned_experiments": [
+    {
+      "id": "E01_RISK_ATTRIBUTION",
+      "deliverable": "market_size_industry_volatility_momentum_attribution"
+    },
+    {
+      "id": "E02_STATE_5_8_DIAGNOSTICS",
+      "deliverable": "coverage_return_drawdown_turnover_tradability_by_state"
+    },
+    {
+      "id": "E03_LOW_RETURN_PROFILE",
+      "deliverable": "loss_vs_profit_numeric_and_categorical_profiles"
+    },
+    {
+      "id": "E04_STATE_RANDOMIZATION",
+      "deliverable": "weekly_quota_preserving_state_identity_null"
+    },
+    {
+      "id": "E05_INDUSTRY_SIZE_MATCHED_RANDOM",
+      "deliverable": "industry_size_matched_identity_null"
+    },
+    {
+      "id": "E06_SIGNAL_DELAY",
+      "deliverable": "fixed_delay_decay_table"
+    },
+    {
+      "id": "E07_SIMPLE_TREND_GATE",
+      "deliverable": "chan_vs_sma20_descriptive_comparison"
+    },
+    {
+      "id": "E08_NEXT_HYPOTHESES",
+      "deliverable": "three_falsifiable_hypotheses"
+    }
+  ]
+}

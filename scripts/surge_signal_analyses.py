@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 import trend_regime as tr
+from surge_candidates_dump import completed_outcomes
 
 CAND_DIR = Path(__file__).resolve().parent / "_output" / "surge_candidates"
 BUY_COST, SELL_COST = 0.0015, 0.0025
@@ -105,7 +106,7 @@ def gate_sensitivity(cand: pd.DataFrame):
 
 
 def main():
-    cand = pd.read_parquet(CAND_DIR / "candidates.parquet")
+    cand = completed_outcomes(pd.read_parquet(CAND_DIR / "candidates.parquet"))
     freshness_decay(cand)
     gate_sensitivity(cand)
 

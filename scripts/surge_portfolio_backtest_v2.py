@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from surge_candidates_dump import completed_outcomes
 
 from czsc._native.trend_regime import (
     py_classify_gate_level as classify_gate_level,
@@ -133,8 +134,7 @@ def gated_candidates(cand: pd.DataFrame, mode: str, st_intervals: dict) -> pd.Da
     df["gate_confidence"] = [g[1] for g in gate_info]
 
     df["priority"] = [
-        priority_score(s, sl, 0, rg)
-        for s, sl, rg in zip(df["score"], df["sl_pct"], df["dec_regime"], strict=False)
+        priority_score(s, sl, 0, rg) for s, sl, rg in zip(df["score"], df["sl_pct"], df["dec_regime"], strict=False)
     ]
     df["ret_net_pct"] = ((1 + df["ret_gross_pct"] / 100) * (1 - SELL_COST) / (1 + BUY_COST) - 1) * 100
     return df.sort_values(["entry_dt", "priority"], ascending=[True, False]).reset_index(drop=True)
@@ -158,26 +158,28 @@ def _to_candidate_dicts(df: pd.DataFrame) -> list[dict]:
     year = df["year"].values.astype(int) if "year" in df.columns else np.zeros(len(df), dtype=int)
 
     for i in range(len(df)):
-        records.append({
-            "symbol": syms[i],
-            "entry_dt": entry_dts[i],
-            "exit_dt": exit_dts[i],
-            "entry_price": entry_px[i],
-            "exit_price": exit_px[i],
-            "gate_level": gate_lvl[i],
-            "gate_confidence": gate_conf[i],
-            "priority": priorities[i],
-            "ret_gross_pct": ret_gross[i],
-            "hold_days": int(hold[i]),
-            "seg": seg[i],
-            "year": int(year[i]),
-        })
+        records.append(
+            {
+                "symbol": syms[i],
+                "entry_dt": entry_dts[i],
+                "exit_dt": exit_dts[i],
+                "entry_price": entry_px[i],
+                "exit_price": exit_px[i],
+                "gate_level": gate_lvl[i],
+                "gate_confidence": gate_conf[i],
+                "priority": priorities[i],
+                "ret_gross_pct": ret_gross[i],
+                "hold_days": int(hold[i]),
+                "seg": seg[i],
+                "year": int(year[i]),
+            }
+        )
     return records
 
 
 def main():
     t0 = time.time()
-    cand = pd.read_parquet(CAND_DIR / "candidates.parquet")
+    cand = completed_outcomes(pd.read_parquet(CAND_DIR / "candidates.parquet"))
     print(f"[候选] {len(cand)} 行（含全部 delay）")
     st_intervals = load_st_intervals()
 
@@ -203,9 +205,12 @@ def main():
                 print(f"\n  [{mode}|{fill_mode}|{tag}] Rust simulate_surge_backtest...")
                 t_bt = time.time()
                 result = simulate_surge_backtest(
-                    cand_dicts, panel_path,
-                    n_slots=n_slots, fill_mode=fill_mode,
-                    buy_cost=BUY_COST, sell_cost=SELL_COST,
+                    cand_dicts,
+                    panel_path,
+                    n_slots=n_slots,
+                    fill_mode=fill_mode,
+                    buy_cost=BUY_COST,
+                    sell_cost=SELL_COST,
                     train_end_year=TRAIN_END_YEAR,
                 )
                 elapsed = time.time() - t_bt
@@ -217,10 +222,12 @@ def main():
                     label = seg["label"]
                     c = seg["curve"]
                     p = seg["pair"]
-                    print(f"  {label}: 年化{c['annual_return_pct']:.1f}% 夏普{c['sharpe']:.2f} "
-                          f"回撤{c['max_drawdown_pct']:.1f}% 卡玛{c['calmar']:.2f} | "
-                          f"胜率{p['win_rate_pct']:.1f}% 盈亏比{p['profit_loss_ratio']:.2f} "
-                          f"净均值{p['net_mean_pct']:.2f}%")
+                    print(
+                        f"  {label}: 年化{c['annual_return_pct']:.1f}% 夏普{c['sharpe']:.2f} "
+                        f"回撤{c['max_drawdown_pct']:.1f}% 卡玛{c['calmar']:.2f} | "
+                        f"胜率{p['win_rate_pct']:.1f}% 盈亏比{p['profit_loss_ratio']:.2f} "
+                        f"净均值{p['net_mean_pct']:.2f}%"
+                    )
 
                 key = f"{fill_mode}_{tag}"
                 summary.setdefault(mode, {})
@@ -232,9 +239,7 @@ def main():
                 # Save trades
                 if result["trades"]:
                     trades_df = pd.DataFrame(result["trades"])
-                    trades_df.to_parquet(
-                        OUTPUT_DIR / f"trades_{mode}_{fill_mode}_{tag}.parquet", index=False
-                    )
+                    trades_df.to_parquet(OUTPUT_DIR / f"trades_{mode}_{fill_mode}_{tag}.parquet", index=False)
 
                 # Beta stripping (only for first slot count, strict mode)
                 if n_slots == SLOT_COUNTS[0] and fill_mode == "strict" and result["trades"]:
@@ -242,11 +247,15 @@ def main():
                     excess = compute_surge_excess(
                         result["trades"],
                         panel_path,
-                        k=CONTROL_K, min_valid=CONTROL_MIN_VALID, seed=RNG_SEED,
+                        k=CONTROL_K,
+                        min_valid=CONTROL_MIN_VALID,
+                        seed=RNG_SEED,
                     )
                     for seg in excess["segments"]:
-                        print(f"  {seg['label']}: n={seg['n']} 超额均值{seg['excess_mean_pct']:.2f}% "
-                              f"t={seg['t_stat']:.2f} 正比{seg['positive_rate_pct']:.1f}%")
+                        print(
+                            f"  {seg['label']}: n={seg['n']} 超额均值{seg['excess_mean_pct']:.2f}% "
+                            f"t={seg['t_stat']:.2f} 正比{seg['positive_rate_pct']:.1f}%"
+                        )
                     print(f"  [判定] {excess['verdict']}")
                     summary[mode][f"{fill_mode}_{tag}_excess"] = excess["segments"]
                     summary[mode][f"{fill_mode}_{tag}_verdict"] = excess["verdict"]

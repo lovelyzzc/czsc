@@ -1,0 +1,13 @@
+{
+  "capture_script_sha256": "55031619841cb7f33eb186029c2d00583e1faa1de5294f3b43319dceed285596",
+  "captured_at_utc": "2026-08-12T08:26:04.787760Z",
+  "ledger_id": "1e3c1a5bdf0845b8ed1407b5b9f319999316f0bd61af0e3752ff884baf4b5930",
+  "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "protocol_sha256": "9d317c6c9696c891ffed6588b99f0d355eaec0c7372a55361a4d267de9fb7161",
+  "record_hash": "71fa3da21f2346134b329e431bb6737574228a93504eb275e0f2d2bf46ca97c8",
+  "record_type": "genesis",
+  "required_follow_up": "commit_and_push_this_unique_anchor_before_the_next_official_session_open",
+  "schema": "surge_delay5_forward_capture_head_anchor_v1",
+  "sequence": 0,
+  "session": null
+}

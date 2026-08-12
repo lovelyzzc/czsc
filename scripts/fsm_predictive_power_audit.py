@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
+from surge_candidates_dump import completed_outcomes
 
 RAW_DIR = os.path.expanduser("~/.ts_data_cache/a_stock_daily_qfq")
 CANDIDATES_PATH = "scripts/_output/surge_candidates/candidates.parquet"
@@ -47,6 +48,7 @@ REGIME_NAMES = {
 
 # ─── Step 0: generate state cache ──────────────────────────────
 
+
 def step0_build_state_cache() -> dict:
     """Build full-market daily regime cache via Rust parallel projector."""
     if STATES_PATH.exists():
@@ -69,6 +71,7 @@ def step0_build_state_cache() -> dict:
 
 # ─── helpers ────────────────────────────────────────────────────
 
+
 def _load_panel_pd() -> pd.DataFrame:
     return pd.read_parquet(PANEL_PATH)
 
@@ -78,7 +81,7 @@ def _load_states_pd() -> pd.DataFrame:
 
 
 def _load_candidates_pd() -> pd.DataFrame:
-    return pd.read_parquet(CANDIDATES_PATH)
+    return completed_outcomes(pd.read_parquet(CANDIDATES_PATH))
 
 
 def _ttest_vs_pop(sample: np.ndarray, pop_mean: float) -> dict:
@@ -111,6 +114,7 @@ def _welch_ttest(a: np.ndarray, b: np.ndarray) -> dict:
 
 # ─── Test 1: regime conditional returns ─────────────────────────
 
+
 def test1_regime_returns() -> dict:
     """FSM regime conditional forward return distributions."""
     print("[Test 1] Loading state cache + panel ...")
@@ -124,9 +128,7 @@ def test1_regime_returns() -> dict:
     merged.sort_values(["symbol", "dt"], inplace=True)
 
     for w in FWD_WINDOWS:
-        merged[f"fwd_{w}d"] = merged.groupby("symbol")["close"].transform(
-            lambda s: s.shift(-w) / s - 1
-        )
+        merged[f"fwd_{w}d"] = merged.groupby("symbol")["close"].transform(lambda s: s.shift(-w) / s - 1)
 
     pop_means = {}
     for w in FWD_WINDOWS:
@@ -183,6 +185,7 @@ def test1_regime_returns() -> dict:
 
 # ─── Test 2: gate incremental predictive power ──────────────────
 
+
 def test2_gate_incremental() -> dict:
     """Gate conditions' incremental power after controlling for FSM regime."""
     print("[Test 2] Loading candidates ...")
@@ -220,16 +223,10 @@ def test2_gate_incremental() -> dict:
         results[feat] = {"groups": groups, "total_n": len(valid)}
 
     gate_pass = uptrend[
-        (uptrend["sig_vol_ratio"] >= 1.2)
-        & (uptrend["sig_ma_spread_pct"] >= 3.0)
-        & (uptrend["sig_above_zg"] == 1.0)
+        (uptrend["sig_vol_ratio"] >= 1.2) & (uptrend["sig_ma_spread_pct"] >= 3.0) & (uptrend["sig_above_zg"] == 1.0)
     ]
     gate_fail = uptrend[
-        ~(
-            (uptrend["sig_vol_ratio"] >= 1.2)
-            & (uptrend["sig_ma_spread_pct"] >= 3.0)
-            & (uptrend["sig_above_zg"] == 1.0)
-        )
+        ~((uptrend["sig_vol_ratio"] >= 1.2) & (uptrend["sig_ma_spread_pct"] >= 3.0) & (uptrend["sig_above_zg"] == 1.0))
     ]
     results["gate_pass_vs_fail"] = _welch_ttest(
         gate_pass["ret_gross_pct"].dropna().values,
@@ -244,6 +241,7 @@ def test2_gate_incremental() -> dict:
 
 
 # ─── Test 3: event study (CAR) ──────────────────────────────────
+
 
 def test3_event_study() -> dict:
     """CAR event study around surge_onset trigger, [-20, +40] window."""
@@ -330,6 +328,7 @@ def test3_event_study() -> dict:
 
 # ─── Test 4: market state interaction ────────────────────────────
 
+
 def test4_market_interaction() -> dict:
     """FSM predictive power conditioned on bull/bear/sideways market regimes."""
     print("[Test 4] Loading data ...")
@@ -399,6 +398,7 @@ def test4_market_interaction() -> dict:
 
 # ─── Summary ────────────────────────────────────────────────────
 
+
 def summarize(t1: dict, t2: dict, t3: dict, t4: dict) -> dict:
     """Generate audit summary with key conclusions."""
     verdicts = []
@@ -436,11 +436,11 @@ def summarize(t1: dict, t2: dict, t3: dict, t4: dict) -> dict:
         post = car_data.get("post_event_drift")
         if pre is not None and post is not None:
             if pre > 0.01:
-                verdicts.append(f"[{mode}] Pre-event CAR drift = {pre*100:.2f}% → signal lags (price-in)")
+                verdicts.append(f"[{mode}] Pre-event CAR drift = {pre * 100:.2f}% → signal lags (price-in)")
             if post > 0.01:
-                verdicts.append(f"[{mode}] Post-event CAR drift = {post*100:.2f}% → residual alpha")
+                verdicts.append(f"[{mode}] Post-event CAR drift = {post * 100:.2f}% → residual alpha")
             elif post <= 0:
-                verdicts.append(f"[{mode}] Post-event CAR drift = {post*100:.2f}% → no forward value")
+                verdicts.append(f"[{mode}] Post-event CAR drift = {post * 100:.2f}% → no forward value")
 
     only_bull = True
     for mkt in ["bear", "sideways"]:
@@ -458,9 +458,9 @@ def summarize(t1: dict, t2: dict, t3: dict, t4: dict) -> dict:
     out_path = OUTPUT_DIR / "audit_summary.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2, default=str, ensure_ascii=False)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("AUDIT SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for v in verdicts:
         print(f"  • {v}")
     print(f"\nSaved to {out_path}")
@@ -468,6 +468,7 @@ def summarize(t1: dict, t2: dict, t3: dict, t4: dict) -> dict:
 
 
 # ─── main ────────────────────────────────────────────────────────
+
 
 def _load_or_run_json(path: Path, fn):
     """Load cached JSON result or run function and cache."""

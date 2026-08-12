@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import surge_portfolio_backtest as spb
+from surge_candidates_dump import completed_outcomes
 
 CAND_DIR = Path(__file__).resolve().parent / "_output" / "surge_candidates"
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output" / "surge_market_state_filter"
@@ -376,7 +377,7 @@ def main() -> None:
     market = load_market_state()
     market.to_parquet(OUTPUT_DIR / "market_state.parquet", index=False)
 
-    cand = pd.read_parquet(CAND_DIR / "candidates.parquet")
+    cand = completed_outcomes(pd.read_parquet(CAND_DIR / "candidates.parquet"))
     st_intervals = spb.load_st_intervals()
     sampler = StableControlSampler()
 

@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import trend_regime as tr
+from surge_candidates_dump import completed_outcomes
 
 CAND_DIR = Path(__file__).resolve().parent / "_output" / "surge_candidates"
 OUTPUT_DIR = Path(__file__).resolve().parent / "_output" / "surge_portfolio"
@@ -269,7 +270,7 @@ def excess_report(trades: pd.DataFrame, sampler: ControlSampler) -> pd.DataFrame
 # --------------------------------------------------------------------------- #
 def main():
     t0 = time.time()
-    cand = pd.read_parquet(CAND_DIR / "candidates.parquet")
+    cand = completed_outcomes(pd.read_parquet(CAND_DIR / "candidates.parquet"))
     print(f"[候选] {len(cand)} 行（含全部 delay）")
     st_intervals = load_st_intervals()
     sampler = ControlSampler()

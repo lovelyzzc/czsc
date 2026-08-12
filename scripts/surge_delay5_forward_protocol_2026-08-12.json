@@ -1,0 +1,173 @@
+{
+  "schema": "surge_delay5_forward_protocol_v1",
+  "frozen_at_utc": "2026-08-12T08:25:35Z",
+  "genesis_source_cutoff_inclusive": "2026-08-11",
+  "decision_cutoff_inclusive": "2026-08-12",
+  "independence_rule": "only dec_dt strictly after the cutoff; no pre-cutoff trade can enter",
+  "accrual": {
+    "start": "first observed official A-share session strictly after decision_cutoff_inclusive",
+    "sessions": 60,
+    "enrollment": "all production delay5 decisions in the first 60 post-freeze sessions",
+    "close": "after the 60th post-freeze session and strict-next-session fill observability"
+  },
+  "production_rules": {
+    "raw": "anticipate structural onset, decision delay=5, decision regime in [5, 6, 7, 8]",
+    "gate": "signal-day sig_vol_ratio<=0.8, sig_ma_spread_pct>=3.0, sig_ret20>=8.0; above_zg unused",
+    "hard": "decision amount_e>=1.0 and 8.0<=sl_pct<=20.0",
+    "st": "non-ST on decision date according to required local namechange intervals",
+    "market": "decision high20_ratio>0.12 and ew_index_above_ma20>0",
+    "fill": "finite panel open on the strict next market session and gap_pct < limit_pct - 0.3pct",
+    "mature": "60th common market session from entry is present; no FULL outcome field is read"
+  },
+  "matching": {
+    "name": "pit_exact_industry_mcap2_conditional_entropy_v1",
+    "industry": "same frozen annual industry; missing treated industry is unsupported",
+    "candidate_pool": "all controls with complete frozen causal balance features inside the inclusive exact point-in-time circ_mv caliper",
+    "caliper_ratio": 2.0,
+    "min_controls": 5,
+    "weighting": "conditional entropy tilting with one all-scope and one 2024plus-scope coefficient per balance feature; weights normalize to one within each treated trade",
+    "solver": {
+      "method": "scipy.optimize.least_squares",
+      "max_nfev": 2000,
+      "parameter_bounds": [
+        -50.0,
+        50.0
+      ],
+      "initial_parameters": "all zeros",
+      "xtol_ftol_gtol": 1e-12
+    },
+    "tie_break": "match_distance, symbol",
+    "forward_transport": "no refit: apply frozen feature scales and all+2024plus entropy coefficients to every new treated trade's eligible controls, then normalize within trade",
+    "required_features": [
+      "log_exact_mcap",
+      "ret5",
+      "ret20",
+      "ret60",
+      "vol20",
+      "vol60",
+      "log_price",
+      "log_amount",
+      "liq20"
+    ],
+    "feature_scale": {
+      "log_exact_mcap": 1.1328874538066886,
+      "ret5": 5.392181197446688,
+      "ret20": 8.388634551997274,
+      "ret60": 19.723162276233694,
+      "vol20": 18.40181760957335,
+      "vol60": 17.26018220891079,
+      "log_price": 0.8320222435472452,
+      "log_amount": 0.7989039539102814,
+      "liq20": 0.8216716699295697
+    },
+    "coefficients": {
+      "all": {
+        "log_exact_mcap": 0.2075505320961047,
+        "ret5": -0.28144345947093385,
+        "ret20": 0.41511118721924595,
+        "ret60": -0.24239073727502275,
+        "vol20": -0.13442559525105238,
+        "vol60": -0.039720394172965294,
+        "log_price": 0.31875110341110396,
+        "log_amount": -0.002748768791763264,
+        "liq20": 0.42217962770934897
+      },
+      "2024plus_increment": {
+        "log_exact_mcap": -0.2900459143343636,
+        "ret5": 0.16617442921285325,
+        "ret20": -0.2716419743631744,
+        "ret60": 0.1724489186054056,
+        "vol20": 0.3262112757929918,
+        "vol60": -0.6173282608730373,
+        "log_price": -0.1828748739830732,
+        "log_amount": -0.005737740418878773,
+        "liq20": 0.14024810978240437
+      }
+    },
+    "future_exact_mcap": "archive one complete daily_basic cross-section on each enrolled decision date before outcome access"
+  },
+  "outcome_lock": {
+    "outcomes_allowed_during_progress": false,
+    "unlock_condition": "accrual is closed, next-session fill is observable for every enrolled decision, and every enrolled filled trade has its fixed 60th common session observed",
+    "horizons_sessions": [
+      5,
+      20,
+      60
+    ],
+    "entry_session_is_day_one": true,
+    "endpoint_offsets": {
+      "5": 4,
+      "20": 19,
+      "60": 59
+    },
+    "path_policy": "no-open or gap-at-limit control stays cash without replacement; post-entry suspension uses LOCF",
+    "costs": {
+      "buy": 0.0015,
+      "sell": 0.0025,
+      "cash": 0.0
+    }
+  },
+  "inference": {
+    "primary_estimand": "equal-weight forward treated-trade ATT",
+    "hac_lags": {
+      "5": 4,
+      "20": 19,
+      "60": 59
+    },
+    "stationary_bootstrap_expected_blocks": {
+      "5": 5,
+      "20": 20,
+      "60": 60
+    },
+    "bootstrap_replications": 10000,
+    "bootstrap_seed": 42,
+    "multiple_testing": "Holm-adjusted one-sided H5/H20/H60 family",
+    "network_inference": "treated_symbol × control_symbol two-way cluster sandwich",
+    "success_gate": "positive ATT and HAC-Holm<0.05 and stationary-bootstrap-Holm<0.05 and two-way-cluster p<0.05",
+    "no_horizon_cherry_picking": true
+  },
+  "source_identity": {
+    "git_head_at_freeze": "dc35eed1b2e7b296d3fbbc1ebd459bb0f4a60b04",
+    "forward_audit_script": {
+      "locator": "scripts/surge_delay5_forward_audit.py",
+      "sha256": "f672c65ea319068c82943cf00f82cd6e3484edd93661fe216f0d4469c30925ad"
+    },
+    "pit_plan": {
+      "locator": "scripts/delay5_pit_exact_mcap_plan_2026-08-12.json",
+      "sha256": "45e123ae019603a3690735099db3242540dff9594b3ab94853c562f0328db0e6"
+    },
+    "balance_audit": {
+      "locator": "scripts/_output/delay5_pit_exact_mcap_balance_audit/audit.json",
+      "sha256": "8601668fac1b9095805c25867d1f6dcc0e73bcf3356282ea6562ce8df34b60e8"
+    },
+    "balance_weights": {
+      "locator": "scripts/_output/delay5_pit_exact_mcap_balance_audit/balance.json",
+      "sha256": "de8cbe6ffb4471f5016c72ac93cc9c5a7f636b01a0c608bee343b480f297bee0"
+    },
+    "historical_outcome_audit": {
+      "locator": "scripts/_output/delay5_pit_exact_mcap_outcome_audit/audit.json",
+      "sha256": "6a6963dc578c75c40eb8fb782b929d16e62d9f00c327c2aafea40f7922c9cfa2"
+    },
+    "production_audit_genesis": {
+      "locator": "scripts/_output/surge_delay5_production_cohort/audit.json",
+      "sha256": "82f78036dd44f8949ecf6b63abf4bc17951746174c9393be878a097dbf4fbab1"
+    },
+    "candidate_manifest_genesis": {
+      "locator": "scripts/_output/surge_candidates/manifest.json",
+      "sha256": "fb405acaaffafcd9629adecd3517c07a7dddfdf92ac5fcd438660cf163280650"
+    }
+  },
+  "data_capture": {
+    "required_before_next_session": [
+      "content-addressed causal decision surface",
+      "complete exact daily_basic cross-section",
+      "production membership and fill decision"
+    ],
+    "late_backfill_policy": "reported separately and excluded from the primary forward sample",
+    "external_anchor": false
+  },
+  "authorization": {
+    "outcome_access_locked": true,
+    "live_authorized": false
+  }
+}

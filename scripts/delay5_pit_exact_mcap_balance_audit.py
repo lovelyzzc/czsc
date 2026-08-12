@@ -24,11 +24,12 @@ import numpy as np
 import pandas as pd
 import surge_portfolio_backtest as portfolio
 import trend_regime
+from scipy.optimize import least_squares
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 REQUEST_PATH = SCRIPT_DIR / "_output" / "delay5_common_horizon_att" / "exact_mcap_request_manifest.json"
-PLAN_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_plan_2026-08-11.json"
+PLAN_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_plan_2026-08-12.json"
 PLAN_SCRIPT_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_plan.py"
 COLLECTOR_SCRIPT_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_collector.py"
 BALANCE_SCRIPT_PATH = Path(__file__).resolve()
@@ -43,18 +44,24 @@ ATTEMPTS_PATH = OUTPUT_DIR / "match_attempts.parquet"
 BALANCE_PATH = OUTPUT_DIR / "balance.json"
 AUDIT_PATH = OUTPUT_DIR / "audit.json"
 
-SCHEMA = "delay5_pit_exact_mcap_balance_audit_v1"
+SCHEMA = "delay5_pit_exact_mcap_balance_audit_v2"
 EXPECTED_REQUEST_SCHEMA = "delay5_exact_mcap_request_manifest_v2"
 EXPECTED_PLAN_SCHEMA = "delay5_pit_exact_mcap_plan_manifest_v1"
-SPECIFICATION = "pit_exact_industry_mcap_k10_min5_c1p5"
+SPECIFICATION = "pit_exact_industry_mcap2_conditional_entropy_v1"
+# 仅保留给历史最近邻诊断函数；冻结主规格使用卡尺内全部控制。
 K = 10
 MIN_CONTROLS = 5
-CALIPER_RATIO = 1.5
+CALIPER_RATIO = 2.0
 COMMON_HORIZON = 60
 BALANCE_THRESHOLD = 0.10
 MCAP_BALANCE_THRESHOLD = 0.05
 COVERAGE_THRESHOLD = 0.80
 BALANCE_SCOPES = ("all", "2024plus")
+ENTROPY_MAX_NFEV = 2_000
+ENTROPY_PARAMETER_BOUND = 50.0
+ESS_P05_THRESHOLD = 5.0
+MAX_PAIR_WEIGHT_THRESHOLD = 0.50
+GLOBAL_ESS_PER_TRADE_THRESHOLD = 5.0
 
 # 这些字段均可由 decision-day panel 的因果前缀可靠构造。若计划预注册更多字段，
 # ``resolve_balance_features`` 会保留并把不可构造字段列入 missing，而不是静默删除。
@@ -76,10 +83,23 @@ FORBIDDEN_FUTURE_TOKENS = ("gross_", "net_", "ret_gross", "exit_", "h5_", "h20_"
 EXPECTED_PRIMARY_PLAN = {
     "name": SPECIFICATION,
     "industry": "same frozen annual industry; missing treated industry is unsupported",
-    "metric": "nearest absolute log(exact point-in-time circ_mv CNY) distance",
+    "candidate_pool": (
+        "all controls with complete frozen causal balance features inside the inclusive exact point-in-time "
+        "circ_mv caliper"
+    ),
     "caliper_ratio": CALIPER_RATIO,
-    "k": K,
     "min_controls": MIN_CONTROLS,
+    "weighting": (
+        "conditional entropy tilting with one all-scope and one 2024plus-scope coefficient per balance feature; "
+        "weights normalize to one within each treated trade"
+    ),
+    "solver": {
+        "method": "scipy.optimize.least_squares",
+        "max_nfev": ENTROPY_MAX_NFEV,
+        "parameter_bounds": [-ENTROPY_PARAMETER_BOUND, ENTROPY_PARAMETER_BOUND],
+        "initial_parameters": "all zeros",
+        "xtol_ftol_gtol": 1e-12,
+    },
     "tie_break": "match_distance, symbol",
 }
 CACHE_LOCATOR_PREFIX = "delay5-exact-mcap-cache://"
@@ -222,6 +242,25 @@ def nearest_exact_mcap_controls(
     ).abs()
     eligible = eligible.sort_values(["match_distance", "symbol"], kind="mergesort")
     return eligible.head(k).copy(), int(len(eligible))
+
+
+def exact_mcap_caliper_controls(
+    pool: pd.DataFrame,
+    *,
+    treated_mcap: float,
+    caliper_ratio: float = CALIPER_RATIO,
+) -> pd.DataFrame:
+    """返回卡尺内全部控制，供结果盲条件熵权重使用。"""
+
+    eligible, eligible_n = nearest_exact_mcap_controls(
+        pool,
+        treated_mcap=treated_mcap,
+        k=max(len(pool), 1),
+        caliper_ratio=caliper_ratio,
+    )
+    if len(eligible) != eligible_n:
+        raise AssertionError("full exact-mcap caliper pool was unexpectedly truncated")
+    return eligible
 
 
 @dataclass
@@ -378,7 +417,7 @@ def build_exact_matches(
     st_intervals: Mapping[str, Any],
     balance_features: Sequence[str] = DEFAULT_BALANCE_FEATURES,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """构造单一预注册 exact-mcap 匹配；不接触任何未来结果列。"""
+    """构造单一冻结 exact-mcap 控制边集合；不接触任何未来结果列。"""
 
     required_treated = {"trade_id", "symbol", "dec_dt", "year"}
     if missing := required_treated - set(treated):
@@ -409,17 +448,30 @@ def build_exact_matches(
             raise RuntimeError(f"frozen industry map is unavailable for {year}")
         snapshot["industry"] = snapshot.index.to_series().map(industry)
         snapshot["is_st"] = [portfolio.is_st_on(st_intervals, symbol, decision) for symbol in snapshot.index]
+        feature_columns = [str(feature) for feature in balance_features]
+        feature_complete = pd.Series(True, index=snapshot.index)
+        for feature in feature_columns:
+            if feature not in snapshot:
+                feature_complete &= False
+            else:
+                feature_complete &= np.isfinite(pd.to_numeric(snapshot[feature], errors="coerce"))
         current_valid = np.isfinite(pd.to_numeric(snapshot["log_price"], errors="coerce")) & np.isfinite(
             pd.to_numeric(snapshot["log_amount"], errors="coerce")
         )
         excluded = treated_by_date.get(decision, set())
-        base_pool = snapshot[current_valid & ~snapshot.index.isin(excluded) & ~snapshot["is_st"].astype(bool)].copy()
+        eligible_before_features = snapshot[
+            current_valid & ~snapshot.index.isin(excluded) & ~snapshot["is_st"].astype(bool)
+        ].copy()
+        base_pool = eligible_before_features[feature_complete.reindex(eligible_before_features.index)].copy()
         for row in day_treated.itertuples(index=False):
             reason: str | None = None
             treated_decision_visible = bool(row.symbol in snapshot.index and current_valid.get(row.symbol, False))
+            treated_features_complete = bool(row.symbol in snapshot.index and feature_complete.get(row.symbol, False))
             target_industry: Any = industry.get(row.symbol, np.nan)
             if not treated_decision_visible:
                 reason = "treated_not_decision_visible"
+            elif not treated_features_complete:
+                reason = "treated_balance_features_incomplete"
             elif target_industry is None or pd.isna(target_industry) or not str(target_industry).strip():
                 reason = "missing_treated_industry"
             target_mcap = (
@@ -433,7 +485,8 @@ def build_exact_matches(
             eligible_n = 0
             if reason is None:
                 industry_pool = base_pool[base_pool["industry"].eq(target_industry)].copy()
-                matched, eligible_n = nearest_exact_mcap_controls(industry_pool, treated_mcap=target_mcap)
+                matched = exact_mcap_caliper_controls(industry_pool, treated_mcap=target_mcap)
+                eligible_n = len(matched)
                 if len(matched) < MIN_CONTROLS:
                     reason = "fewer_than_min_controls"
             support_ok = reason is None
@@ -446,8 +499,11 @@ def build_exact_matches(
                     "year": year,
                     "treated_industry": None if pd.isna(target_industry) else str(target_industry),
                     "treated_decision_visible": treated_decision_visible,
+                    "treated_balance_features_complete": treated_features_complete,
                     "treated_exact_mcap_available": bool(np.isfinite(target_mcap) and target_mcap > 0),
                     "attempt_eligible": bool(attempt_eligible),
+                    "eligible_before_feature_complete_n": int(len(eligible_before_features)),
+                    "feature_complete_pool_n": int(len(base_pool)),
                     "industry_pool_n": int(len(industry_pool)),
                     "caliper_eligible_pool_n": int(eligible_n),
                     "selected_controls_n": int(len(matched)),
@@ -497,13 +553,173 @@ def _weighted_moments(values: np.ndarray, weights: np.ndarray) -> tuple[float, f
     return mean, variance
 
 
+def _normalised_exp_weights(logits: np.ndarray) -> np.ndarray:
+    """稳定 softmax；每个处理票的控制权重严格归一。"""
+
+    values = np.asarray(logits, dtype=float)
+    if values.ndim != 1 or len(values) == 0 or not np.isfinite(values).all():
+        raise ValueError("conditional entropy logits are invalid")
+    shifted = values - values.max()
+    weights = np.exp(shifted)
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("conditional entropy weights cannot be normalized")
+    return weights / total
+
+
+def fit_conditional_entropy_weights(
+    pairs: pd.DataFrame,
+    features: Sequence[str],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """结果盲条件熵校准，同时约束全期与 2024+ 的协变量均值。"""
+
+    supported = pairs[pairs["support_ok"].astype(bool)].copy()
+    if supported.empty:
+        raise ValueError("conditional entropy weighting has no supported pairs")
+    supported = supported.sort_values(["dec_dt", "treated_symbol", "rank"], kind="mergesort").reset_index(drop=True)
+    treated = supported.drop_duplicates("trade_id", keep="first").reset_index(drop=True)
+    trade_order = treated["trade_id"].astype(str).tolist()
+    trade_year = treated.set_index("trade_id")["year"].astype(int)
+    feature_names = [str(feature) for feature in features]
+    treated_columns = [f"treated_{feature}" for feature in feature_names]
+    control_columns = [f"control_{feature}" for feature in feature_names]
+    required = {*treated_columns, *control_columns}
+    if missing := required - set(supported):
+        raise ValueError(f"conditional entropy input lacks features: {sorted(missing)}")
+    treated_values = treated[treated_columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    control_values = supported[control_columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    if not np.isfinite(treated_values).all() or not np.isfinite(control_values).all():
+        raise ValueError("conditional entropy input contains non-finite features")
+    scale = treated_values.std(axis=0, ddof=0)
+    if not np.isfinite(scale).all() or (scale <= 0).any():
+        raise ValueError("conditional entropy treated feature scale is degenerate")
+    treated_z = treated_values / scale
+    control_z = control_values / scale
+    group_indices = {
+        str(trade_id): indices.to_numpy(dtype=int)
+        for trade_id, indices in supported.groupby("trade_id", sort=False).groups.items()
+    }
+    if set(group_indices) != set(trade_order):
+        raise AssertionError("conditional entropy trade grouping drift")
+    new_mask = treated["year"].astype(int).ge(2024).to_numpy(bool)
+    if not new_mask.any() or new_mask.all():
+        raise ValueError("conditional entropy requires non-empty pre-2024 and 2024plus scopes")
+    target_all = treated_z.mean(axis=0)
+    target_new = treated_z[new_mask].mean(axis=0)
+    dimension = len(feature_names)
+
+    def weights_for(parameters: np.ndarray) -> list[np.ndarray]:
+        all_coefficients = parameters[:dimension]
+        new_coefficients = parameters[dimension:]
+        result: list[np.ndarray] = []
+        for trade_id in trade_order:
+            indices = group_indices[trade_id]
+            coefficients = all_coefficients + (new_coefficients if int(trade_year.loc[trade_id]) >= 2024 else 0)
+            result.append(_normalised_exp_weights(control_z[indices] @ coefficients))
+        return result
+
+    def residuals(parameters: np.ndarray) -> np.ndarray:
+        weights = weights_for(parameters)
+        weighted = np.vstack(
+            [weights[index] @ control_z[group_indices[trade_id]] for index, trade_id in enumerate(trade_order)]
+        )
+        return np.concatenate((weighted.mean(axis=0) - target_all, weighted[new_mask].mean(axis=0) - target_new))
+
+    solution = least_squares(
+        residuals,
+        np.zeros(dimension * 2, dtype=float),
+        bounds=(-ENTROPY_PARAMETER_BOUND, ENTROPY_PARAMETER_BOUND),
+        max_nfev=ENTROPY_MAX_NFEV,
+        xtol=1e-12,
+        ftol=1e-12,
+        gtol=1e-12,
+    )
+    final_residuals = residuals(solution.x)
+    if not solution.success or not np.isfinite(final_residuals).all():
+        raise RuntimeError(f"conditional entropy solver failed: status={solution.status} message={solution.message}")
+    fitted = weights_for(solution.x)
+    supported["control_weight"] = 0.0
+    for index, trade_id in enumerate(trade_order):
+        supported.loc[group_indices[trade_id], "control_weight"] = fitted[index]
+    group_sums = supported.groupby("trade_id")["control_weight"].sum()
+    if not np.allclose(group_sums.to_numpy(float), 1.0, atol=1e-12, rtol=0):
+        raise AssertionError("conditional entropy weights do not sum to one by treated trade")
+    diagnostics = {
+        "method": "conditional_entropy_tilting",
+        "solver_success": bool(solution.success),
+        "solver_status": int(solution.status),
+        "solver_nfev": int(solution.nfev),
+        "max_abs_standardized_mean_residual": float(np.max(np.abs(final_residuals))),
+        "feature_scale": {feature: float(value) for feature, value in zip(feature_names, scale, strict=True)},
+        "coefficients": {
+            "all": {
+                feature: float(value) for feature, value in zip(feature_names, solution.x[:dimension], strict=True)
+            },
+            "2024plus_increment": {
+                feature: float(value) for feature, value in zip(feature_names, solution.x[dimension:], strict=True)
+            },
+        },
+    }
+    assert_outcome_blind_columns(supported, "entropy-weighted pairs")
+    return supported, diagnostics
+
+
+def positivity_diagnostics(pairs: pd.DataFrame) -> dict[str, Any]:
+    """报告冻结的 coverage 之外权重集中度与有效样本量门。"""
+
+    if pairs.empty or "control_weight" not in pairs:
+        raise ValueError("positivity diagnostics require weighted pairs")
+
+    def summarize(scope: pd.DataFrame) -> dict[str, Any]:
+        grouped = scope.groupby("trade_id", sort=False)
+        per_trade_ess = grouped["control_weight"].apply(lambda values: 1.0 / np.square(values.to_numpy(float)).sum())
+        weights = scope["control_weight"].to_numpy(float)
+        trade_count = int(scope["trade_id"].nunique())
+        global_ess = float(np.square(weights.sum()) / np.square(weights).sum())
+        p05 = float(per_trade_ess.quantile(0.05))
+        maximum = float(weights.max())
+        global_per_trade = float(global_ess / trade_count) if trade_count else 0.0
+        passes = (
+            p05 >= ESS_P05_THRESHOLD
+            and maximum <= MAX_PAIR_WEIGHT_THRESHOLD
+            and global_per_trade >= GLOBAL_ESS_PER_TRADE_THRESHOLD
+        )
+        return {
+            "supported_trades": trade_count,
+            "candidate_controls": int(len(scope)),
+            "unique_control_symbols": int(scope["control_symbol"].nunique()),
+            "per_trade_ess_min": float(per_trade_ess.min()),
+            "per_trade_ess_p05": p05,
+            "per_trade_ess_median": float(per_trade_ess.median()),
+            "max_pair_weight": maximum,
+            "global_pair_ess": global_ess,
+            "global_pair_ess_per_trade": global_per_trade,
+            "thresholds": {
+                "per_trade_ess_p05_gte": ESS_P05_THRESHOLD,
+                "max_pair_weight_lte": MAX_PAIR_WEIGHT_THRESHOLD,
+                "global_pair_ess_per_trade_gte": GLOBAL_ESS_PER_TRADE_THRESHOLD,
+            },
+            "passes": bool(passes),
+        }
+
+    return {
+        "all": summarize(pairs),
+        "2024plus": summarize(pairs[pairs["year"].ge(2024)]),
+    }
+
+
 def balance_statistics(pairs: pd.DataFrame, features: Sequence[str]) -> tuple[dict[str, Any], list[str]]:
-    """treated=1、每个 control=1/K，任何缺值都 fail closed。"""
+    """treated 等权、控制使用每笔归一的冻结权重，任何缺值都 fail closed。"""
 
     if pairs.empty:
         return {}, list(features)
     treated = pairs.drop_duplicates("trade_id", keep="first")
-    weights = 1.0 / pairs.groupby("trade_id")["trade_id"].transform("size").to_numpy(float)
+    if "control_weight" not in pairs:
+        raise ValueError("balance statistics require frozen control_weight")
+    weights = pd.to_numeric(pairs["control_weight"], errors="coerce").to_numpy(float)
+    group_sums = pairs.assign(_weight=weights).groupby("trade_id")["_weight"].sum().to_numpy(float)
+    if not np.allclose(group_sums, 1.0, atol=1e-12, rtol=0):
+        raise ValueError("control weights do not sum to one by trade")
     result: dict[str, Any] = {}
     missing: list[str] = []
     for feature in features:
@@ -665,6 +881,7 @@ def cross_provider_unit_qa(exact_mcap: pd.DataFrame, baostock: pd.DataFrame | No
 def build_verdict(
     coverage: Mapping[str, Mapping[str, Any]],
     balance: Mapping[str, Mapping[str, Any]],
+    positivity: Mapping[str, Mapping[str, Any]],
     *,
     required_features: Sequence[str],
     input_complete: bool = True,
@@ -690,12 +907,15 @@ def build_verdict(
             }
         )
     balance_ok = not any(failed.values())
+    positivity_ok = all(bool(positivity.get(scope, {}).get("passes", False)) for scope in BALANCE_SCOPES)
     if not input_complete:
         status = "INPUT_INCOMPLETE_OUTCOMES_NOT_EVALUATED"
     elif not coverage_ok:
         status = "COLLECTOR_COVERAGE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED"
     elif not balance_ok:
         status = "BALANCE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED"
+    elif not positivity_ok:
+        status = "POSITIVITY_INSUFFICIENT_OUTCOMES_NOT_EVALUATED"
     else:
         status = "BALANCE_GATE_PASSED_OUTCOME_EVALUATION_PERMITTED"
     return {
@@ -703,8 +923,9 @@ def build_verdict(
         "input_complete": bool(input_complete),
         "coverage_sufficient": bool(coverage_ok),
         "balance_sufficient": bool(balance_ok),
+        "positivity_sufficient": bool(positivity_ok),
         "failed_balance_features": failed,
-        "outcome_evaluation_permitted": bool(coverage_ok and balance_ok),
+        "outcome_evaluation_permitted": bool(coverage_ok and balance_ok and positivity_ok),
         "outcomes_loaded": False,
         "live_authorized": False,
     }
@@ -762,6 +983,14 @@ def validate_plan_contract(plan: Mapping[str, Any], request: Mapping[str, Any]) 
             "treated_exact_mcap": "286/286",
             "all": "D_supported/D_source >= 0.80",
             "2024plus": "D_supported/D_source >= 0.80",
+        }
+        and balance.get("positivity")
+        == {
+            "all_and_2024plus": {
+                "per_trade_ess_p05_gte": ESS_P05_THRESHOLD,
+                "max_pair_weight_lte": MAX_PAIR_WEIGHT_THRESHOLD,
+                "global_pair_ess_per_trade_gte": GLOBAL_ESS_PER_TRADE_THRESHOLD,
+            }
         }
         and balance.get("fail_closed") is True
     ):
@@ -1025,8 +1254,10 @@ def run_audit(
         st_intervals=st_intervals,
         balance_features=required_features,
     )
+    pairs, entropy_diagnostics = fit_conditional_entropy_weights(pairs, required_features)
     coverage = coverage_summary(attempts)
     balance = scoped_balance(pairs, required_features)
+    positivity = positivity_diagnostics(pairs)
     for scope in BALANCE_SCOPES:
         balance[scope]["missing_features"] = sorted(set(balance[scope]["missing_features"]) | set(prereg_missing))
 
@@ -1041,11 +1272,13 @@ def run_audit(
         "outcomes_loaded": False,
         "required_features": list(required_features),
         "scopes": balance,
+        "positivity": positivity,
+        "entropy_weighting": entropy_diagnostics,
     }
     balance_path.write_text(
         json.dumps(balance_payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )
-    verdict = build_verdict(coverage, balance, required_features=required_features)
+    verdict = build_verdict(coverage, balance, positivity, required_features=required_features)
     proxy_pairs = None
     if PROXY_PAIRS_PATH.is_file():
         proxy_pairs = pd.read_parquet(PROXY_PAIRS_PATH, columns=["trade_id", "specification", "support_ok"])
@@ -1066,7 +1299,12 @@ def run_audit(
         "outcome_blind": True,
         "outcomes_loaded": False,
         "specification": SPECIFICATION,
-        "parameters": {"k": K, "min_controls": MIN_CONTROLS, "caliper_ratio": CALIPER_RATIO},
+        "parameters": {
+            "min_controls": MIN_CONTROLS,
+            "caliper_ratio": CALIPER_RATIO,
+            "entropy_max_nfev": ENTROPY_MAX_NFEV,
+            "entropy_parameter_bound": ENTROPY_PARAMETER_BOUND,
+        },
         "cohort": {
             "D_source": int(len(treated)),
             "D_source_2024plus": int(treated["year"].ge(2024).sum()),
@@ -1078,6 +1316,8 @@ def run_audit(
         "collector_closure": verified,
         "input_identity": input_identity,
         "coverage": coverage,
+        "entropy_weighting": entropy_diagnostics,
+        "positivity": positivity,
         "proxy_identical_support": proxy_crosstab,
         "cross_provider_unit_qa": provider_qa,
         "balance": balance,

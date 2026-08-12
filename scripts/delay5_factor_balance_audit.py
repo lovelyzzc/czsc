@@ -165,6 +165,7 @@ def validate_common_upstream(common_audit: Mapping[str, Any]) -> dict[str, Any]:
 
     expected = {
         "candidates": common.CANDIDATES_PATH,
+        "candidate_manifest": common.CANDIDATE_MANIFEST_PATH,
         "panel": common.PANEL_PATH,
         "market_state": common.MARKET_PATH,
         "namechange": common.portfolio.NAMECHANGE_PATH,
@@ -180,7 +181,7 @@ def validate_common_upstream(common_audit: Mapping[str, Any]) -> dict[str, Any]:
         verified[label] = verify_bound_file(path, record.get("sha256"), label)
 
     production = identities["production_cohort"]
-    if production.get("upstream_schema") != "surge_delay5_production_cohort_audit_v2":
+    if production.get("upstream_schema") != "surge_delay5_production_cohort_audit_v3":
         raise RuntimeError("unexpected bound production cohort schema")
     _verify_recorded_path(
         {"path": production.get("upstream_audit_path")}, common.PRODUCTION_AUDIT_PATH, "production audit"

@@ -1,0 +1,412 @@
+{
+  "study_id": "xs_chan_exploration_stage2_hypothesis_stress_20260727",
+  "mode": "EXPLORATORY_ONLY",
+  "study_type": "RETROSPECTIVE_FALSIFICATION_ONLY",
+  "confirmation_chain": "NOT_STARTED",
+  "claim_boundary": [
+    "historical_reuse_only",
+    "no_independent_out_of_sample_claim",
+    "no_alpha_confirmation",
+    "no_live_trading_authorization"
+  ],
+  "design_provenance": {
+    "stage1_full_sample_already_seen": true,
+    "stage2_is_preregistered_confirmation": false,
+    "independent_oos_sample_available": false,
+    "pre_protocol_audit_peeked_stage2_metrics": true,
+    "peeked_metrics": [
+      "proposal_state7_minus_sma20_full_early_late",
+      "membership_state7_minus_sma20_full_early_late",
+      "residual_early_late_means",
+      "registered_and_early_only_failure_feature_differences",
+      "ma20_breadth_association"
+    ],
+    "interpretation": "The plan is an append-only retrospective stress test written after a semantic audit, not an untouched preregistration."
+  },
+  "revision_history": [
+    {
+      "revision": 2,
+      "date": "2026-07-27",
+      "superseded_identity": "14cd6318aa878103bd200b3c239ca26a44257bc191ee25f4acb8368d21328155",
+      "reason": "The first published identity correctly marked the exact matched H1 endpoint insufficient at 5.05% match coverage, but its tail probability was still included in the descriptive Holm table. Revision 2 excludes insufficient endpoints from p-value interpretation while retaining the planned family size of five. Hypothesis statuses and effect estimates were unchanged."
+    },
+    {
+      "revision": 3,
+      "date": "2026-07-27",
+      "superseded_identity": "dda1f6e18efa219d292dd5c8a87d968858bcca7cfcadeef99b0a8edda4df80fa",
+      "reason": "Independent completion review found that the exact-matched treated weekly mean still included state-7 events outside matched strata, segment event/slot metadata repeated full-sample values, and the verifier did not distinguish current from superseded study identities. Revision 3 restricts both treated and control returns to the same exact matched events, fixes segment metadata and p-value labels, and binds current verification to the live spec, source, frozen inputs, and a detached manifest digest. The matched endpoint remains insufficient and all H1/H2/H3 decisions are unchanged."
+    },
+    {
+      "revision": 4,
+      "date": "2026-07-29",
+      "superseded_identity": "1a92a698ecb6b042e96496139a461ad673a99235a9d4449833b1da224121ae46",
+      "reason": "The standalone Rust trend-regime FSM changes 51,531 of 6,453,156 overlapping historical state rows (0.7985%), so it is treated as an algorithm revision rather than a performance-only migration. Revision 4 binds a newly generated 5,743-source state cache, a regenerated 224-week Stage 1 result, and an artifact-level semantic audit. All Stage 2 hypotheses and decision rules remain unchanged and must be recalculated under the revised state history."
+    },
+    {
+      "revision": 5,
+      "date": "2026-07-29",
+      "superseded_identity": "314726dd5a8acf88e272e86bf3fef982ca8c50bb05208fcb117c58bdd1e91d7c",
+      "reason": "Post-publication review found that Revision 4 froze the regenerated artifacts but did not fail closed on the semantic audit's no-confirmation boundary, prior-audit carry-forward, or independently recomputed old-versus-new state mismatch. Revision 5 verifies those claims, both state-cache generations, and the exact symbol/dt inner-join comparison before any Stage 2 experiment runs. No hypothesis, estimand, decision rule, or Stage 1 artifact changed."
+    }
+  ],
+  "stage1_algorithm_revision": {
+    "required_audit_id": "xs_chan_exploration_stage1_algorithm_revision_audit_20260729",
+    "required_audit_type": "POST_REGENERATION_IDENTITY_AND_SEMANTIC_CARRY_FORWARD_AUDIT",
+    "required_source_commit": "89ae4fe1fc81f0bfe038bbd0d11b9bf24edb2c5e",
+    "required_prior_audit_path": "scripts/xs_chan_exploration_stage1_audit_20260727.json",
+    "required_prior_audit_sha256": "97377b743b85390f224078708d5daa3d2175609dca75c74ad33e836a032f292c",
+    "required_prior_findings": [
+      "A01_E05_CONTROL_CONFOUNDING",
+      "A02_H1_ESTIMAND_MIX",
+      "A03_H3_POST_SELECTION_LEAKAGE",
+      "A04_E04_CONDITIONAL_PATH_ONLY",
+      "A05_ATTRIBUTION_MARKET_LABEL",
+      "A06_RARE_STATE_TURNOVER",
+      "A07_SECONDARY_FAILURE_NOT_DELIVERED"
+    ],
+    "required_old_state_cache_identity": "473b92f92f548ca638c953506dad8c2906f9f981f268d88db6f3b88c75f4a54b",
+    "required_old_state_sha256": "665121b375ab80539744639370a653180f90cda423bb74a769003f4fa8d8fb65",
+    "required_old_state_manifest_sha256": "4153ae578bd6c5c3f2c4d0b54d67101093c59455cd3a52301b062632a5f22796",
+    "required_new_state_cache_identity": "47cb3926fd2031c8afccdbcd17d9bc4825cf607261a41abf8a2c7d0b710c6988",
+    "required_new_state_sha256": "a92a8e669989a9dda51347e11d0cfaa9c8e2ab0ab91b46f79b4143daffa0e7b4",
+    "required_new_state_manifest_sha256": "5c8e93827c36db7bbf84bcc40594295c79299498278987678a6d8f1ab4b50700",
+    "required_native_extension_sha256": "32cd788470877cf70f4bbd5f7e6764373d9d53be38b412e89ed6901abb62c857",
+    "required_old_source_files": 5719,
+    "required_new_source_files": 5743,
+    "required_new_state_rows": 6558670,
+    "required_overlap_rows": 6453156,
+    "required_regime_mismatches": 51531,
+    "required_prefix_causality_audit": "PASS",
+    "required_comparison_keys": [
+      "symbol",
+      "dt"
+    ],
+    "required_comparison_join": "inner",
+    "required_mismatch_predicate": "old_regime != new_regime",
+    "required_comparison_method": "polars_lazy_parquet_inner_join_then_count_regime_inequality"
+  },
+  "frozen_v2_1_baseline": {
+    "protocol_id": "xs_chan_pilot_v2_1_preregistered_20260720",
+    "required_protocol_status": "LOCKED_PENDING_ENGINEERING_AND_FORWARD_DATA",
+    "protocol_path": "scripts/xs_chan_protocol_v2_1.json",
+    "protocol_physical_sha256": "c05d249e1cf94edf741f097d375a26fad84657812ea1af2447b8431c66dd5c9e",
+    "protocol_canonical_sha256": "8501bdd242cdd961b13cb4688cc7e2fd6d621342f85039a3223a18c4579ea203",
+    "protocol_document_path": "scripts/XS_CHAN_PILOT_PROTOCOL_V2_1.md",
+    "protocol_document_sha256": "9d712eb6767ccf9f35f0f5b26acedfdd9feccd42ce33b73d8f0377fa5dfb2882"
+  },
+  "frozen_stage1_inputs": [
+    {
+      "name": "stage1_spec",
+      "path": "scripts/xs_chan_exploration_stage1.json",
+      "sha256": "7c9d5ee439a52db63f8a4b06e32a743a509d8ca3b81f194f125dce19cd097744"
+    },
+    {
+      "name": "stage1_source",
+      "path": "scripts/xs_chan_exploration_stage1.py",
+      "sha256": "4954ec1ce784cc391c2281212a91a4123a913d927df2734daf9f33708d085427"
+    },
+    {
+      "name": "stage1_audit",
+      "path": "scripts/xs_chan_exploration_stage1_algorithm_revision_audit_20260729.json",
+      "sha256": "3bef0789506b6ba7adce83fd01ba968660b9e0dc31e1fe3cce89a45d7cd6d402"
+    },
+    {
+      "name": "stage1_data_manifest",
+      "path": "scripts/_output/xs_chan_exploration_stage1/data_manifest.json",
+      "sha256": "55e49d73c276a4f95319105bc2b2165f4fefc9ccc6ff1baf3206bb93f0fd8e5a"
+    },
+    {
+      "name": "stage1_next_hypotheses",
+      "path": "scripts/_output/xs_chan_exploration_stage1/next_hypotheses.json",
+      "sha256": "45a9315d3b85a242db33f63b1e9d94bfb6714c79b97ca2ba6e6b1bee66744cf7"
+    },
+    {
+      "name": "ranked_surface",
+      "path": "scripts/_output/xs_chan_exploration_stage1/ranked_surface.parquet",
+      "sha256": "8ddf72e3e528764827ab06a634a87ffc47f384fe5dce1f54274a754071f59369"
+    },
+    {
+      "name": "buffered_memberships",
+      "path": "scripts/_output/xs_chan_exploration_stage1/buffered_memberships.parquet",
+      "sha256": "9fe4e7742b56927488c01195cb1e9f1ce07401c3ea449e5c0e41125d0a7f1af4"
+    },
+    {
+      "name": "gate_proposals",
+      "path": "scripts/_output/xs_chan_exploration_stage1/gate_proposals.parquet",
+      "sha256": "8dc94d7dd035531ef65f0534c802c2f163762c367a5714c4072c2592202c6f99"
+    },
+    {
+      "name": "attribution_weekly",
+      "path": "scripts/_output/xs_chan_exploration_stage1/attribution_weekly.parquet",
+      "sha256": "5311521c7c560bedcb017b34b4317cdd2c0e93ad0277565a3fc19b5ddbd4550c"
+    },
+    {
+      "name": "failure_sample",
+      "path": "scripts/_output/xs_chan_exploration_stage1/failure_sample.parquet",
+      "sha256": "6c746a01c41762f3f7b8be1f8673d666c2d4e5fec35f74715881241db5256042"
+    }
+  ],
+  "time_split": {
+    "development_start": "2022-01-14",
+    "development_end": "2023-12-29",
+    "expected_development_weeks": 99,
+    "historical_validation_start": "2024-01-05",
+    "historical_validation_end": "2026-06-05",
+    "expected_historical_validation_weeks": 125,
+    "validation_half_1_start": "2024-01-05",
+    "validation_half_1_end": "2025-03-14",
+    "expected_validation_half_1_weeks": 62,
+    "validation_half_2_start": "2025-03-21",
+    "validation_half_2_end": "2026-06-05",
+    "expected_validation_half_2_weeks": 63,
+    "boundary_rule": "fixed_from_the_224_stage1_analyzed_decision_dates",
+    "week_weighting": "equal_weight_across_common_decision_weeks"
+  },
+  "statistics": {
+    "hac_lag": 4,
+    "circular_block_weeks": 4,
+    "bootstrap_draws": 5000,
+    "bootstrap_confidence": 0.95,
+    "random_seed_root": 2026072702,
+    "rng": "numpy_PCG64DXSM",
+    "holm_endpoint_count": 5,
+    "effect_threshold_weekly": 0.002,
+    "failure_profile_smd_threshold": 0.1,
+    "report_best_10_week_contribution_share": true
+  },
+  "h1_state7_increment": {
+    "primary_estimand": {
+      "name": "proposal_common_support",
+      "population": "gate_proposals_arm_FC_with_observable_next_open_and_5_session_label",
+      "state7_gate": "regime_equals_7",
+      "sma20_gate": "ma_allowed_equals_true",
+      "weekly_difference": "mean_state7_return_minus_mean_sma20_return_on_weeks_where_both_exist"
+    },
+    "sensitivity_estimand": {
+      "name": "buffered_membership_common_support",
+      "population": "buffered_memberships_arm_F_with_observable_next_open_and_5_session_label",
+      "state7_gate": "regime_equals_7",
+      "sma20_gate": "ma_allowed_equals_true",
+      "weekly_difference": "mean_state7_return_minus_mean_sma20_return_on_weeks_where_both_exist"
+    },
+    "matched_control": {
+      "population": "gate_proposals_arm_FC",
+      "exclude_regime": 7,
+      "exact_strata": [
+        "decision_dt",
+        "industry_code",
+        "mcap_bucket",
+        "ma_allowed",
+        "factor_rank_decile"
+      ],
+      "factor_rank_decile_edges": [
+        0,
+        10,
+        20,
+        30,
+        40,
+        50,
+        75
+      ],
+      "sampling": "without_replacement",
+      "treated_support": "same_exact_strata_and_same_matched_count_as_sampled_controls",
+      "repetitions": 1000,
+      "minimum_full_match_rate": 0.95,
+      "minimum_half_match_rate": 0.9,
+      "maximum_null_mcse_weekly": 0.0005
+    },
+    "proposal_identity_randomization": {
+      "preserve": "weekly_state7_count_inside_FC_proposal_population",
+      "repetitions": 1000
+    },
+    "minimum_validation_common_weeks": 52,
+    "minimum_each_half_common_weeks": 26,
+    "minimum_validation_state7_events": 260,
+    "decision_rule": {
+      "pass": "validation_state7_minus_sma20_and_matched_each_gte_0.002_and_all_four_half_effects_gt_0",
+      "falsified": "any_sufficient_full_endpoint_lte_0_or_its_half_effect_lte_0",
+      "insufficient": "no_sufficient_endpoint_can_decide_and_any_data_gate_fails",
+      "otherwise": "INCONCLUSIVE"
+    }
+  },
+  "h2_factor_residual": {
+    "model": "weekly_cross_sectional_ols_intercept_plus_standardized_log_free_float_mcap_lowvol60_mom120_20_plus_centered_SW2021_L1",
+    "primary_estimand": "buffered_F_pool_mean_unexplained_residual",
+    "common_return_label": "cross_sectional_common_return_not_market_beta",
+    "random_identity_control": {
+      "population": "tradable_labeled_ranked_universe",
+      "weekly_sample_size": 50,
+      "repetitions": 1000
+    },
+    "minimum_validation_weeks": 52,
+    "minimum_each_half_weeks": 26,
+    "minimum_weekly_universe": 100,
+    "minimum_weekly_factor_pool": 20,
+    "maximum_reconstruction_error": 1e-10,
+    "decision_rule": {
+      "pass": "validation_mean_gte_0.002_and_both_half_means_gt_0",
+      "falsified": "validation_mean_lte_0_or_either_half_mean_lte_0",
+      "insufficient": "any_data_gate_fails",
+      "otherwise": "INCONCLUSIVE"
+    }
+  },
+  "h3_failure_profile": {
+    "registered_post_selection_features": [
+      "distance_to_sma20",
+      "volume_ratio"
+    ],
+    "registered_feature_test_status": "INVALID_POST_SELECTION_DIAGNOSTIC_ONLY",
+    "nested_candidate_features": [
+      "factor_score",
+      "factor_rank",
+      "mom_120_20",
+      "lowvol_60",
+      "log_free_float_mcap",
+      "adv20",
+      "turnover_rate",
+      "volume_ratio",
+      "pe_ttm",
+      "pb",
+      "distance_to_sma20"
+    ],
+    "nested_selection": "top_2_absolute_pooled_standardized_failure_minus_profit_difference_in_development_only",
+    "nested_validation": "evaluate_the_two_locked_development_features_in_historical_validation_only",
+    "secondary_failure": "bottom_return_quintile_within_decision_week",
+    "tail_lift": "development_direction_and_development_quartile_applied_unchanged_to_validation",
+    "permutation_control_repetitions": 1000,
+    "synthetic_noise": "sha256_symbol_decision_dt_study_id_mapped_to_standard_normal",
+    "minimum_validation_non_missing_rate": 0.95,
+    "minimum_validation_failure_rows": 1250,
+    "minimum_validation_profit_rows": 1250,
+    "decision_rule": {
+      "pass": "both_nested_features_keep_development_direction_and_each_validation_absolute_smd_gte_0.10",
+      "falsified": "either_nested_feature_reverses_or_both_validation_absolute_smd_lt_0.10",
+      "insufficient": "any_data_gate_fails",
+      "otherwise": "INCONCLUSIVE"
+    }
+  },
+  "portfolio_path_stress": {
+    "arms": [
+      "F",
+      "FC",
+      "FMA"
+    ],
+    "target_slots": 50,
+    "cash_buffer": 0.005,
+    "unfilled_slots": "zero_return_cash",
+    "missing_or_untradable_slot_return": "zero_return_proxy_with_completeness_reported",
+    "buy_cost": 0.0015,
+    "sell_cost": 0.0025,
+    "terminal_liquidation": true,
+    "roundtrip_cost_stress": [
+      0.0,
+      0.002,
+      0.004,
+      0.006
+    ],
+    "recursive_randomized_chan_paths": {
+      "shuffle": "allowed_state_identity_within_each_week_factor_rank_lte_75",
+      "rebuild_retention_and_proposals_recursively": true,
+      "repetitions": 500
+    }
+  },
+  "placebo_and_market_state": {
+    "placebo_states": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "minimum_placebo_events": 100,
+    "full_calendar_turnover_includes_empty_weeks": true,
+    "fixed_market_state_variables": [
+      {
+        "name": "eligible_ma20_breadth",
+        "definition": "weekly_mean_ma_allowed",
+        "split": "gte_0.50_vs_lt_0.50"
+      },
+      {
+        "name": "eligible_median_momentum",
+        "definition": "weekly_median_mom_120_20",
+        "split": "gt_0_vs_lte_0"
+      }
+    ],
+    "outcomes": [
+      "FC_minus_F_fixed_50_slot_net_return",
+      "proposal_state7_minus_sma20_return"
+    ],
+    "interpretation": "mechanism_hypothesis_generation_only_no_filter_selection"
+  },
+  "output_integrity": {
+    "directory_identity": "sha256_of_canonical_spec_and_stage2_source_bytes",
+    "directory_prefix": "STAGE2_",
+    "atomic_publish": true,
+    "refuse_overwrite": true,
+    "preserve_failed_run_directory": true,
+    "inventory_output_sha256_size_rows_schema": true,
+    "detached_manifest_sha256": true,
+    "verify_current_identity_against_spec_source_and_frozen_inputs": true,
+    "classify_revision_history_identities_as_superseded": true
+  },
+  "no_tuning": {
+    "parameter_search": false,
+    "threshold_optimization": false,
+    "best_variant_selection": false,
+    "failed_experiment_suppression": false,
+    "post_result_endpoint_substitution": false,
+    "matching_relaxation_after_results": false,
+    "seed_extension_after_results": false,
+    "all_planned_experiments_must_be_registered": true,
+    "all_runtime_and_semantic_failures_must_be_retained": true,
+    "results_may_only_reject_or_generate_hypotheses": true
+  },
+  "planned_experiments": [
+    {
+      "id": "S2E00_INPUT_AND_INTEGRITY",
+      "deliverable": "frozen_input_schema_schedule_and_fresh_sample_audit"
+    },
+    {
+      "id": "S2E01_H1_COMMON_SUPPORT",
+      "deliverable": "separate_proposal_and_membership_state7_vs_sma20_weekly_differences"
+    },
+    {
+      "id": "S2E02_H1_CONTROLS",
+      "deliverable": "factor_supported_matched_and_proposal_identity_random_controls"
+    },
+    {
+      "id": "S2E03_H2_RESIDUAL_STABILITY",
+      "deliverable": "recomputed_attribution_residual_by_validation_half_and_year"
+    },
+    {
+      "id": "S2E04_H2_RANDOM_IDENTITY",
+      "deliverable": "weekly_random_50_identity_residual_null"
+    },
+    {
+      "id": "S2E05_H3_PROFILE_REPLICATION",
+      "deliverable": "post_selection_registered_and_early_only_nested_failure_profiles"
+    },
+    {
+      "id": "S2E06_H3_CONTROLS_AND_SECONDARY",
+      "deliverable": "failure_label_permutation_noise_and_bottom_quintile_profiles"
+    },
+    {
+      "id": "S2E07_FIXED_SLOT_PATH_STRESS",
+      "deliverable": "cash_cost_and_recursive_random_buffer_path_comparison"
+    },
+    {
+      "id": "S2E08_PLACEBO_AND_MARKET_STATE",
+      "deliverable": "all_state_placebos_full_calendar_turnover_and_fixed_market_state_mechanisms"
+    },
+    {
+      "id": "S2E09_DECISION_MATRIX",
+      "deliverable": "hypothesis_statuses_invalidity_and_next_action"
+    }
+  ]
+}

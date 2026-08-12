@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-EXPECTED_PLAN_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_plan_2026-08-11.json"
+EXPECTED_PLAN_PATH = SCRIPT_DIR / "delay5_pit_exact_mcap_plan_2026-08-12.json"
 
 COMMON_DIR = SCRIPT_DIR / "_output" / "delay5_common_horizon_att"
 COMMON_AUDIT_PATH = COMMON_DIR / "audit.json"
@@ -36,6 +36,7 @@ ARTIFACT_PATHS = {
     "production_audit": PRODUCTION_DIR / "audit.json",
     "production_cohort": PRODUCTION_DIR / "cohort.parquet",
     "candidates": SCRIPT_DIR / "_output" / "surge_candidates" / "candidates.parquet",
+    "candidate_manifest": SCRIPT_DIR / "_output" / "surge_candidates" / "manifest.json",
     "panel": SCRIPT_DIR / "_output" / "surge_candidates" / "panel.parquet",
     "market_state": SCRIPT_DIR / "_output" / "surge_market_state_filter" / "market_state.parquet",
     "namechange": Path.home() / ".ts_data_cache" / "namechange.parquet",
@@ -372,6 +373,7 @@ def _validate_common_bindings(common: Mapping[str, Any], request_identity: Mappi
     upstream = common.get("data_identity", {})
     mapping = {
         "candidates": "candidates",
+        "candidate_manifest": "candidate_manifest",
         "panel": "panel",
         "market_state": "market_state",
         "namechange": "namechange",
@@ -382,7 +384,7 @@ def _validate_common_bindings(common: Mapping[str, Any], request_identity: Mappi
         if record.get("sha256") != sha256_file(ARTIFACT_PATHS[artifact_label]):
             raise RuntimeError(f"common upstream binding drift: {common_label}")
     production = upstream.get("production_cohort", {})
-    if production.get("upstream_schema") != "surge_delay5_production_cohort_audit_v2":
+    if production.get("upstream_schema") != "surge_delay5_production_cohort_audit_v3":
         raise RuntimeError("unexpected production cohort audit schema")
     if production.get("upstream_audit_sha256") != sha256_file(ARTIFACT_PATHS["production_audit"]):
         raise RuntimeError("production audit binding drift")
@@ -482,16 +484,39 @@ def _design() -> dict[str, Any]:
         },
         "matching": {
             "primary": {
-                "name": "pit_exact_industry_mcap_k10_min5_c1p5",
+                "name": "pit_exact_industry_mcap2_conditional_entropy_v1",
                 "industry": "same frozen annual industry; missing treated industry is unsupported",
-                "metric": "nearest absolute log(exact point-in-time circ_mv CNY) distance",
-                "caliper_ratio": 1.5,
-                "k": 10,
+                "candidate_pool": (
+                    "all controls with complete frozen causal balance features inside the inclusive exact "
+                    "point-in-time circ_mv caliper"
+                ),
+                "caliper_ratio": 2.0,
                 "min_controls": 5,
+                "weighting": (
+                    "conditional entropy tilting with one all-scope and one 2024plus-scope coefficient per balance "
+                    "feature; weights normalize to one within each treated trade"
+                ),
+                "solver": {
+                    "method": "scipy.optimize.least_squares",
+                    "max_nfev": 2000,
+                    "parameter_bounds": [-50.0, 50.0],
+                    "initial_parameters": "all zeros",
+                    "xtol_ftol_gtol": 1e-12,
+                },
                 "tie_break": "match_distance, symbol",
             },
             "causal_cutoff": "every feature and eligibility input has max timestamp <= decision date",
             "exclude": "treated symbol, every production-treated symbol on that date, historical ST",
+            "outcome_blind_design_ledger": {
+                "candidate_calipers": [1.5, 2.0, 3.0],
+                "selection_rule": (
+                    "choose the smallest caliper with both-scope coverage >=0.80, all frozen SMD gates passing, "
+                    "per-trade ESS p05 >=5, max pair weight <=0.50 and global pair ESS/trade >=5"
+                ),
+                "selected_caliper": 2.0,
+                "outcomes_loaded_during_selection": False,
+                "note": "weighting was designed after exact covariates were available but before exact H5/H20/H60 outcomes",
+            },
         },
         "balance_gate": {
             "evaluated_before_outcome_loading": True,
@@ -517,6 +542,13 @@ def _design() -> dict[str, Any]:
                 "all": "D_supported/D_source >= 0.80",
                 "2024plus": "D_supported/D_source >= 0.80",
             },
+            "positivity": {
+                "all_and_2024plus": {
+                    "per_trade_ess_p05_gte": 5.0,
+                    "max_pair_weight_lte": 0.5,
+                    "global_pair_ess_per_trade_gte": 5.0,
+                }
+            },
             "fail_closed": True,
             "failure_action": "stop before loading or computing any realised outcome",
         },
@@ -527,8 +559,8 @@ def _design() -> dict[str, Any]:
         "outcome_design": {
             "horizons_sessions": [5, 20, 60],
             "common_support": "entry day is day one; endpoints use offsets 4/19/59; identical controls at every horizon",
-            "primary_contrast": "treated net return minus equal-weight arithmetic mean control net return",
-            "sensitivity_contrast": "treated net return minus median control net return",
+            "primary_contrast": "treated net return minus frozen conditional-entropy weighted control mean",
+            "sensitivity_contrast": "equal-weight mean and median controls, reported as non-primary sensitivities",
             "path_policy": "no-open or gap-at-limit control stays cash without replacement; post-entry suspension uses LOCF",
             "terminal_bounds": "missing terminal settlement reports pessimistic -100% and optimistic LOCF bounds",
             "costs": {"buy": 0.0015, "sell": 0.0025, "cash": 0.0},
@@ -581,10 +613,28 @@ def validate_design_contract(manifest: Mapping[str, Any]) -> None:
         source.get("exact_mcap_cny") == "circ_mv * 10000",
         source.get("mix_sources_within_date") is False,
         source.get("fallback_for_missing_exact_mcap") is False,
-        primary.get("name") == "pit_exact_industry_mcap_k10_min5_c1p5",
-        primary.get("caliper_ratio") == 1.5,
-        primary.get("k") == 10,
+        primary.get("name") == "pit_exact_industry_mcap2_conditional_entropy_v1",
+        primary.get("candidate_pool")
+        == (
+            "all controls with complete frozen causal balance features inside the inclusive exact point-in-time "
+            "circ_mv caliper"
+        ),
+        primary.get("caliper_ratio") == 2.0,
         primary.get("min_controls") == 5,
+        primary.get("weighting")
+        == (
+            "conditional entropy tilting with one all-scope and one 2024plus-scope coefficient per balance "
+            "feature; weights normalize to one within each treated trade"
+        ),
+        primary.get("solver")
+        == {
+            "method": "scipy.optimize.least_squares",
+            "max_nfev": 2000,
+            "parameter_bounds": [-50.0, 50.0],
+            "initial_parameters": "all zeros",
+            "xtol_ftol_gtol": 1e-12,
+        },
+        primary.get("tie_break") == "match_distance, symbol",
         balance.get("evaluated_before_outcome_loading") is True,
         balance.get("scopes") == {"all": 286, "2024plus": 174},
         balance.get("features")
@@ -605,6 +655,14 @@ def validate_design_contract(manifest: Mapping[str, Any]) -> None:
             "treated_exact_mcap": "286/286",
             "all": "D_supported/D_source >= 0.80",
             "2024plus": "D_supported/D_source >= 0.80",
+        },
+        balance.get("positivity")
+        == {
+            "all_and_2024plus": {
+                "per_trade_ess_p05_gte": 5.0,
+                "max_pair_weight_lte": 0.5,
+                "global_pair_ess_per_trade_gte": 5.0,
+            }
         },
         balance.get("fail_closed") is True,
         authorization.get("allowed_in_this_plan") is False,
@@ -629,7 +687,7 @@ def build_manifest() -> dict[str, Any]:
         raise RuntimeError("treated common-support denominator drift")
 
     production_audit = json.loads(ARTIFACT_PATHS["production_audit"].read_text(encoding="utf-8"))
-    if production_audit.get("schema") != "surge_delay5_production_cohort_audit_v2":
+    if production_audit.get("schema") != "surge_delay5_production_cohort_audit_v3":
         raise RuntimeError("production audit schema drift")
 
     manifest = {
@@ -655,8 +713,8 @@ def build_manifest() -> dict[str, Any]:
         "treated_common_support": treated,
         "design": _design(),
         "verdict": {
-            "status": "OUTCOME_EVALUATION_LOCKED_PENDING_EXACT_DATA_AND_BALANCE",
-            "exact_data_closed": False,
+            "status": "OUTCOME_EVALUATION_LOCKED_PENDING_ENTROPY_BALANCE_AUDIT",
+            "exact_data_identity_frozen": True,
             "balance_passed": False,
             "outcome_evaluation_authorized": False,
             "live_authorized": False,
