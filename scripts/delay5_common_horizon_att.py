@@ -545,11 +545,11 @@ def _control_path_from_wide(
     )
 
 
-def _canonical_payload(records: list[list[str]]) -> bytes:
+def _canonical_payload(records: list[Any]) -> bytes:
     return json.dumps(sorted(records), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
-def _payload_identity(records: list[list[str]]) -> dict[str, Any]:
+def _payload_identity(records: list[Any]) -> dict[str, Any]:
     ordered = sorted(records)
     payload = _canonical_payload(ordered)
     return {
@@ -580,6 +580,24 @@ def _exact_cache_coverage(treated: pd.DataFrame, request_records: list[list[str]
         "treated_valid": int(len(treated_keys & valid_keys)),
         "request_valid": int(len(request_keys & valid_keys)),
     }
+
+
+def add_exact_mcap_request_pairs(
+    request_pairs: set[tuple[str, str]],
+    *,
+    treated_symbol: str,
+    dec_dt: pd.Timestamp,
+    treated_industry: Any,
+    pool: pd.DataFrame,
+) -> None:
+    """加入点时市值请求；treated 永远保留，行业缺失只关闭控制匹配。"""
+
+    date_text = pd.Timestamp(dec_dt).strftime("%Y-%m-%d")
+    request_pairs.add((str(treated_symbol), date_text))
+    if treated_industry is None or pd.isna(treated_industry) or not str(treated_industry).strip():
+        return
+    controls = pool.index[pool["industry"].eq(treated_industry)].tolist()
+    request_pairs.update((str(symbol), date_text) for symbol in controls)
 
 
 def build_matches(
@@ -618,6 +636,13 @@ def build_matches(
         )
         for row in day_trades.itertuples(index=False):
             treated_industry = industry_map.get(row.symbol, np.nan)
+            add_exact_mcap_request_pairs(
+                request_pairs,
+                treated_symbol=row.symbol,
+                dec_dt=row.dec_dt,
+                treated_industry=treated_industry,
+                pool=pool,
+            )
             treated_proxy = float(close_w.at[row.dec_dt, row.symbol] * shares.get(row.symbol, np.nan))
             amount_matches, amount_pool_n = match_amount_controls(
                 full, pool, treated_symbol=row.symbol, treated_amount=float(row.amount_e)
@@ -629,9 +654,6 @@ def build_matches(
             pool_sizes[SPEC_PROXY].append(proxy_pool_n)
             if treated_industry is None or pd.isna(treated_industry) or not str(treated_industry).strip():
                 missing_industry.append({"symbol": row.symbol, "dec_dt": row.dec_dt.strftime("%Y-%m-%d")})
-            else:
-                controls = pool.index[pool["industry"].eq(treated_industry)].tolist() + [row.symbol]
-                request_pairs.update((str(symbol), row.dec_dt.strftime("%Y-%m-%d")) for symbol in controls)
             specifications = (
                 (SPEC_AMOUNT, amount_matches, amount_pool_n, float(row.amount_e), "amount_e"),
                 (SPEC_PROXY, proxy_matches, proxy_pool_n, treated_proxy, "mcap_proxy"),
@@ -864,8 +886,22 @@ def run_audit(*, n_boot: int = N_BOOT, output_dir: Path = OUTPUT_DIR) -> dict[st
     summaries = build_summaries(trade_att, n_boot=n_boot)
     support = _support_summary(treated, trade_att, pairs)
     request_identity = _payload_identity(request_records)
+    treated_request_records = sorted(
+        {
+            (str(row.symbol), pd.Timestamp(row.dec_dt).strftime("%Y-%m-%d"))
+            for row in treated[["symbol", "dec_dt"]].itertuples(index=False)
+        }
+    )
+    request_keys = {tuple(record) for record in request_records}
+    treated_request_keys = set(treated_request_records)
+    if len(treated_request_records) != len(treated):
+        raise RuntimeError("treated exact-mcap request keys are not unique")
+    if not treated_request_keys.issubset(request_keys):
+        raise RuntimeError("exact-mcap request does not contain every treated key")
+    request_dates = sorted({date_text for _, date_text in request_keys})
+    request_symbols = sorted({symbol for symbol, _ in request_keys})
     exact_manifest = {
-        "schema": "delay5_exact_mcap_request_manifest_v1",
+        "schema": "delay5_exact_mcap_request_manifest_v2",
         "canonicalization": (
             "JSON array of [symbol, YYYY-MM-DD] records; lexicographic sort; ensure_ascii=False; "
             "separators=(',', ':'); UTF-8; no trailing newline"
@@ -878,6 +914,17 @@ def run_audit(*, n_boot: int = N_BOOT, output_dir: Path = OUTPUT_DIR) -> dict[st
         },
         "request_identity": request_identity,
         "request_records": sorted(request_records),
+        "treated_request_identity": _payload_identity([list(record) for record in treated_request_records]),
+        "treated_request_records": [list(record) for record in treated_request_records],
+        "request_dates_identity": _payload_identity(request_dates),
+        "request_dates": request_dates,
+        "request_symbols_identity": _payload_identity(request_symbols),
+        "request_symbols": request_symbols,
+        "closure": {
+            "request_keys_unique": len(request_keys) == len(request_records),
+            "treated_keys_unique": len(treated_request_keys) == len(treated_request_records),
+            "all_treated_requested": treated_request_keys.issubset(request_keys),
+        },
         "local_exact_cache": _exact_cache_coverage(treated, request_records),
     }
     proxy_2024plus = summaries[SPEC_PROXY]["2024plus"]

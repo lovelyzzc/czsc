@@ -1,0 +1,558 @@
+{
+  "schema": "delay5_pit_exact_mcap_plan_manifest_v1",
+  "canonicalization": "top-level JSON array; positional records; lexicographic sort; json.dumps ensure_ascii=False separators=(',', ':') allow_nan=False; UTF-8; no trailing newline",
+  "source_identity": {
+    "baseline_parent_commit": "52b6fc75ecba6519f2b641c150343da81d21e324",
+    "baseline_parent_note": "research baseline before the frozen PIT plan; current HEAD is intentionally not compared",
+    "scripts": {
+      "common_horizon": {
+        "locator": "scripts/delay5_common_horizon_att.py",
+        "sha256": "7087f572d15809c9fd2e0e6bf9fd257c39862e9eb10a5c55ea75f4ae1824c23d"
+      },
+      "production_cohort": {
+        "locator": "scripts/surge_delay5_production_cohort_audit.py",
+        "sha256": "37c912f38a4eb23eff371a36eb406d8c76bc5366f3fc37fec3fb65c995f86507"
+      },
+      "candidate_dump": {
+        "locator": "scripts/surge_candidates_dump.py",
+        "sha256": "44d45b8a9afd80812a5ef0c11cd6015e55594707c678213bd1f49f08e34f9942"
+      },
+      "market_state": {
+        "locator": "scripts/surge_market_state_filter.py",
+        "sha256": "cf97ce1fb1cea2caff7d931f53a145af18ffd228885de33bde01f76453a76fef"
+      },
+      "industry_snapshot": {
+        "locator": "scripts/s2b_industry_size_proxy_audit.py",
+        "sha256": "d1404d36458fef59e633cbf6d852ddc87de3eaecd2705e1eb42a045fc43fa60b"
+      }
+    },
+    "reproducible_identity": {
+      "panel_causal_projection": {
+        "schema": "sorted CSV UTF-8; header; LF; <NA>; float %.17g",
+        "columns": [
+          "symbol",
+          "dt",
+          "close",
+          "amount_e"
+        ],
+        "sort_by": [
+          "symbol",
+          "dt"
+        ],
+        "rows": 5644485,
+        "bytes": 308498943,
+        "sha256": "6c00b013c19b9301f7203a2f3574cf539794f2d3d3d0c581637f6211689154c3"
+      },
+      "market_calendar": {
+        "schema": "sorted CSV UTF-8; header; LF; <NA>; float %.17g",
+        "columns": [
+          "dt"
+        ],
+        "sort_by": [
+          "dt"
+        ],
+        "rows": 1358,
+        "bytes": 14941,
+        "sha256": "9f1a234ab063419bfc2e955431b54282a48b72166f887147ef2e59b5c63af0e3"
+      },
+      "historical_st": {
+        "schema": "sorted CSV UTF-8; header; LF; <NA>; float %.17g",
+        "columns": [
+          "ts_code",
+          "name",
+          "start_date",
+          "end_date"
+        ],
+        "sort_by": [
+          "ts_code",
+          "start_date",
+          "end_date",
+          "name"
+        ],
+        "rows": 4993,
+        "bytes": 184734,
+        "sha256": "a7bfd8013ecb7e7333ff41f44eacfa6705e625713083667fa5ebb05a22b258e6"
+      },
+      "production": {
+        "all_filled_identity": {
+          "count": 298,
+          "bytes": 11921,
+          "sha256": "817a6f3d61e926a996774c036ef74db57371dee4d59694b09567616a8a767b2f",
+          "first3": [
+            [
+              "000032.SZ",
+              "2024-03-18",
+              "2024-03-19"
+            ],
+            [
+              "000301.SZ",
+              "2023-02-10",
+              "2023-02-13"
+            ],
+            [
+              "000338.SZ",
+              "2026-04-20",
+              "2026-04-21"
+            ]
+          ],
+          "last3": [
+            [
+              "603993.SH",
+              "2025-07-10",
+              "2025-07-11"
+            ],
+            [
+              "605011.SH",
+              "2026-08-04",
+              "2026-08-05"
+            ],
+            [
+              "605336.SH",
+              "2022-06-30",
+              "2022-07-01"
+            ]
+          ]
+        },
+        "common60_schedule_identity": {
+          "count": 286,
+          "bytes": 22595,
+          "sha256": "ab2808139de3d855eca403149b623f17a45669f9a5f2767b435fe2dea4d61311",
+          "first3": [
+            [
+              "000032.SZ",
+              "2024-03-18",
+              "2024-03-19",
+              "2024-03-25",
+              "2024-04-17",
+              "2024-06-18"
+            ],
+            [
+              "000301.SZ",
+              "2023-02-10",
+              "2023-02-13",
+              "2023-02-17",
+              "2023-03-10",
+              "2023-05-11"
+            ],
+            [
+              "000338.SZ",
+              "2026-04-20",
+              "2026-04-21",
+              "2026-04-27",
+              "2026-05-21",
+              "2026-07-17"
+            ]
+          ],
+          "last3": [
+            [
+              "603986.SH",
+              "2024-05-10",
+              "2024-05-13",
+              "2024-05-17",
+              "2024-06-07",
+              "2024-08-05"
+            ],
+            [
+              "603993.SH",
+              "2025-07-10",
+              "2025-07-11",
+              "2025-07-17",
+              "2025-08-07",
+              "2025-10-10"
+            ],
+            [
+              "605336.SH",
+              "2022-06-30",
+              "2022-07-01",
+              "2022-07-07",
+              "2022-07-28",
+              "2022-09-23"
+            ]
+          ]
+        }
+      }
+    },
+    "artifacts": {
+      "common_audit": {
+        "locator": "scripts/_output/delay5_common_horizon_att/audit.json",
+        "sha256": "99720cba71e22c219403f4577adfe1da3bbd3d11f66a71a0f031a4dde0a3be65"
+      },
+      "exact_mcap_request_manifest": {
+        "locator": "scripts/_output/delay5_common_horizon_att/exact_mcap_request_manifest.json",
+        "sha256": "4b1be8d48f563e76648f15936178dac26d181bc516a435ad400035924cbf93d4"
+      },
+      "treated_common_support": {
+        "locator": "scripts/_output/delay5_common_horizon_att/treated_common_support.parquet",
+        "sha256": "ef4080342e3cbb9f05a8f0e480de2f673924b5f5a13fa39580b69c5760e337fc",
+        "rows": 286
+      },
+      "production_audit": {
+        "locator": "scripts/_output/surge_delay5_production_cohort/audit.json",
+        "sha256": "90f6dd705b098f16dfca71fcee874cf64a919d7c03a80bc0be142c52c0d5cfd3"
+      },
+      "production_cohort": {
+        "locator": "scripts/_output/surge_delay5_production_cohort/cohort.parquet",
+        "sha256": "3c3e39d7b46cfc1c836f803fa765c11de795000a5b984c818ffbd50166fbb4d2",
+        "rows": 101410
+      },
+      "candidates": {
+        "locator": "scripts/_output/surge_candidates/candidates.parquet",
+        "sha256": "a080912e118e198976125bfa69b96ce47452e435fe7ad4a867056f52f5bad667",
+        "rows": 1254284
+      },
+      "panel": {
+        "locator": "scripts/_output/surge_candidates/panel.parquet",
+        "sha256": "dc745e9e485a1dfcff8936ac911ecf5e57fa70509c0b0461575cbd8f46df67a1",
+        "rows": 5644485
+      },
+      "market_state": {
+        "locator": "scripts/_output/surge_market_state_filter/market_state.parquet",
+        "sha256": "ac1925a4be0b4106726ad7f9bc3b098a43ff2f4b19fd7fa2fab45147faeb0a8e",
+        "rows": 1358
+      },
+      "namechange": {
+        "locator": "$HOME/.ts_data_cache/namechange.parquet",
+        "sha256": "07e382c08aabf7827850f17cb1704c28db64738a90124827c8200d1c77f56577",
+        "rows": 4993
+      }
+    },
+    "industry_snapshots": {
+      "2021": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2021_20210701.parquet",
+        "rows": 4447,
+        "file_sha256": "a728a2e6f9225560396c116734caa754905595e2ef3503e1a05eaaa21b30609a",
+        "canonical_content_sha256": "68cdf050e12fd6024c3ef2cea0c0735f3e00c5aacc6aa2181e5804d6a81b55a3",
+        "effective_dates": [
+          "2021-06-14"
+        ]
+      },
+      "2022": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2022_20220104.parquet",
+        "rows": 4654,
+        "file_sha256": "1a7a03c95f9666f50734a83b7fd5af738d61438b34fdb87cd0813e5c5efcab80",
+        "canonical_content_sha256": "514d5e85fa8709e54c9fb24b52e6562beb477beffc21a8b6a9a713b6be5aac02",
+        "effective_dates": [
+          "2021-11-15"
+        ]
+      },
+      "2023": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2023_20230103.parquet",
+        "rows": 4898,
+        "file_sha256": "b1ca610e727871deb55af14dbcc0bd28e1b090351644ba17004e517050a64d33",
+        "canonical_content_sha256": "5a88ef815d8dd0faf5677464d78dc01641cf6b2d87b465b486554e920b33a181",
+        "effective_dates": [
+          "2022-08-01"
+        ]
+      },
+      "2024": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2024_20240102.parquet",
+        "rows": 5298,
+        "file_sha256": "46a2ac5b1957a5a0025550a8f6d6411906df6a87ed3a823274af2170975abf72",
+        "canonical_content_sha256": "4b4d33bd78215aa808a2c21128a9266e8247157049fd3877f5975f555920e231",
+        "effective_dates": [
+          "2024-01-01"
+        ]
+      },
+      "2025": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2025_20250102.parquet",
+        "rows": 5375,
+        "file_sha256": "14499f054682f581fe2136b53281914e1db85af5a83dd9916b9ba08db2407a62",
+        "canonical_content_sha256": "db11f8c6ac3789bbcd19d108296ff8c520754af4648bee19ac55190e49b1d1fa",
+        "effective_dates": [
+          "2024-12-30"
+        ]
+      },
+      "2026": {
+        "locator": "scripts/_output/s2b_industry_size_proxy/reference/baostock_industry_2026_20260105.parquet",
+        "rows": 5182,
+        "file_sha256": "c3997f39d2358f09cc01381263e6d68e6b35126feb1999c054d3221e01508cc5",
+        "canonical_content_sha256": "a829f1aa817514f9b09a07800dc5b85d4eb6717d3f6f09f4e64f2ee30d8b2f58",
+        "effective_dates": [
+          "2026-01-05"
+        ]
+      }
+    }
+  },
+  "request_identity": {
+    "request": {
+      "count": 47431,
+      "bytes": 1280638,
+      "sha256": "71f0543b5e64d44041fc27c1291630d64e7b7931855aea25ca205f0df7e6bdc9",
+      "first3": [
+        [
+          "000001.SZ",
+          "2024-02-27"
+        ],
+        [
+          "000001.SZ",
+          "2024-03-04"
+        ],
+        [
+          "000001.SZ",
+          "2024-05-07"
+        ]
+      ],
+      "last3": [
+        [
+          "689009.SH",
+          "2026-05-06"
+        ],
+        [
+          "689009.SH",
+          "2026-05-11"
+        ],
+        [
+          "689009.SH",
+          "2026-05-12"
+        ]
+      ]
+    },
+    "treated": {
+      "count": 286,
+      "bytes": 7723,
+      "sha256": "57167f6739ec25e0569349802074771e1e7f5763f629d428708729c6c903e3b3",
+      "first3": [
+        [
+          "000032.SZ",
+          "2024-03-18"
+        ],
+        [
+          "000301.SZ",
+          "2023-02-10"
+        ],
+        [
+          "000338.SZ",
+          "2026-04-20"
+        ]
+      ],
+      "last3": [
+        [
+          "603986.SH",
+          "2024-05-10"
+        ],
+        [
+          "603993.SH",
+          "2025-07-10"
+        ],
+        [
+          "605336.SH",
+          "2022-06-30"
+        ]
+      ]
+    },
+    "dates": {
+      "count": 170,
+      "bytes": 2211,
+      "sha256": "52476a7f768588037a5e5ab0b5d4339098ebb71d98cde6fdb743bfb1bb79079c",
+      "first3": [
+        "2021-08-23",
+        "2021-09-03",
+        "2021-11-22"
+      ],
+      "last3": [
+        "2026-05-06",
+        "2026-05-11",
+        "2026-05-12"
+      ]
+    },
+    "symbols": {
+      "count": 4089,
+      "bytes": 49069,
+      "sha256": "bdb4b3a943e1599fa4800556d96e919040c96cdcfe8e58ab2ca8c6b95a17493b",
+      "first3": [
+        "000001.SZ",
+        "000002.SZ",
+        "000004.SZ"
+      ],
+      "last3": [
+        "605598.SH",
+        "605599.SH",
+        "689009.SH"
+      ]
+    },
+    "missing_frozen_industry": [
+      {
+        "symbol": "301308.SZ",
+        "dec_dt": "2023-11-14"
+      }
+    ]
+  },
+  "treated_common_support": {
+    "rows": 286,
+    "decision_dates": 170,
+    "trades_2024plus": 174,
+    "schedule_identity": {
+      "count": 286,
+      "bytes": 22595,
+      "sha256": "ab2808139de3d855eca403149b623f17a45669f9a5f2767b435fe2dea4d61311",
+      "first3": [
+        [
+          "000032.SZ",
+          "2024-03-18",
+          "2024-03-19",
+          "2024-03-25",
+          "2024-04-17",
+          "2024-06-18"
+        ],
+        [
+          "000301.SZ",
+          "2023-02-10",
+          "2023-02-13",
+          "2023-02-17",
+          "2023-03-10",
+          "2023-05-11"
+        ],
+        [
+          "000338.SZ",
+          "2026-04-20",
+          "2026-04-21",
+          "2026-04-27",
+          "2026-05-21",
+          "2026-07-17"
+        ]
+      ],
+      "last3": [
+        [
+          "603986.SH",
+          "2024-05-10",
+          "2024-05-13",
+          "2024-05-17",
+          "2024-06-07",
+          "2024-08-05"
+        ],
+        [
+          "603993.SH",
+          "2025-07-10",
+          "2025-07-11",
+          "2025-07-17",
+          "2025-08-07",
+          "2025-10-10"
+        ],
+        [
+          "605336.SH",
+          "2022-06-30",
+          "2022-07-01",
+          "2022-07-07",
+          "2022-07-28",
+          "2022-09-23"
+        ]
+      ]
+    }
+  },
+  "design": {
+    "outcome_blind": true,
+    "data_source": {
+      "provider": "Tushare/Tinyshare",
+      "endpoint": "daily_basic",
+      "query": "one full-market query per request date using trade_date=YYYYMMDD",
+      "fields": [
+        "ts_code",
+        "trade_date",
+        "close",
+        "total_share",
+        "float_share",
+        "total_mv",
+        "circ_mv"
+      ],
+      "exact_mcap_cny": "circ_mv * 10000",
+      "close_times_float_share": "quality-control diagnostic only",
+      "mix_sources_within_date": false,
+      "fallback_for_missing_exact_mcap": false
+    },
+    "cache_contract": {
+      "root": "CZSC_DELAY5_EXACT_MCAP_CACHE or $HOME/.ts_data_cache/delay5_exact_mcap_v1",
+      "object_scope": "complete daily_basic cross-section projected to the declared fields",
+      "object_canonicalization": "top-level JSON array; positional records; lexicographic sort; json.dumps ensure_ascii=False separators=(',', ':') allow_nan=False; UTF-8; no trailing newline",
+      "content_addressed": true,
+      "atomic_writes": true,
+      "resume_requires_sha256_verification": true,
+      "closure_gates": [
+        "all 170 request dates have one verified object",
+        "all rows belong to the queried trade date",
+        "no duplicate ts_code/trade_date keys",
+        "4000 <= full-market rows < 6000",
+        "circ_mv is finite and positive for every requested key",
+        "all 47431 requested keys and all 286 treated keys are materialized"
+      ]
+    },
+    "matching": {
+      "primary": {
+        "name": "pit_exact_industry_mcap_k10_min5_c1p5",
+        "industry": "same frozen annual industry; missing treated industry is unsupported",
+        "metric": "nearest absolute log(exact point-in-time circ_mv CNY) distance",
+        "caliper_ratio": 1.5,
+        "k": 10,
+        "min_controls": 5,
+        "tie_break": "match_distance, symbol"
+      },
+      "causal_cutoff": "every feature and eligibility input has max timestamp <= decision date",
+      "exclude": "treated symbol, every production-treated symbol on that date, historical ST"
+    },
+    "balance_gate": {
+      "evaluated_before_outcome_loading": true,
+      "scopes": {
+        "all": 286,
+        "2024plus": 174
+      },
+      "features": [
+        "log_exact_mcap",
+        "ret5",
+        "ret20",
+        "ret60",
+        "vol20",
+        "vol60",
+        "log_price",
+        "log_amount",
+        "liq20"
+      ],
+      "smd_thresholds": {
+        "log_exact_mcap": 0.05,
+        "all_other_features": 0.1
+      },
+      "criterion": "finite abs(SMD)<0.05 for log_exact_mcap and <0.1 for every other feature, in both all and 2024plus scopes",
+      "coverage": {
+        "treated_exact_mcap": "286/286",
+        "all": "D_supported/D_source >= 0.80",
+        "2024plus": "D_supported/D_source >= 0.80"
+      },
+      "fail_closed": true,
+      "failure_action": "stop before loading or computing any realised outcome"
+    },
+    "outcome_authorization": {
+      "allowed_in_this_plan": false,
+      "unlock_condition": "exact-data closure and the frozen balance gate both pass"
+    },
+    "outcome_design": {
+      "horizons_sessions": [
+        5,
+        20,
+        60
+      ],
+      "common_support": "entry day is day one; endpoints use offsets 4/19/59; identical controls at every horizon",
+      "primary_contrast": "treated net return minus equal-weight arithmetic mean control net return",
+      "sensitivity_contrast": "treated net return minus median control net return",
+      "path_policy": "no-open or gap-at-limit control stays cash without replacement; post-entry suspension uses LOCF",
+      "terminal_bounds": "missing terminal settlement reports pessimistic -100% and optimistic LOCF bounds",
+      "costs": {
+        "buy": 0.0015,
+        "sell": 0.0025,
+        "cash": 0.0
+      },
+      "inference": {
+        "primary_estimand": "equal-weight treated-trade ATT",
+        "hac": "complete decision-date calendar ratio-influence Newey-West, lags H5/H20/H60 = 4/19/59",
+        "bootstrap": "stationary bootstrap on complete decision-date calendar, expected blocks H5/H20/H60 = 5/20/60, 10000 replications, seed 42",
+        "multiple_testing": "Holm-adjusted one-sided H5/H20/H60 family; no horizon cherry-picking",
+        "secondary_estimand": "equal-decision-date mean, reported separately from trade-weight ATT",
+        "network_dependence": "report control reuse and overlapping-path diagnostics; HAC alone is not a proof"
+      }
+    }
+  },
+  "verdict": {
+    "status": "OUTCOME_EVALUATION_LOCKED_PENDING_EXACT_DATA_AND_BALANCE",
+    "exact_data_closed": false,
+    "balance_passed": false,
+    "outcome_evaluation_authorized": false,
+    "live_authorized": false
+  }
+}

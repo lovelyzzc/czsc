@@ -43,7 +43,7 @@ TRADE_ATT_PATH = OUTPUT_DIR / "trade_att.parquet"
 AUDIT_PATH = OUTPUT_DIR / "audit.json"
 
 EXPECTED_COMMON_SCHEMA = "delay5_common_horizon_att_audit_v1"
-EXPECTED_EXACT_SCHEMA = "delay5_exact_mcap_request_manifest_v1"
+EXPECTED_EXACT_SCHEMA = "delay5_exact_mcap_request_manifest_v2"
 SCHEMA = "delay5_factor_balance_audit_v2"
 
 SPEC_ALL = "factor_std_all_k5"
@@ -219,8 +219,7 @@ def load_bound_common_outputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
     common_audit = json.loads(COMMON_AUDIT_PATH.read_text(encoding="utf-8"))
     upstream = validate_common_upstream(common_audit)
     exact_manifest = json.loads(COMMON_OUTPUT_PATHS["exact_mcap_request_manifest"].read_text(encoding="utf-8"))
-    if exact_manifest.get("schema") != EXPECTED_EXACT_SCHEMA:
-        raise RuntimeError("unexpected exact-mcap request schema")
+    validate_exact_request_closure(exact_manifest)
 
     treated = pd.read_parquet(COMMON_OUTPUT_PATHS["treated_common_support"])
     pairs = pd.read_parquet(COMMON_OUTPUT_PATHS["matched_pairs"])
@@ -301,6 +300,18 @@ def validate_common_output_bindings(
         identity["rows"] = int(rows)
         verified[label] = identity
     return verified
+
+
+def validate_exact_request_closure(exact_manifest: Mapping[str, Any]) -> None:
+    """要求 common exact-mcap v2 请求对 treated 身份形成完整闭包。"""
+
+    if exact_manifest.get("schema") != EXPECTED_EXACT_SCHEMA:
+        raise RuntimeError("unexpected exact-mcap request schema")
+    closure = exact_manifest.get("closure", {})
+    if not all(
+        closure.get(field) is True for field in ("request_keys_unique", "treated_keys_unique", "all_treated_requested")
+    ):
+        raise RuntimeError("exact-mcap request closure is incomplete")
 
 
 def build_limitup_matrix(

@@ -117,6 +117,42 @@ def test_proxy_match_fails_closed_without_industry() -> None:
     assert eligible == 0
 
 
+def test_exact_mcap_requests_always_include_treated_when_industry_is_missing() -> None:
+    pool = pd.DataFrame(
+        {"industry": ["A", "B"]},
+        index=pd.Index(["CONTROL_A", "CONTROL_B"], name="symbol"),
+    )
+    requests: set[tuple[str, str]] = set()
+
+    audit.add_exact_mcap_request_pairs(
+        requests,
+        treated_symbol="TREATED_MISSING",
+        dec_dt=pd.Timestamp("2023-11-14"),
+        treated_industry=np.nan,
+        pool=pool,
+    )
+    audit.add_exact_mcap_request_pairs(
+        requests,
+        treated_symbol="TREATED_A",
+        dec_dt=pd.Timestamp("2024-01-02"),
+        treated_industry="A",
+        pool=pool,
+    )
+
+    assert ("TREATED_MISSING", "2023-11-14") in requests
+    assert ("TREATED_A", "2024-01-02") in requests
+    assert ("CONTROL_A", "2024-01-02") in requests
+    assert ("CONTROL_B", "2024-01-02") not in requests
+
+
+def test_request_identity_is_order_invariant_for_pairs_and_scalars() -> None:
+    pairs = [["B", "2024-01-02"], ["A", "2024-01-01"]]
+    dates = ["2024-01-02", "2024-01-01"]
+
+    assert audit._payload_identity(pairs) == audit._payload_identity(list(reversed(pairs)))
+    assert audit._payload_identity(dates) == audit._payload_identity(list(reversed(dates)))
+
+
 def test_control_no_open_and_gap_abandon_are_cash_without_cost() -> None:
     marks = {5: 110.0, 20: 110.0, 60: 110.0}
     terminal = {5: False, 20: False, 60: False}

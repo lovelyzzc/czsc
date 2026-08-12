@@ -183,6 +183,22 @@ def test_common_output_path_sha_and_rows_are_all_bound(tmp_path: Path, monkeypat
         audit.validate_common_output_bindings(common_audit, treated, pairs, trade, manifest)
 
 
+def test_exact_request_v2_requires_complete_treated_closure() -> None:
+    complete = {
+        "schema": audit.EXPECTED_EXACT_SCHEMA,
+        "closure": {
+            "request_keys_unique": True,
+            "treated_keys_unique": True,
+            "all_treated_requested": True,
+        },
+    }
+
+    audit.validate_exact_request_closure(complete)
+    incomplete = {**complete, "closure": {**complete["closure"], "all_treated_requested": False}}
+    with pytest.raises(RuntimeError, match="closure is incomplete"):
+        audit.validate_exact_request_closure(incomplete)
+
+
 def test_support_min3_and_2024plus_denominator_are_fixed() -> None:
     attempts = pd.DataFrame(
         {

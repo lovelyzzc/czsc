@@ -37,7 +37,11 @@ ret20、vol20 等协变量仍未达到 `|SMD|<0.1`，所以这既不能确认 al
 
 同-FSM敏感性没有消除冻结 2025 top5，但这些赢家相对其余交易呈现 8 倍 MFE、约 12 倍持有期
 涨停日和显著更长的到峰值路径；这更支持“极少数未平衡的极端动量/连板路径承载历史尾部”。
-点时精确市值尚未完成，协变量余额审计已运行但未通过，故 `live_authorized=false`。
+生产 delay5 的点时精确流通市值现已完整采集并通过 47,431/47,431 请求键、170/170 日期和
+286/286 处理票闭包。同行业、精确流通市值 1.5 倍卡尺、K10/min5 的结果盲匹配支持全期
+236/286、2024+ 143/174，均超过预冻结的 80% 覆盖门；但 ret20、vol20、价格和流动性等余额
+仍未达到门槛。因此审计在加载 H5/H20/H60 收益前按规则停止，不能确认 alpha，也不能解释为
+因果零效应，`live_authorized=false`。
 
 本轮新增日期尚未覆盖最长 60 个交易日的完整退出周期，不构成新的完整独立 OOS。
 架构新鲜段、冻结至 2026-07-27 的内部留出、walk-forward 和随机对照继续支持 **S8 关闭**；
@@ -399,7 +403,8 @@ SHA 校验后再运行规划脚本。本机 ignored 的 BaoStock cache 有 4,315
 覆盖、年度 HAC/bootstrap、drop-top5 和未来缺失结果边界。
 
 历史 S2b 容量模拟的正式状态仍为 `EDGE_CONCENTRATED_IN_2025_NOT_TEMPORALLY_ROBUST`。生产 cohort
-与共同期限现已重建；全行业点时精确匹配、真实退市结算和新的冻结成熟前向样本仍未完成，
+与共同期限现已重建；这里所指的 **S2b 容量模拟 219 日全行业** 点时精确匹配、真实退市结算和
+新的冻结成熟前向样本仍未完成（不等同于第 8.5 节已完成的 production delay5 170 日取数与匹配），
 不应扩大策略复杂度或风险敞口。
 
 ## 八、生产 delay5 共同期限与路径证伪
@@ -447,11 +452,13 @@ SHA 校验后再运行规划脚本。本机 ignored 的 BaoStock cache 有 4,315
 结果是更强反证而非最终因果估计。正式状态为
 `PRODUCTION_DELAY5_COMMON_HORIZON_EDGE_NOT_CONFIRMED_AFTER_INDUSTRY_SIZE_CONTROL`。
 
-生产 exact-mcap 请求清单现为 47,430 个股票×决策日、169 个决策日、4,089 只股票；本机旧
-BaoStock cache 对 286 笔处理票的点时市值覆盖为 0，故精确匹配尚不可计算。该请求清单与审计
-输出都在 ignored 目录，另一设备需按复现步骤重建。请求清单文件 SHA256 为
-`f15685f35eb95d5e056806ddc8f4a750ad03d9d8cd57f03679d5502fc0ad7198`，共同期限 audit SHA256 为
-`4f372fd64c5c69ae19cfeee23e1db8ad9951731efb8b0773c919fa7fe85edc3b`。
+生产 exact-mcap 请求清单已修正为 47,431 个股票×决策日、170 个决策日、4,089 只股票；原先因
+缺年度行业而漏出的 `301308.SZ@2023-11-14` 现在仍会采集 exact mcap，只在行业匹配阶段明确记为
+不支持。canonical 请求 SHA256 为
+`71f0543b5e64d44041fc27c1291630d64e7b7931855aea25ca205f0df7e6bdc9`，处理票身份 SHA256 为
+`57167f6739ec25e0569349802074771e1e7f5763f629d428708729c6c903e3b3`；请求文件与共同期限 audit
+SHA256 分别为 `4b1be8d48f563e76648f15936178dac26d181bc516a435ad400035924cbf93d4`、
+`99720cba71e22c219403f4577adfe1da3bbd3d11f66a71a0f031a4dde0a3be65`。
 
 ### 8.3 同 FULL FSM 与赢家路径
 
@@ -493,15 +500,58 @@ production cohort、panel、历史 ST、当前股本代理和逐年行业快照�
 `EXPLORATORY_FACTOR_BALANCE_EDGE_NOT_CONFIRMED_BALANCE_INSUFFICIENT`，
 `live_authorized=false`。规格 SHA256 为
 `aa265f145238d237eff13c4429bd80d145f587260d8bf0f36f0eddfa428b74d2`；matched-pairs 与
-trade-ATT SHA256 分别为 `2352f90329e51e1bb766f9d5b363b2ea472fff8c58f130e3577dda36088677bf`、
-`d162d4a072fed336918a4c79aecfe13f67bb146ab90c2b0e589fb7c7a6d7679b`；最终 audit SHA256 为
-`35913f3ecdedd2ecb653fd3468052f554cf23ca77ef04b567aa91d49882f8b44`。
+trade-ATT SHA256 分别为 `a83c51bd461bc52ef299e7e3e07eebf7eecffe1d580b67b263f027fff62c33b7`、
+`d69049d1ffe968b576044b53ae4733e8e71422438a418e7c6eae7bd48d16fa74`；最终 audit SHA256 为
+`3f05ec45cdbffc3da7be9abbc9d47dffb8f64a090e310671430c0e7256b35592`。
 
-### 8.5 当前生产判定
+### 8.5 点时精确流通市值与结果盲余额门
+
+新增 `scripts/delay5_pit_exact_mcap_plan.py`、Git 可携带的轻量冻结计划
+`scripts/delay5_pit_exact_mcap_plan_2026-08-11.json`、专用 collector 与结果盲 balance audit。计划在
+完整数据闭包、余额计算和任何结果加载前冻结输入身份、唯一主规格和停止规则，不包含任何已实现
+收益；首批 vendor 截面开始抓取略早于 tracked JSON 落盘，故不把它表述为严格的“取数前预注册”。
+主规格为同决策日、同行业、
+精确流通市值 1.5 倍 inclusive 卡尺，按绝对 log-mcap 距离稳定取 K=10/min5；同日全部处理票和
+历史 ST 从控制池排除，禁止用当前股本、BaoStock 或未来可用性补缺。主 ATT 若未来获准计算，控制
+reducer 冻结为算术均值；旧中位数口径只能作为敏感性。
+
+Tinyshare/Tushare `daily_basic` 按 170 个决策日逐日取得完整全市场截面，固定字段为
+`ts_code,trade_date,close,total_share,float_share,total_mv,circ_mv`，并将 `circ_mv` 从万元一次转换为
+人民币元。170 个内容寻址对象共 887,532 行，每日截面 4,445–5,498 行；47,431 个请求键、170 个
+日期和 286 个处理票全部闭包，materialized Parquet SHA256 为
+`1d01aea9098f54d7823d1d1f3038a4c76995829004eaac24dff434101bc737e7`。与本机 BaoStock cache 的
+32 个重叠点跨 3 日，Tushare/BaoStock 比值中位数 1.0000018，绝对偏差中位数 0.000414%、P95
+0.002667%、最大 0.011760%，没有大于 5% 的点；这只验证单位和方向，不证明供应商历史版本完全
+等价。供应商只提供历史日期值，无法证明 revision-vintage as-of 身份。
+
+结果盲匹配得到：
+
+| 范围 | D_source | D_attempt | D_supported | source 支持率 |
+| --- | ---: | ---: | ---: | ---: |
+| 2021–2026 | 286 | 285 | 236 | 82.52% |
+| 2024+ | 174 | 174 | 143 | 82.18% |
+
+唯一未进入 attempt 的处理票是上述缺冻结行业票。2024 单年只有 32/48 支持，故年度外推仍须谨慎。
+精确市值本身余额良好：全期/2024+ SMD 为 +0.010/+0.005，ret5 也为 -0.027/-0.012；但关键余额
+仍失败：全期 ret20/vol20/log-price/log-amount/liq20 SMD 为 +0.382/+0.243/+0.210/+0.299/+0.311，
+2024+ 为 +0.270/+0.182/+0.166/+0.245/+0.244。ret60/vol60 在全期也略越过 0.1，而 2024+
+ret60 为 +0.09998，不能用这一临界通过掩盖其余失败。
+
+因此正式 verdict 为 `BALANCE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED`。审计明确
+`outcomes_loaded=false`、`outcome_evaluation_permitted=false`、`live_authorized=false`，没有生成或
+查看 exact H5/H20/H60 ATT。Plan、matched-pairs、attempts、balance 与最终 audit SHA256 分别为
+`10155678453e43307fa3318f7743dd990c6ac39841b317aa82ed8973fc1be4f4`、
+`0057d47b67d8e66470a18de02663c8867044f9134bd0b99b2484369828565bd3`、
+`ac4cfd28dbe460bec4c72ab79017fd9728abbdd6dab8a02613fabf31d90596ae`、
+`2d049f54af197bd75fb88b7caf45a6a10ec951ea294a4482625190bf22fec794`、
+`ac1d418fcca74f5dece92c0f3a59b907c04c916dffc33af480c54459cbe07040`。
+
+### 8.6 当前生产判定
 
 当前生产证据把解释强度再降一级：旧成交额对照的正值不能抵抗行业/规模代理控制；同-FSM没有
-解释掉冻结 top5，却把尾部与极端涨停路径的关系凸显出来。点时精确市值、充分协变量余额、
-日历时间 long-short 与独立前向成熟样本均未完成，故不能部署，也不能依据这些事后路径新增门控。
+解释掉冻结 top5，却把尾部与极端涨停路径的关系凸显出来。点时精确市值数据与基础匹配已经完成，
+但充分协变量余额、日历时间 long-short 与独立前向成熟样本均未完成。结果阶段仍被正式锁定，故
+不能部署，也不能依据这些事后路径新增门控。
 
 ## 九、另一台设备的复现顺序
 
@@ -535,6 +585,17 @@ Git 只携带代码、轻量清单与本文，不能单靠 `git pull` 字节级�
 修订后不保证字节一致。没有上述冻结文件时，以下流程的含义是按同一请求上限和安全截止重建输入、
 重新验证结论，而不是复现本文全部 SHA；联网步骤还要求设备已配置相应数据源凭据，凭据本身不得
 写入仓库或报告。
+
+本轮 production exact-mcap cache 同样不进入 Git。若要在另一设备继续余额研究而不重新请求供应商，
+复制 `~/.ts_data_cache/delay5_exact_mcap_v1_71f0543b_portable.tar.zst`，其大小 25,289,224 bytes、
+SHA256 为 `55c7884bd7b488e9e9576781a0c1586d9f587f92ea1e7ab3db3f00da459f6388`；解包后目录应为
+`~/.ts_data_cache/delay5_exact_mcap_v1/`。缓存 final manifest、materialized Parquet、portable request
+与 verifier report SHA256 分别为 `63ce3f7dc02aeadb5cbc07b359f62c73817fcd1c3fb99fa06bc96335b701006b`、
+`1d01aea9098f54d7823d1d1f3038a4c76995829004eaac24dff434101bc737e7`、
+`50d933bdc89018b4eaa4c36a920d6e913890646b5afff4908c1fcbd6361f2a43`、
+`f8503b927f87f2cd37602f123038458315ccc46c276042343e8654bfd812bf9f`。该压缩包需要通过私有存储
+另行传输，不能 `git add -f`。若不复制，可在设置 `TINYSHARE_TOKEN` 或 `TUSHARE_TOKEN` 后按下面
+命令重新采集；这会形成新的 collected-at/provenance 身份，但仍可对同一 canonical 请求做比较。
 
 ```bash
 # 正式同步审计要求远端别名、URL 与 upstream 完全绑定；已有错误 mine 时先人工修正
@@ -574,6 +635,16 @@ uv run --no-sync python scripts/surge_delay5_production_cohort_audit.py
 uv run --no-sync python scripts/delay5_common_horizon_att.py --n-boot 10000
 uv run --no-sync python scripts/delay5_factor_balance_audit.py
 uv run --no-sync python scripts/s2b_same_fsm_path_audit.py
+
+# 先复算 Git 中的 outcome-blind 轻量计划
+uv run --no-sync python scripts/delay5_pit_exact_mcap_plan.py
+
+# 已复制冻结 cache 时只验完整性；否则固定 tinyshare 版本并从环境变量凭证串行采集
+uv run --no-sync python scripts/delay5_pit_exact_mcap_collector.py verify
+# uv run --with tinyshare==0.1028.0 python scripts/delay5_pit_exact_mcap_collector.py collect
+
+# 该步骤只生成匹配、覆盖率和余额；余额失败时禁止加载 H5/H20/H60 outcome
+uv run --no-sync python scripts/delay5_pit_exact_mcap_balance_audit.py
 ```
 
 如果另一台设备执行时数据源已修订、请求上限不再是 2026-08-12、安全截止不再是 2026-08-11，
@@ -583,12 +654,13 @@ SHA256；新结果应另建日期报告，不能覆盖本文身份。
 ## 十、下一步研究边界
 
 1. **冻结当前参数**，不要用 2025 尾部或 2026-08 新增数据反向调 S2b/S2c 门控。
-2. 按生产请求清单的 169 个决策日/47,430 对补全点时 `circ_mv`；历史 S2b 全量规划另有 219 日，
-   两套 cohort 不得混用。同一决策日只用一个供应商，不得回退当前股本。
-3. 本轮 ret5/20、vol20、价格和涨停路径余额审计仍失败；下一轮在不看收益的前提下预冻结加入
-   vol60、beta、流动性和上市年龄。只有所有关键协变量 `|SMD| < 0.1` 才解释 ATT，共同支持不足时
-   必须判为不可识别。
-4. 在仅用决策日/次日可见信息重配控制后，分别运行固定 H5/H20/H60、control own-FULL 与共享风险
+2. production 47,431 对/170 日点时 `circ_mv` 已完整闭包；历史 S2b 全量规划另有 219 日，两套
+   cohort 不得混用。继续保留同一决策日单供应商、禁止回退当前股本与 revision-vintage 限定。
+3. 精确市值主匹配后的 ret20、vol20、价格和流动性余额仍失败。下一轮必须继续保持 outcome lock，
+   另立唯一、可解释的协变量平衡规格并预冻结 positivity、ESS、覆盖率与 SMD 门；不能先看 exact ATT
+   再调 K、卡尺或特征。若仍无法同时保持全期/2024+ source 支持率 ≥80% 和全部余额门，应正式判为
+   历史数据不可识别，不再继续挖 outcome。
+4. 只有新的 outcome-blind 余额审计 PASS 后，才分别运行固定 H5/H20/H60、control own-FULL 与共享风险
    预算 FULL；未来停牌 LOCF，退市采用真实结算并保留悲观/乐观边界。
 5. 构造日历时间 long-treated/short-control 收益并做决策日、处理票和控制票多向聚类或 wild bootstrap，
    处理持仓重叠与控制网络复用；所有规格纳入统一多重检验。

@@ -31,20 +31,22 @@ description: >-
 
 ## 工作流（三步）
 
+以下命令均从仓库根目录运行；若依赖尚未安装，先执行 `uv sync --extra dev`。
+
 ### Step 1: 预检并发布最新数据
 
 先运行不写 active manifest 的 dry-run，生成并验证增量计划、数据完整性和安全截止日；该模式只记录
 工作树状态，不验证远端发布绑定：
 
 ```bash
-PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/scripts/_sync_daily_data.py
+PYTHONUNBUFFERED=1 uv run --no-sync python scripts/_sync_daily_data.py
 ```
 
 确认计划无误后再用 `--apply`；正式发布会额外强制工作树 clean、当前提交已 push、分支/upstream/
 remote URL 与远端 ref 全部匹配，全部通过才原子更新 active manifest：
 
 ```bash
-PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/scripts/_sync_daily_data.py --apply
+PYTHONUNBUFFERED=1 uv run --no-sync python scripts/_sync_daily_data.py --apply
 ```
 
 若预检失败，不得跳过门槛直接扫描；先修复失败项，再重新执行 dry-run。
@@ -52,7 +54,7 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/sc
 ### Step 2: 运行每日筛选
 
 ```bash
-PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.cursor/skills/surge-delay5-stock-picker/scripts/delay5_scan.py
+PYTHONUNBUFFERED=1 uv run --no-sync python .cursor/skills/surge-delay5-stock-picker/scripts/delay5_scan.py
 ```
 
 全 A 股因果扫描约 1-2 分钟。输出市场状态门、全部 delay5 候选表和前向转正进度。
@@ -71,12 +73,15 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 ## 必须随结果呈现的风险边界
 
 - **生产共同期限未确认**：2024+ 行业 + 当前股本规模代理控制后，H5/H20/H60 的 HAC t
-  分别为 1.181/0.785/1.593，期望块长 10 的 stationary-bootstrap 区间均跨零；
-- **余额仍不足**：追加决策日前动量、波动、价格和涨停路径后结果仍不显著，但 ret20/vol20
-  的匹配后 `|SMD|` 仍高于 0.1，不能宣称已识别因果零效应；
+  分别为 1.186/0.785/1.569，期望块长 10 的 stationary-bootstrap 区间均跨零；
+- **点时精确市值不解锁结果**：production 请求已完成 47,431/47,431 键、170/170 日期和
+  286/286 处理票闭包；同行业 exact-mcap 1.5× K10/min5 支持全期 236/286、2024+ 143/174；
+  但 ret20、vol20、价格和流动性匹配后 `|SMD|` 仍高于 0.1，审计状态为
+  `BALANCE_INSUFFICIENT_OUTCOMES_NOT_EVALUATED`，不能查看 exact H5/H20/H60 或宣称因果零效应；
 - **旧正值不可外推**：amount-only 和容量模拟口径未应用完整生产门控，且历史正值受少数长趋势、
   涨停/连板路径影响，不能作为生产选股 alpha；
-- **规则冻结**：禁止依据本次候选或 2025 尾部继续调门控；下一轮先补点时精确市值和协变量余额；
+- **规则冻结**：禁止依据本次候选或 2025 尾部继续调门控；下一轮只做 outcome-blind 协变量平衡，
+  未通过覆盖率、positivity/ESS 与余额门之前继续锁定结果；
 - **转正标准（预声明）**：前向 ≥60 笔可操作样本、超额 t≥2 **且中位数>0**；达标前仅记录。
 
 ## 输出文件（与 surge-regime-stock-picker 共用）
@@ -87,10 +92,13 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 
 ## 研究依据
 
-- `scripts/S8_INCREMENTAL_VALIDATION_2026-08-10.md`：当前跨设备总报告与正式结论；
+- `scripts/S8_INCREMENTAL_VALIDATION_2026-08-11.md`：当前跨设备总报告与正式结论；
 - `scripts/surge_delay5_production_cohort_audit.py`：生产顺序漏斗和成熟度身份；
 - `scripts/delay5_common_horizon_att.py`：固定 5/20/60 日共同期限匹配；
 - `scripts/delay5_factor_balance_audit.py`：决策日前动量、波动、价格与涨停路径余额审计；
+- `scripts/delay5_pit_exact_mcap_plan.py`：点时精确市值 outcome-blind 冻结计划；
+- `scripts/delay5_pit_exact_mcap_collector.py`：按决策日完整截面采集、内容寻址缓存与验证；
+- `scripts/delay5_pit_exact_mcap_balance_audit.py`：单一 exact-mcap 主规格的结果盲覆盖与余额门；
 - `scripts/s2b_same_fsm_path_audit.py`：历史精确支持集的同-FSM与路径敏感性。
 
 ## 研究文档索引
@@ -100,5 +108,6 @@ PYTHONUNBUFFERED=1 /home/lovelyzzc/czsc/.venv/bin/python /home/lovelyzzc/czsc/.c
 | 生产漏斗 | 只把硬门、市场门、成交门和完整退出都通过的样本称为成熟 |
 | 共同期限 | 行业/规模代理控制后 H5/H20/H60 全部未确认 |
 | 因子余额 | 两套 K5/min3 规格全部期限区间跨零，且 ret20/vol20 仍未平衡 |
+| 点时市值 | 47,431 键完整闭包；exact K10/min5 覆盖超过 80%，但余额失败且 outcome 未加载 |
 | 同-FSM | 冻结 top5 仍为正，但继续占超额总和约 58%，极端涨停路径集中 |
-| 总判定 | `live_authorized=false`；等待点时精确市值、充分余额与独立前向成熟样本 |
+| 总判定 | `live_authorized=false`；等待充分余额与独立前向成熟样本 |
