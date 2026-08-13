@@ -15,7 +15,15 @@ from tqdm import tqdm
 import czsc
 from czsc import Freq, RawBar
 
-_tinyshare_token = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+
+def _require_tinyshare_token() -> str:
+    token = os.getenv("TINYSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TINYSHARE_TOKEN must be set and non-empty")
+    return token
+
+
+_tinyshare_token = _require_tinyshare_token()
 ts.set_token(_tinyshare_token)
 
 cache_path = os.getenv("TS_CACHE_PATH", os.path.expanduser("~/.ts_data_cache"))

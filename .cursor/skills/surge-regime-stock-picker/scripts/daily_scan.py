@@ -45,7 +45,15 @@ from trend_regime import (  # noqa: E402
     surge_score,
 )
 
-TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+
+def _require_tinyshare_token() -> str:
+    token = os.getenv("TINYSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TINYSHARE_TOKEN must be set and non-empty")
+    return token
+
+
+TOKEN = _require_tinyshare_token()
 OUTPUT_DIR = REPO / "scripts" / "_output" / "surge_regime_picks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

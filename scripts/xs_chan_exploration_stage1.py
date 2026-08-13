@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import math
@@ -43,7 +42,6 @@ DAILY_BASIC_DIR = REFERENCE_DIR / "daily_basic_weekly"
 RAW_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
 NAMECHANGE_PATH = Path.home() / ".ts_data_cache" / "namechange.parquet"
 STATE_CACHE_ROOT = Path.home() / ".ts_data_cache" / "xs_chan_state_cache_v2"
-CONNECTOR_PATH = REPO_ROOT / "czsc" / "connectors" / "ts_connector.py"
 
 STATE_NAMES = {
     0: "NotTradable",
@@ -298,32 +296,13 @@ def build_decision_schedule(spec: Mapping[str, Any], calendar: pd.DatetimeIndex)
     return schedule
 
 
-def _load_repository_fallback_token() -> str:
-    """Read the legacy connector's existing fallback without copying or logging it."""
-
-    source = CONNECTOR_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "getenv"
-            and len(node.args) >= 2
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "TINYSHARE_TOKEN"
-        ):
-            continue
-        token = ast.literal_eval(node.args[1])
-        if isinstance(token, str) and token:
-            return token
-    raise ExplorationError("Tinyshare token is not configured in the environment or existing connector")
-
-
 def resolve_tinyshare_token() -> str:
     """Resolve a token without ever writing it into exploratory artifacts."""
 
-    token = os.getenv("TINYSHARE_TOKEN") or os.getenv("TUSHARE_TOKEN")
-    return token if token else _load_repository_fallback_token()
+    token = (os.getenv("TINYSHARE_TOKEN") or os.getenv("TUSHARE_TOKEN") or "").strip()
+    if not token:
+        raise ExplorationError("TINYSHARE_TOKEN or TUSHARE_TOKEN must be set and non-empty")
+    return token
 
 
 def _api_call_with_retry(call: Callable[[], pd.DataFrame], label: str, retries: int = 4) -> pd.DataFrame:

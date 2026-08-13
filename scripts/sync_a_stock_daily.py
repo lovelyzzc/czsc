@@ -22,7 +22,15 @@ import pyarrow.parquet as pq
 import tinyshare as ts
 from tqdm import tqdm
 
-TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+
+def _require_tinyshare_token() -> str:
+    token = os.getenv("TINYSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TINYSHARE_TOKEN must be set and non-empty")
+    return token
+
+
+TOKEN = _require_tinyshare_token()
 ts.set_token(TOKEN)
 pro = ts.pro_api()
 

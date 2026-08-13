@@ -25,7 +25,16 @@ import tinyshare as ts
 from czsc import CZSC, Freq, format_standard_kline
 
 DATA_DIR = Path.home() / ".ts_data_cache" / "a_stock_daily_qfq"
-TOKEN = os.getenv("TINYSHARE_TOKEN", "8mgRs242h2Bc3mADa8Pfh8YAfZf6ym4vYli84P4uMJb9v5QaKbW5l05sa286040b")
+
+
+def _require_tinyshare_token() -> str:
+    token = os.getenv("TINYSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TINYSHARE_TOKEN must be set and non-empty")
+    return token
+
+
+TOKEN = _require_tinyshare_token()
 OUTPUT_DIR = Path(__file__).resolve().parents[3] / "scripts" / "_output" / "surge_wave_picks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
